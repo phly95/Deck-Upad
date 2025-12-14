@@ -17,3 +17,6 @@ What needs work:
 
 
 Note on networking: It appears like things like network scanning are creating latency issues. The next challenge is to create a container that takes over a wifi card and ensures that it behaves correctly to ensure consistently low latency. The container should act as a VPN to the host OSs on each side.
+
+
+Regarding the solution to the networking issue, the plan is to set up a root level podman container on Alpine Linux that takes control of the Wifi chip and ensures that it is managed correctly for low latency. Traffic will flow through a wireguard VPN that connects the host PC to the wifi network while preventing the host PC from performing any operations involving wifi.

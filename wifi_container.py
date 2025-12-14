@@ -75,11 +75,8 @@ class ContainerVPN:
 
     def cleanup(self):
         print("\n\n--- Cleaning Up ---")
-        # Remove Host Connection
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
-
-        # Remove Veth Interface (Deleting one end deletes both)
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
 
         print("Stopping container...")
@@ -98,7 +95,6 @@ class ContainerVPN:
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         use_image = CUSTOM_IMAGE if self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False) else BASE_IMAGE
 
-        # Note: No WireGuard tools needed anymore!
         self.run_command(
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--cap-add=NET_ADMIN --cap-add=NET_RAW "
@@ -109,7 +105,6 @@ class ContainerVPN:
 
         if use_image == BASE_IMAGE:
             print("[2/6] Installing tools (Internet Required)...")
-            # Removed wireguard-tools, added generic network tools
             max_retries = 3
             for i in range(max_retries):
                 try:
@@ -134,30 +129,43 @@ class ContainerVPN:
 
     def setup_veth_link(self, ctr_pid):
         print(f"[5/6] Creating High-Speed Veth Link (Host <-> Container)...")
-        # 1. Create Veth Pair on Host
+        # 1. Create Veth Pair
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
 
-        # 2. Move Container-side end into Container Namespace
+        # 2. Performance Tuning: Increase Queue Length to prevent drops/bufferbloat
+        self.run_command(f"ip link set {VETH_HOST} txqueuelen 1000")
+
+        # 3. Move Container-side end
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
 
-        # 3. Configure Container Side
+        # 4. Configure Container Side
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
 
-        # 4. Configure Host Side (Using NMCLI for stability)
-        # Create a manual ethernet connection for the veth interface
+        # 5. Configure Host Side
         self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR} gw4 {IP_CTR}")
-        # Prioritize this connection for local traffic, but allow internet via it if Client Mode
         self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
+        self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 50")
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
-        # 5. Enable NAT on Container
+        # 6. Add Explicit Route on Host to WiFi Subnet via Container
+        self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
+
+        # 7. Enable NAT on Container (Postrouting)
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
+
+    def optimize_wifi(self):
+        """Disables Power Saving to reduce latency."""
+        print("      Optimizing WiFi Latency (Power Save OFF)...")
+        self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
 
     def setup_client_mode(self, ssid, password):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
+
+        self.optimize_wifi() # Disable Power Save
+
         psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
         self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
@@ -184,7 +192,7 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip route del default || true'")
         self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0'")
 
-        # DMZ Forwarding (Client Mode) - Forward all incoming to Host
+        # DMZ Forwarding (Client Mode)
         print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
@@ -193,6 +201,8 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
+
+        self.optimize_wifi() # Disable Power Save
 
         hostapd_conf = f"""interface=wlan0
 ssid={ssid}
@@ -240,9 +250,12 @@ dhcp-option=6,8.8.8.8"""
         print(f"INTERNAL VETH IP:     {IP_HOST}")
         print("-" * 40)
         if mode == "AP Mode":
-            print(f"Remote Device Pings:  192.168.50.1")
+            print(f"You are the HOST.")
+            print(f"Clients will connect from: 192.168.50.10 - 50")
+            print(f"Ping Client IPs directly (e.g., ping 192.168.50.48)")
         else:
-            print(f"Remote Device Pings:  192.168.50.1")
+            print(f"You are a CLIENT.")
+            print(f"Ping the Host at:     192.168.50.1")
         print("="*40)
 
 def main():

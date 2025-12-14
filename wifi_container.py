@@ -10,8 +10,14 @@ import traceback
 CONTAINER_NAME = "vpn-test"
 BASE_IMAGE = "alpine:latest"
 CUSTOM_IMAGE = "vpn-ap-ready"
-HOST_WG_CONF = "/tmp/wg-host.conf"
-NM_CONN_NAME = "wg-vpn-test"
+NM_CONN_NAME = "veth-host-conn"
+VETH_HOST = "veth-host"
+VETH_CTR = "veth-ctr"
+
+# IPs for the Virtual Cable
+IP_CTR = "10.13.13.1"
+IP_HOST = "10.13.13.2"
+SUBNET_CIDR = "24"
 
 # AP Configuration
 AP_GATEWAY_IP = "192.168.50.1"
@@ -69,19 +75,17 @@ class ContainerVPN:
 
     def cleanup(self):
         print("\n\n--- Cleaning Up ---")
+        # Remove Host Connection
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
-        self.run_command("nmcli connection delete wg-host", check=False)
 
-        if os.path.exists(HOST_WG_CONF):
-            try:
-                os.remove(HOST_WG_CONF)
-            except:
-                pass
+        # Remove Veth Interface (Deleting one end deletes both)
+        self.run_command(f"ip link delete {VETH_HOST}", check=False)
 
         print("Stopping container...")
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+
         print("Restoring Host Network Manager...")
         try:
             iface = self.get_active_wifi_interface()
@@ -94,6 +98,7 @@ class ContainerVPN:
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         use_image = CUSTOM_IMAGE if self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False) else BASE_IMAGE
 
+        # Note: No WireGuard tools needed anymore!
         self.run_command(
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--cap-add=NET_ADMIN --cap-add=NET_RAW "
@@ -104,10 +109,11 @@ class ContainerVPN:
 
         if use_image == BASE_IMAGE:
             print("[2/6] Installing tools (Internet Required)...")
+            # Removed wireguard-tools, added generic network tools
             max_retries = 3
             for i in range(max_retries):
                 try:
-                    self.run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache wpa_supplicant iw wireguard-tools iptables hostapd dnsmasq")
+                    self.run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache wpa_supplicant iw iptables hostapd dnsmasq iproute2")
                     break
                 except:
                     if i < max_retries - 1:
@@ -121,10 +127,32 @@ class ContainerVPN:
 
     def move_wifi_card(self):
         print(f"[3/6] Moving {self.wifi_interface} to container...")
-        # Check=False prevents crash if device is already disconnected/idle
         self.run_command(f"nmcli device disconnect {self.wifi_interface}", check=False)
         ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
         self.run_command(f"iw phy phy0 set netns {ctr_pid}")
+        return ctr_pid
+
+    def setup_veth_link(self, ctr_pid):
+        print(f"[5/6] Creating High-Speed Veth Link (Host <-> Container)...")
+        # 1. Create Veth Pair on Host
+        self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
+
+        # 2. Move Container-side end into Container Namespace
+        self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
+
+        # 3. Configure Container Side
+        self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
+        self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
+
+        # 4. Configure Host Side (Using NMCLI for stability)
+        # Create a manual ethernet connection for the veth interface
+        self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR} gw4 {IP_CTR}")
+        # Prioritize this connection for local traffic, but allow internet via it if Client Mode
+        self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
+        self.run_command(f"nmcli connection up {NM_CONN_NAME}")
+
+        # 5. Enable NAT on Container
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
 
     def setup_client_mode(self, ssid, password):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
@@ -136,7 +164,7 @@ class ContainerVPN:
         print("      Requesting IP...")
         self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
 
-        # Robust Gateway Detection
+        # Gateway Detection
         gateway_ip = "172.16.16.16"
         try:
             output = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
@@ -155,6 +183,10 @@ class ContainerVPN:
 
         self.run_command(f"{self.exec_cmd} 'ip route del default || true'")
         self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0'")
+
+        # DMZ Forwarding (Client Mode) - Forward all incoming to Host
+        print("      Enabling DMZ...")
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def setup_ap_mode(self, ssid, password):
         print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode - 5GHz AX)...")
@@ -190,62 +222,11 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
-    def setup_dmz_forwarding(self, is_ap_mode):
-        """Forwards incoming WiFi traffic directly to the Host."""
-        print("      Setting up DMZ (Forwarding all WiFi traffic to Host)...")
-        if is_ap_mode:
-            # AP Mode: Allow DHCP(67) and DNS(53) to hit container, forward rest to Host
-            self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'")
-            self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'")
-            self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination 10.13.13.2'")
-        else:
-            # Client Mode: Forward EVERYTHING to Host
-            self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination 10.13.13.2'")
-
-    def setup_wireguard(self):
-        print("[5/6] Configuring WireGuard VPN...")
-        ctr_priv = self.run_command(f"podman exec {CONTAINER_NAME} wg genkey")
-        ctr_pub = self.run_command(f"podman exec -i {CONTAINER_NAME} wg pubkey", shell=True, input=ctr_priv).strip()
-        host_priv = self.run_command(f"podman exec {CONTAINER_NAME} wg genkey")
-        host_pub = self.run_command(f"podman exec -i {CONTAINER_NAME} wg pubkey", shell=True, input=host_priv).strip()
-        ctr_ip = self.run_command(f"podman inspect -f '{{{{.NetworkSettings.IPAddress}}}}' {CONTAINER_NAME}")
-
-        wg0_conf = f"""[Interface]
-Address = 10.13.13.1/24
-ListenPort = 51820
-PrivateKey = {ctr_priv}
-[Peer]
-PublicKey = {host_pub}
-AllowedIPs = 10.13.13.2/32"""
-        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wireguard/wg0.conf'", shell=True, input=wg0_conf)
-
-        self.run_command(f"{self.exec_cmd} 'wg-quick up wg0'")
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE'")
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
-
-        wg_host_conf = f"""[Interface]
-Address = 10.13.13.2/24
-PrivateKey = {host_priv}
-DNS = 8.8.8.8
-[Peer]
-PublicKey = {ctr_pub}
-Endpoint = {ctr_ip}:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25"""
-
-        if os.path.exists(HOST_WG_CONF):
-            try:
-                os.remove(HOST_WG_CONF)
-            except:
-                pass
-
-        with open(HOST_WG_CONF, "w") as f: f.write(wg_host_conf)
-
-        self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
-        self.run_command("nmcli connection delete wg-host", check=False)
-        self.run_command(f"nmcli connection import type wireguard file {HOST_WG_CONF}")
-        self.run_command(f"nmcli connection modify wg-host connection.id {NM_CONN_NAME}")
-        self.run_command(f"nmcli connection up {NM_CONN_NAME}")
+        # DMZ Forwarding (AP Mode)
+        print("      Enabling DMZ...")
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'") # DHCP
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'") # DNS
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def show_status(self, mode):
         lan_ip = "Unknown"
@@ -255,13 +236,13 @@ PersistentKeepalive = 25"""
         print("\n" + "="*40)
         print(f"   CONNECTION ESTABLISHED ({mode})")
         print("="*40)
-        print(f"YOUR IP ADDRESS:      {lan_ip}")
+        print(f"YOUR WIFI IP:         {lan_ip}")
+        print(f"INTERNAL VETH IP:     {IP_HOST}")
         print("-" * 40)
         if mode == "AP Mode":
-            print(f"Host IP to Ping:      192.168.50.1")
-            print(f"Client Range:         192.168.50.10 - 50")
+            print(f"Remote Device Pings:  192.168.50.1")
         else:
-            print(f"Host IP to Ping:      192.168.50.1")
+            print(f"Remote Device Pings:  192.168.50.1")
         print("="*40)
 
 def main():
@@ -290,17 +271,15 @@ def main():
         pw = input(f"Password for {ssid}: ")
 
         vpn.initialize_container()
-        vpn.move_wifi_card()
+        ctr_pid = vpn.move_wifi_card()
 
         if c == '1':
             vpn.setup_client_mode(ssid, pw)
-            vpn.setup_wireguard()
-            vpn.setup_dmz_forwarding(is_ap_mode=False)
+            vpn.setup_veth_link(ctr_pid)
             vpn.show_status("Client Mode")
         else:
             vpn.setup_ap_mode(ssid, pw)
-            vpn.setup_wireguard()
-            vpn.setup_dmz_forwarding(is_ap_mode=True)
+            vpn.setup_veth_link(ctr_pid)
             vpn.show_status("AP Mode")
 
         input("\nPress ENTER to stop...")

@@ -20,3 +20,6 @@ Note on networking: It appears like things like network scanning are creating la
 
 
 Regarding the solution to the networking issue, the plan is to set up a root level podman container on Alpine Linux that takes control of the Wifi chip and ensures that it is managed correctly for low latency. Traffic will flow through a wireguard VPN that connects the host PC to the wifi network while preventing the host PC from performing any operations involving wifi.
+
+
+wifi_container.py does just this. It hands over control of the wifi card to the podman container, the container connects to the wifi and passes the internet connection to the host machine via a wireguard VPN. More testing is needed to be done to check if the code is portable (Bazzite and Steam OS for testing), extend functionality to allow for P2P Wifi, and modularizing the code. For example, the wifi container option should be an API that other scripts can interact with.

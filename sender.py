@@ -3,6 +3,7 @@ import threading
 import socket
 import json
 import uuid
+import time
 import gi
 import evdev
 from evdev import UInput, ecodes, AbsInfo
@@ -18,9 +19,9 @@ class InputServer(threading.Thread):
         self.daemon = True
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 5001))
+        self.last_log = 0
 
-        # Create a Virtual Absolute Mouse
-        # We use Absolute (EV_ABS) because it maps better to touchscreens/tablets
+        # Virtual Mouse
         cap = {
             ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
             ecodes.EV_ABS: [
@@ -35,14 +36,17 @@ class InputServer(threading.Thread):
         print(" [INPUT] Listening for events on Port 5001...")
         while True:
             try:
-                data, _ = self.sock.recvfrom(1024)
-                msg = json.loads(data.decode())
+                data, addr = self.sock.recvfrom(1024)
 
-                # Convert 0.0-1.0 to 0-65535
+                # Log input connection once every 5 seconds to reduce spam
+                now = time.time()
+                if now - self.last_log > 5:
+                    print(f" [INPUT] Receiving Input Events from {addr[0]}...")
+                    self.last_log = now
+
+                msg = json.loads(data.decode())
                 abs_x = int(msg['x'] * 65535)
                 abs_y = int(msg['y'] * 65535)
-
-                # Sanity check
                 abs_x = max(0, min(65535, abs_x))
                 abs_y = max(0, min(65535, abs_y))
 
@@ -50,25 +54,19 @@ class InputServer(threading.Thread):
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
                     self.ui.syn()
-
                 elif msg['type'] in ['press', 'release']:
-                    # Map GDK button numbers to Linux Kernel Codes
                     btn_code = ecodes.BTN_LEFT
                     if msg['btn'] == 2: btn_code = ecodes.BTN_MIDDLE
                     if msg['btn'] == 3: btn_code = ecodes.BTN_RIGHT
-
                     val = 1 if msg['type'] == 'press' else 0
-
-                    # Ensure cursor is at position before clicking
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
                     self.ui.write(ecodes.EV_KEY, btn_code, val)
                     self.ui.syn()
-
             except Exception as e:
                 print(f"Input Error: {e}")
 
-# --- PORTAL & VIDEO LOGIC (Same as before) ---
+# --- PORTAL & VIDEO LOGIC ---
 class PortalClient:
     def __init__(self):
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -82,22 +80,18 @@ class PortalClient:
         request_token = f"req_{uuid.uuid4().hex}"
         args[-1]['handle_token'] = GLib.Variant('s', request_token)
         request_path = f"/org/freedesktop/portal/desktop/request/{self.sender_name}/{request_token}"
-
         response_data = {}
         def on_response(conn, sender, path, iface, signal, params, data):
             if path == request_path:
                 response_data['code'] = params[0]
                 response_data['results'] = params[1]
                 self.main_loop.quit()
-
         sub_id = self.bus.signal_subscribe(self.portal_name, "org.freedesktop.portal.Request", "Response", request_path, None, Gio.DBusSignalFlags.NONE, on_response, None)
-
         try:
             self.bus.call_sync(self.portal_name, self.object_path, self.interface, method, GLib.Variant(f"({signature})", tuple(args)), None, Gio.DBusCallFlags.NONE, -1, None)
         except Exception as e:
             self.bus.signal_unsubscribe(sub_id)
             raise e
-
         self.main_loop.run()
         self.bus.signal_unsubscribe(sub_id)
         if response_data.get('code') != 0: raise Exception(f"Request failed. Code: {response_data.get('code')}")
@@ -108,49 +102,77 @@ class PortalClient:
         session_token = f"sess_{uuid.uuid4().hex}"
         results = self.call_request("CreateSession", [{'session_handle_token': GLib.Variant('s', session_token)}], "a{sv}")
         session_handle = results['session_handle']
-
         print("[2/3] Select Screen...")
         self.call_request("SelectSources", [session_handle, {"types": GLib.Variant("u", 1), "cursor_mode": GLib.Variant("u", 2)}], "oa{sv}")
-
         print("[3/3] Starting Stream...")
         results = self.call_request("Start", [session_handle, "", {}], "osa{sv}")
         return results['streams'][0][0]
 
+def get_best_encoder():
+    factory = Gst.ElementFactory.find
+    if factory("nvh264enc"):
+        print(" [ENCODER] Detected NVIDIA (nvh264enc)")
+        return "nvh264enc preset=low-latency-hq zerolatency=true bitrate=10000 rc-mode=cbr"
+    if factory("vaapih264enc"):
+        print(" [ENCODER] Detected VA-API (vaapih264enc)")
+        return "vaapih264enc rate-control=cbr bitrate=10000 keyframe-period=30 max-bframes=0"
+    print(" [ENCODER] No Hardware Encoder found. Trying Software (x264enc)...")
+    return "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30"
+
+# --- MONITORING ---
+last_sent_time = 0
+def monitor_traffic(pad, info, user_data):
+    global last_sent_time
+    now = time.time()
+    if now - last_sent_time > 2.0:
+        print(f" [VIDEO] STATUS: Stream is ACTIVE. Sending data... (Time: {time.strftime('%H:%M:%S')})")
+        last_sent_time = now
+    return Gst.PadProbeReturn.OK
+
 def run_pipeline(node_id, receiver_ip):
     Gst.init(None)
-    # Start Input Server
+
     input_server = InputServer()
     input_server.start()
 
-    # Software encode pipeline (proven to work)
-    # Using the provided receiver_ip for udpsink
+    encoder_str = get_best_encoder()
+
     pipeline_str = (
         f"pipewiresrc path={node_id} do-timestamp=true ! "
         "queue max-size-buffers=1 leaky=downstream ! "
         "videoconvert ! "
-        "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! "
+        f"{encoder_str} ! "
         "rtph264pay config-interval=1 pt=96 ! "
-        f"udpsink host={receiver_ip} port=5000 sync=false"
+        f"udpsink name=sink host={receiver_ip} port=5000 sync=false"
     )
 
-    print(f"\nRunning with Input Server active...\nStreaming to {receiver_ip}:5000\n{pipeline_str}")
-    pipeline = Gst.parse_launch(pipeline_str)
-    pipeline.set_state(Gst.State.PLAYING)
-    loop = GLib.MainLoop()
+    print(f"\nRunning Pipeline:\n{pipeline_str}")
+
+    pipeline = None
     try:
+        pipeline = Gst.parse_launch(pipeline_str)
+
+        # Add traffic monitor
+        sink = pipeline.get_by_name("sink")
+        sink_pad = sink.get_static_pad("sink")
+        sink_pad.add_probe(Gst.PadProbeType.BUFFER, monitor_traffic, None)
+
+        pipeline.set_state(Gst.State.PLAYING)
+        loop = GLib.MainLoop()
         loop.run()
-    except KeyboardInterrupt:
-        pass
-    pipeline.set_state(Gst.State.NULL)
+    except Exception as e:
+        print(f"\nPipeline Error: {e}")
+    finally:
+        if pipeline:
+            pipeline.set_state(Gst.State.NULL)
 
 if __name__ == "__main__":
     try:
-        # Determine Receiver IP
         if len(sys.argv) > 1:
             target_ip = sys.argv[1]
         else:
             print("No IP provided as argument.")
-            target_ip = input("Enter Receiver IP (default 127.0.0.1): ").strip() or "127.0.0.1"
+            target_ip = input("Enter Receiver IP (Steam Deck IP): ").strip() or "127.0.0.1"
 
         client = PortalClient()
         node_id = client.run()

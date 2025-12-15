@@ -116,23 +116,24 @@ class PortalClient:
         results = self.call_request("Start", [session_handle, "", {}], "osa{sv}")
         return results['streams'][0][0]
 
-def run_pipeline(node_id):
+def run_pipeline(node_id, receiver_ip):
     Gst.init(None)
     # Start Input Server
     input_server = InputServer()
     input_server.start()
 
     # Software encode pipeline (proven to work)
+    # Using the provided receiver_ip for udpsink
     pipeline_str = (
         f"pipewiresrc path={node_id} do-timestamp=true ! "
         "queue max-size-buffers=1 leaky=downstream ! "
         "videoconvert ! "
         "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! "
         "rtph264pay config-interval=1 pt=96 ! "
-        "udpsink host=127.0.0.1 port=5000 sync=false"
+        f"udpsink host={receiver_ip} port=5000 sync=false"
     )
 
-    print(f"\nRunning with Input Server active...\n{pipeline_str}")
+    print(f"\nRunning with Input Server active...\nStreaming to {receiver_ip}:5000\n{pipeline_str}")
     pipeline = Gst.parse_launch(pipeline_str)
     pipeline.set_state(Gst.State.PLAYING)
     loop = GLib.MainLoop()
@@ -144,8 +145,15 @@ def run_pipeline(node_id):
 
 if __name__ == "__main__":
     try:
+        # Determine Receiver IP
+        if len(sys.argv) > 1:
+            target_ip = sys.argv[1]
+        else:
+            print("No IP provided as argument.")
+            target_ip = input("Enter Receiver IP (default 127.0.0.1): ").strip() or "127.0.0.1"
+
         client = PortalClient()
         node_id = client.run()
-        run_pipeline(node_id)
+        run_pipeline(node_id, target_ip)
     except Exception as e:
         print(f"Error: {e}")

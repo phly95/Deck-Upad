@@ -9,18 +9,18 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gst, Gtk, Gdk, GLib
 
 # CONFIG
-HOST_IP = "127.0.0.1"
 INPUT_PORT = 5001
 VIDEO_PORT = 5000
 
 class ReceiverWindow(Gtk.Window):
-    def __init__(self):
-        super().__init__(title="Stream Receiver")
+    def __init__(self, sender_ip):
+        super().__init__(title=f"Stream Receiver (Input -> {sender_ip})")
         self.set_default_size(1280, 720)
 
         # Setup UDP Socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.server_address = (HOST_IP, INPUT_PORT)
+        # Use the provided sender_ip for input events
+        self.server_address = (sender_ip, INPUT_PORT)
 
         # Rate Limiting for Mouse Move
         self.last_move_time = 0
@@ -97,7 +97,15 @@ class ReceiverWindow(Gtk.Window):
         self.pipeline.set_state(Gst.State.NULL)
         Gtk.main_quit()
 
-win = ReceiverWindow()
-win.connect("destroy", win.close)
-win.show_all()
-Gtk.main()
+if __name__ == "__main__":
+    # Determine Sender IP
+    if len(sys.argv) > 1:
+        target_ip = sys.argv[1]
+    else:
+        print("No IP provided as argument.")
+        target_ip = input("Enter Sender IP (default 127.0.0.1): ").strip() or "127.0.0.1"
+
+    win = ReceiverWindow(target_ip)
+    win.connect("destroy", win.close)
+    win.show_all()
+    Gtk.main()

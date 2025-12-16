@@ -7,7 +7,7 @@ import math
 # --- CONFIGURATION ---
 CONTAINER_NAME = "stream-receiver"
 BASE_IMAGE = "registry.fedoraproject.org/fedora:39"
-CUSTOM_IMAGE = "localhost/stream-receiver-v6" # Version bump
+CUSTOM_IMAGE = "localhost/stream-receiver-v7" # Version bump
 SCRIPT_PATH = os.path.abspath(__file__)
 
 PACKAGES = [
@@ -138,7 +138,8 @@ def run_gui_worker():
         def __init__(self):
             super().__init__(title="Stream Receiver")
             self.set_default_size(1280, 720)
-            self.set_app_paintable(True)
+
+            # REMOVED: self.set_app_paintable(True) -> This caused black screens on load
 
             # 1. Wake Lock
             self.inhibitor = ScreenSaverInhibitor()
@@ -190,74 +191,19 @@ def run_gui_worker():
             self.connect("key-press-event", self.on_key_press)
             self.pipeline.set_state(Gst.State.PLAYING)
 
-            # 8. Schedule Refresh Rate Check (Wait for window to map)
-            GLib.timeout_add(1000, self.check_refresh_rate)
+            # REMOVED: Refresh rate warning check.
 
         def on_realize(self, widget):
             # Hide Cursor
-            display = widget.get_display()
-            window = widget.get_window()
-            pix = Gdk.Pixbuf.new(Gdk.Colorspace.RGB, True, 8, 1, 1)
-            pix.fill(0x00000000)
-            invisible = Gdk.Cursor.new_from_pixbuf(display, pix, 0, 0)
-            window.set_cursor(invisible)
-
-        def check_refresh_rate(self):
-            """Checks if the monitor refresh rate is a multiple of 60."""
             try:
-                display = Gdk.Display.get_default()
-                monitor = display.get_monitor_at_window(self.get_window())
-
-                # Returns mHz (e.g. 60000 for 60Hz, 59940 for 59.94Hz, 90000 for 90Hz)
-                rate_mhz = monitor.get_refresh_rate()
-
-                if rate_mhz == 0:
-                    print(" [DISPLAY] Could not detect refresh rate.")
-                    return False # Stop checking
-
-                fps = rate_mhz / 1000.0
-                print(f" [DISPLAY] Detected Refresh Rate: {fps:.2f} Hz")
-
-                # Check if it is a multiple of 60 (with tolerance for 59.94)
-                # We calculate modulo 60.
-                # Good: 60 -> 0, 120 -> 0, 59.94 -> 59.94 (close to 60)
-                # Bad: 90 -> 30, 144 -> 24
-
-                remainder = fps % 60.0
-
-                # If remainder is close to 0 OR close to 60, it is a multiple
-                is_multiple = (remainder < 1.0) or (remainder > 59.0)
-
-                if not is_multiple:
-                    self.show_fps_warning(fps)
-                    return False # Don't check again
-            except Exception as e:
-                print(f" [DISPLAY] Error checking refresh rate: {e}")
-
-            return False # Run once then stop
-
-        def show_fps_warning(self, current_fps):
-            dialog = Gtk.MessageDialog(
-                transient_for=self,
-                flags=0,
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Suboptimal Refresh Rate Detected"
-            )
-            dialog.format_secondary_text(
-                f"Your display is running at {current_fps:.1f} Hz.\n\n"
-                "For the smoothest experience, please set your monitor to "
-                "60 Hz or a multiple (120 Hz, etc).\n\n"
-                "Running at 90Hz or 144Hz causes stutter."
-            )
-            dialog.add_button("Ignore & Continue", Gtk.ResponseType.ACCEPT)
-            dialog.add_button("Quit to Settings", Gtk.ResponseType.REJECT)
-
-            response = dialog.run()
-            dialog.destroy()
-
-            if response == Gtk.ResponseType.REJECT:
-                self.close()
+                display = widget.get_display()
+                window = widget.get_window()
+                pix = Gdk.Pixbuf.new(Gdk.Colorspace.RGB, True, 8, 1, 1)
+                pix.fill(0x00000000)
+                invisible = Gdk.Cursor.new_from_pixbuf(display, pix, 0, 0)
+                window.set_cursor(invisible)
+            except Exception:
+                pass
 
         def listen_control(self):
             while True:

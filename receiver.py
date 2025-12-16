@@ -5,6 +5,7 @@ import time
 
 # --- CONFIGURATION ---
 CONTAINER_NAME = "stream-receiver"
+# Use specific registry to ensure safe pull
 BASE_IMAGE = "registry.fedoraproject.org/fedora:39"
 CUSTOM_IMAGE = "localhost/stream-receiver-v4"
 SCRIPT_PATH = os.path.abspath(__file__)
@@ -18,13 +19,30 @@ PACKAGES = [
 def run_host_logic():
     print(f"--- Stream Receiver Launcher ---")
 
-    # 1. Check Image
+    # --- INPUT PROMPTS ---
+    # 1. Get Sender IP
+    default_ip = "127.0.0.1"
+    sender_ip = input(f"Enter Sender (Steam Deck) IP [{default_ip}]: ").strip()
+    if not sender_ip:
+        sender_ip = default_ip
+
+    # 2. Get Fullscreen Preference
+    use_fullscreen = "0"
+    fs_choice = input("Run in Fullscreen? (y/N): ").strip().lower()
+    if fs_choice in ["y", "yes"]:
+        use_fullscreen = "1"
+
+    # --- BUILD LOGIC ---
+    print("[1/4] Checking Container Image...")
     has_image = subprocess.run(["podman", "image", "exists", CUSTOM_IMAGE], capture_output=True).returncode == 0
 
     if not has_image:
         print(f"      Building local image '{CUSTOM_IMAGE}'...")
         subprocess.run(["podman", "pull", BASE_IMAGE], check=True)
+        # Cleanup old builder
         subprocess.run(["podman", "rm", "-f", f"{CONTAINER_NAME}-builder"], stderr=subprocess.DEVNULL)
+
+        # Start builder
         subprocess.run(["podman", "run", "-d", "--name", f"{CONTAINER_NAME}-builder", BASE_IMAGE, "sleep", "infinity"], check=True)
 
         # Enable RPM Fusion
@@ -41,22 +59,29 @@ def run_host_logic():
         subprocess.run(["podman", "rm", "-f", f"{CONTAINER_NAME}-builder"], check=True)
         print("      Build Complete.")
 
-    # 2. XHOST
+    # 2. XHOST (Allow display access)
     try: subprocess.run(["xhost", "+local:"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except: pass
 
     # 3. Launch
+    print(f"[2/4] Launching Receiver (Target: {sender_ip})...")
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+
     cmd = [
         "podman", "run", "--rm", "-it",
         "--name", CONTAINER_NAME,
         "--pull=never",
         "--net=host", "--userns=keep-id", "--ipc=host", "--security-opt", "label=disable",
         "--device", "/dev/dri",
+
+        # Pass Host Config to Container
         "-e", f"DISPLAY={os.environ.get('DISPLAY', ':0')}",
         "-e", f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', 'wayland-0')}",
         "-e", f"XDG_RUNTIME_DIR={runtime_dir}",
         "-e", "GDK_BACKEND=wayland,x11",
+        "-e", f"SENDER_IP={sender_ip}",        # <--- PASSED HERE
+        "-e", f"USE_FULLSCREEN={use_fullscreen}", # <--- PASSED HERE
+
         "-v", "/tmp/.X11-unix:/tmp/.X11-unix:ro",
         "-v", f"{runtime_dir}:{runtime_dir}:rw",
         "-v", f"{SCRIPT_PATH}:/app/main.py:Z",
@@ -79,7 +104,10 @@ def run_gui_worker():
         from gi.repository import Gst, Gtk, Gdk, GLib
     except ImportError: sys.exit(1)
 
-    HOST_IP = "127.0.0.1"
+    # READ CONFIG FROM ENVIRONMENT
+    HOST_IP = os.environ.get("SENDER_IP", "127.0.0.1")
+    IS_FULLSCREEN = os.environ.get("USE_FULLSCREEN") == "1"
+
     INPUT_PORT = 5001
     VIDEO_PORT = 5000
     CONTROL_PORT = 5002
@@ -89,13 +117,16 @@ def run_gui_worker():
             super().__init__(title="Stream Receiver")
             self.set_default_size(1280, 720)
 
+            # Fullscreen Logic
+            if IS_FULLSCREEN:
+                self.fullscreen()
+
             self.input_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.server_addr = (HOST_IP, INPUT_PORT)
 
             self.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.control_sock.bind(("0.0.0.0", CONTROL_PORT))
 
-            # Default Source Resolution (Assume 16:9 until told otherwise)
             self.source_w = 1920
             self.source_h = 1080
 
@@ -120,6 +151,9 @@ def run_gui_worker():
             self.video_widget.connect("button-press-event", self.on_button)
             self.video_widget.connect("button-release-event", self.on_button)
 
+            # Key Press for Exit (Essential for Fullscreen)
+            self.connect("key-press-event", self.on_key_press)
+
             self.pipeline.set_state(Gst.State.PLAYING)
             self.last_move = 0
 
@@ -137,68 +171,52 @@ def run_gui_worker():
             self.source_h = h
             print(f" [DISPLAY] Source Resolution Updated: {w}x{h}")
 
-            # Resize Window Logic
-            screen = Gdk.Screen.get_default()
-            max_w = screen.get_width() * 0.9
-            max_h = screen.get_height() * 0.9
+            # Only resize if NOT in fullscreen to avoid breaking window manager state
+            if not IS_FULLSCREEN:
+                screen = Gdk.Screen.get_default()
+                max_w = screen.get_width() * 0.9
+                max_h = screen.get_height() * 0.9
 
-            aspect = w / h
-            new_w = w
-            new_h = h
+                aspect = w / h
+                new_w = w
+                new_h = h
 
-            # Fit to screen if too big
-            if new_w > max_w:
-                new_w = max_w
-                new_h = new_w / aspect
-            if new_h > max_h:
-                new_h = max_h
-                new_w = new_h * aspect
-
-            self.resize(int(new_w), int(new_h))
+                if new_w > max_w:
+                    new_w = max_w
+                    new_h = new_w / aspect
+                if new_h > max_h:
+                    new_h = max_h
+                    new_w = new_h * aspect
+                self.resize(int(new_w), int(new_h))
 
         def map_input_to_video(self, widget, x_in, y_in):
-            """
-            Compensates for black bars (Letterboxing/Pillarboxing).
-            Converts raw Widget XY to Video Percentage XY (0.0 - 1.0).
-            """
-            # 1. Get current Widget Dimensions
             widget_w = widget.get_allocated_width()
             widget_h = widget.get_allocated_height()
 
-            # 2. Calculate Aspect Ratios
+            # Safety check for zero-size
+            if widget_w == 0 or widget_h == 0: return 0.0, 0.0
+
             widget_aspect = widget_w / widget_h
             source_aspect = self.source_w / self.source_h
 
-            # 3. Determine 'Drawn' Video Dimensions inside the widget
-            # GStreamer 'videoconvert' typically fits image to center
             if widget_aspect > source_aspect:
-                # Widget is wider than video -> PILLARBOX (Black bars Left/Right)
                 draw_h = widget_h
                 draw_w = widget_h * source_aspect
                 offset_x = (widget_w - draw_w) / 2
                 offset_y = 0
             else:
-                # Widget is taller than video -> LETTERBOX (Black bars Top/Bottom)
                 draw_w = widget_w
                 draw_h = widget_w / source_aspect
                 offset_x = 0
                 offset_y = (widget_h - draw_h) / 2
 
-            # 4. Normalize Input
-            # Subtract the offset (start of video)
             rel_x = x_in - offset_x
             rel_y = y_in - offset_y
 
-            # Divide by the DRAWN size, not the full widget size
             norm_x = rel_x / draw_w
             norm_y = rel_y / draw_h
 
-            # 5. Clamp values to strict 0.0 - 1.0
-            # (Ignores clicks in the black bars)
-            norm_x = max(0.0, min(1.0, norm_x))
-            norm_y = max(0.0, min(1.0, norm_y))
-
-            return norm_x, norm_y
+            return max(0.0, min(1.0, norm_x)), max(0.0, min(1.0, norm_y))
 
         def send_input(self, data):
             try: self.input_sock.sendto(json.dumps(data).encode(), self.server_addr)
@@ -207,7 +225,6 @@ def run_gui_worker():
         def on_motion(self, widget, event):
             if time.time() - self.last_move < 0.016: return True
             self.last_move = time.time()
-
             nx, ny = self.map_input_to_video(widget, event.x, event.y)
             self.send_input({"type": "move", "x": nx, "y": ny})
             return True
@@ -217,6 +234,11 @@ def run_gui_worker():
             t = "press" if event.type == Gdk.EventType.BUTTON_PRESS else "release"
             self.send_input({"type": t, "x": nx, "y": ny, "btn": event.button})
             return True
+
+        def on_key_press(self, widget, event):
+            # Allow ESC to quit
+            if event.keyval == Gdk.KEY_Escape:
+                self.close()
 
         def close(self, *args):
             self.pipeline.set_state(Gst.State.NULL)

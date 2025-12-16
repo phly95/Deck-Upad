@@ -1,15 +1,3 @@
-Yes, we can absolutely add a logic check for the refresh rate.
-
-Here is how the logic works in the updated script:
-
-1.  **Detection:** It queries the `Gdk.Monitor` where the window is located to get the refresh rate in milli-Hertz (e.g., `60000` for 60Hz).
-2.  **Math:** It divides by `60` and checks the remainder. It accepts values close to **60Hz, 120Hz, 240Hz**, etc. (handling the `59.94` NTSC standard correctly).
-3.  **Warning:** If it detects a rate like **90Hz** or **144Hz**, it pauses and shows a dialog box: *"Refresh Rate Mismatch detected. Please set your monitor to 60Hz or a multiple (120Hz) for smoothest streaming."*
-4.  **Choice:** The user can click **"Ignore"** (continue anyway) or **"Quit"** (close app to go change settings).
-
-### Updated `receiver.py`
-
-```python
 import sys
 import os
 import subprocess
@@ -354,4 +342,3 @@ def run_gui_worker():
 if __name__ == "__main__":
     if "--worker" in sys.argv: run_gui_worker()
     else: run_host_logic()
-```

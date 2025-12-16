@@ -17,7 +17,7 @@ The project uses **Podman** containers to manage complex, low-level Linux functi
 
 ## What Needs Work
 
-* **Simplified Launch Process:** Simplify the launch process to make it easy to get going (perhaps with 3 modes: Host, Client (P2P), Client (external AP).
+* **Simplified Launch Process:** Simplify the launch process to make it easy to get going (perhaps with 3 modes: Host, Client (P2P), Client (external AP). Additionally, help the user create a VKMS display for KDE.
 * **Portability/Testing:** More testing is needed to check if the code is portable (Bazzite and Steam OS for testing, currently it's confirmed working when both the desktop and Steam Deck are on Bazzite under a Wayland session).
 * **Modularization:** Modularizing the networking components into an API that other scripts can interact with. Perhaps breaking the wifi solution into a separate project for use in other applications.
 

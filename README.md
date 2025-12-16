@@ -2,7 +2,7 @@
 An experiment to turn the Steam Deck into a controller with a screen for a remote PC, similar to the Wii U gamepad.
 
 
-https://github.com/user-attachments/assets/bfc63a6d-95d8-448f-8c55-4da5a6917598
+https://github.com/user-attachments/assets/9d859c82-4915-40b5-b0e8-9d2090256aee
 
 
 This is a Work In Progress (WIP), but all major functionality is now working. This has only been tested with Bazzite KDE. (on both sides) It's quite likely that this will not work in Gnome or any other desktop environment. You will need to set up a VKMS virtual display before using this. The name will be something like Virtual-1, and you should set it to something like 1280x800 to match the Steam Deck.

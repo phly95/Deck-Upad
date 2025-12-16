@@ -9,11 +9,13 @@ import re
 
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
-BASE_IMAGE = "fedora:41"  # Fedora base for compatibility with Bazzite/SteamOS
+BUILDER_NAME = "usbip-builder"
+BASE_IMAGE = "fedora:41"
 CUSTOM_IMAGE = "usbip-ready"
 
 class ContainerUSBIP:
     def __init__(self):
+        # We update this command dynamically depending on which container is active
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/bash -c"
 
     def run_command(self, cmd, shell=False, check=True, input=None):
@@ -40,25 +42,66 @@ class ContainerUSBIP:
 
     def cleanup(self):
         print("\n\n--- Cleaning Up ---")
-        # Attempt to stop daemon inside
         self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
-        print("Stopping container...")
+        print("Stopping containers...")
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+        # Ensure builder is gone too
+        self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
         print("Done.")
 
-    def initialize_container(self):
-        print("\n[1/4] Initializing USBIP Container...")
-
-        # Check if we already built the custom image
+    def ensure_image_exists(self):
+        """Builds the custom image if it doesn't exist."""
+        print("[1/5] Checking for USBIP tools image...")
         has_image = self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False)
-        use_image = CUSTOM_IMAGE if has_image else BASE_IMAGE
 
+        if has_image:
+            print("      Image found. Skipping build.")
+            return
+
+        print("      Image not found. Building...")
+        print("[2/5] Creating Builder Container (Internet Required)...")
+
+        # 1. Start BUILDER (No Host Mounts, just internet)
+        self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+        self.run_command(
+            f"podman run -d --name {BUILDER_NAME} "
+            f"{BASE_IMAGE} sleep infinity"
+        )
+
+        # 2. Install Tools
+        print("      Installing packages (this may take a minute)...")
+        # We exclude kernel-debug to save space, but we let it install kernel-core
+        # because usbip tools often depend on exact kernel versions.
+        install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils --exclude=kernel-debug*"
+
+        try:
+            self.run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
+
+            # 3. Commit to Image
+            print(f"      Saving to '{CUSTOM_IMAGE}'...")
+            self.run_command(f"podman commit {BUILDER_NAME} {CUSTOM_IMAGE}")
+
+            # 4. Cleanup Builder
+            self.run_command(f"podman rm -f {BUILDER_NAME}")
+            print("      Build Complete.")
+
+        except Exception as e:
+            print("\n[ERROR] Build failed. Check your internet connection.")
+            print("Cleaning up builder...")
+            self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+            sys.exit(1)
+
+    def start_runtime_container(self):
+        """Starts the privileged container with host access."""
+        print("[3/5] Starting Runtime Container...")
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # CRITICAL: --privileged gives access to Host Kernel Modules
-        # CRITICAL: --net=host allows simple IP communication
-        # CRITICAL: Volumes mount USB bus so we can see devices
+        # CRITICAL:
+        # --privileged: Access to Host Hardware/Kernel
+        # --net=host: Simple IP networking
+        # -v /dev:/dev: See USB devices
+        # -v /lib/modules:/lib/modules:ro: Load Host Kernel Modules
         self.run_command(
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
@@ -66,38 +109,19 @@ class ContainerUSBIP:
             "-v /dev:/dev "
             "-v /lib/modules:/lib/modules:ro "
             "-v /sys:/sys "
-            f"{use_image} sleep infinity"
+            f"{CUSTOM_IMAGE} sleep infinity"
         )
-
-        # Install tools if using base image
-        if use_image == BASE_IMAGE:
-            print("[2/4] Installing USBIP tools (Internet Required)...")
-            # Fedora/Bazzite/SteamOS compatible tools
-            install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils"
-
-            try:
-                self.run_command(f"{self.exec_cmd} '{install_cmd}'")
-                print(f"      Caching image to '{CUSTOM_IMAGE}'...")
-                self.run_command(f"podman commit {CONTAINER_NAME} {CUSTOM_IMAGE}")
-            except Exception as e:
-                print("Failed to install tools. Check internet connection.")
-                raise e
-        else:
-            print("[2/4] Using Cached Tools (Offline Ready).")
 
     # --- SENDER LOGIC (STEAM DECK) ---
     def setup_sender(self):
         print("\n--- SENDER MODE (Steam Deck) ---")
 
-        # 1. Load Host Kernel Module (Privileged container can do this!)
         print("      Loading 'usbip-host' kernel module...")
         self.run_command(f"{self.exec_cmd} 'modprobe usbip-host'")
 
-        # 2. Start Daemon
         print("      Starting usbip daemon...")
         self.run_command(f"{self.exec_cmd} 'usbipd -D'")
 
-        # 3. List Devices
         print("      Scanning local USB devices...")
         output = self.run_command(f"{self.exec_cmd} 'usbip list -l'")
 
@@ -123,7 +147,6 @@ class ContainerUSBIP:
 
         target = devices[int(sel)-1]
 
-        # 4. Bind
         print(f"\nBinding {target['bus']}...")
         self.run_command(f"{self.exec_cmd} 'usbip bind -b {target['bus']}'")
 
@@ -145,11 +168,9 @@ class ContainerUSBIP:
 
         sender_ip = input("Enter Steam Deck IP: ").strip()
 
-        # 1. Load Host Kernel Module
         print("      Loading 'vhci-hcd' kernel module...")
         self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
 
-        # 2. Scan Remote
         print(f"      Scanning {sender_ip}...")
         try:
             output = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
@@ -161,7 +182,6 @@ class ContainerUSBIP:
 
         bus_id = input("\nEnter Bus ID from above (e.g., 1-1): ").strip()
 
-        # 3. Attach
         print(f"      Attaching {bus_id}...")
         self.run_command(f"{self.exec_cmd} 'usbip attach -r {sender_ip} -b {bus_id}'")
 
@@ -173,11 +193,7 @@ class ContainerUSBIP:
         try:
             input()
         finally:
-            # We need the port number to detach, not the bus id
-            # Usually port 00 if it's the first one
             print("Detaching...")
-            # Ideally we parse 'usbip port' to find the port number,
-            # but simple detach 00 often works for single device
             self.run_command(f"{self.exec_cmd} 'usbip detach -p 00'", check=False)
 
 def main():
@@ -190,7 +206,13 @@ def main():
     mode = input("Select Mode (1/2): ").strip()
 
     try:
-        tool.initialize_container()
+        # Step 1: Build Image (if needed)
+        tool.ensure_image_exists()
+
+        # Step 2: Run Runtime Container
+        tool.start_runtime_container()
+
+        # Step 3: Run Logic
         if mode == '1':
             tool.setup_sender()
         elif mode == '2':

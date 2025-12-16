@@ -1,7 +1,7 @@
 # Deck-Upad
 An experiment to turn the Steam Deck into a controller with a screen for a remote PC, similar to the Wii U gamepad.
 
-This is a Work In Progress (WIP), but all major functionality is now working.
+This is a Work In Progress (WIP), but all major functionality is now working. This has only been tested with Bazzite KDE. It's quite likely that this will not work in Gnome or any other desktop environment.
 
 ## Technical Overview
 The project uses **Podman** containers to manage complex, low-level Linux functionality on the Steam Deck, including dedicated network control and virtual hardware binding. **GStreamer** and **PipeWire** are used for low-latency video streaming, and **USB/IP** handles the controller passthrough.

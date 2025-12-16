@@ -173,7 +173,7 @@ class InputServer(threading.Thread):
             except Exception:
                 pass
 
-# --- RESOLUTION BROADCASTER (UPDATED) ---
+# --- RESOLUTION BROADCASTER ---
 class ResolutionBroadcaster(threading.Thread):
     def __init__(self, target_ip, w, h):
         super().__init__()
@@ -249,7 +249,7 @@ def run_pipeline(node_id, receiver_ip, dm_instance, window_proc=None):
     input_server = InputServer(dm_instance)
     input_server.start()
 
-    # 2. Start Resolution Broadcaster (NEW)
+    # 2. Start Resolution Broadcaster
     w = dm_instance.selected_display['w']
     h = dm_instance.selected_display['h']
     res_broadcaster = ResolutionBroadcaster(receiver_ip, w, h)
@@ -276,9 +276,7 @@ def run_pipeline(node_id, receiver_ip, dm_instance, window_proc=None):
         pipeline = Gst.parse_launch(pipeline_str)
         pipeline.set_state(Gst.State.PLAYING)
 
-        if window_proc:
-            try: window_proc.terminate()
-            except: pass
+        # CHANGE: Window no longer auto-closes here.
 
         loop = GLib.MainLoop()
         loop.run()

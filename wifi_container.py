@@ -51,19 +51,22 @@ class ContainerVPN:
             sys.exit(1)
 
     # --- Session Management ---
-    def save_session(self, mode, ssid, password, last_ip=None):
-        """Saves current config AND the last known IP."""
+    def save_session(self, mode, ssid, password, net_config=None):
+        """Saves current config AND the full network state."""
         data = {
             "mode": mode,
             "ssid": ssid,
             "password": password,
-            "last_ip": last_ip
+            "net_config": net_config
         }
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump(data, f)
             os.chmod(STATE_FILE, 0o600)
-            print(f"\n[Session Saved] State (IP: {last_ip}) written to {STATE_FILE}")
+            if net_config:
+                print(f"\n[Session Saved] State (IP: {net_config.get('ip')}) written to {STATE_FILE}")
+            else:
+                print(f"\n[Session Saved] State written to {STATE_FILE}")
         except Exception as e:
             print(f"Warning: Could not save session: {e}")
 
@@ -92,10 +95,33 @@ class ContainerVPN:
         except: pass
         return None
 
-    def get_current_wan_ip(self):
-        """Helper to get the current IP inside the container."""
+    def get_current_network_state(self):
+        """Scrapes IP, CIDR, and Gateway from inside the container."""
+        config = {"ip": None, "cidr": "24", "gateway": None}
         try:
-            return self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet | awk \"{{print \\$2}}\"'").split('/')[0]
+            # Get IP and CIDR
+            # Output format ex: "    inet 192.168.1.105/24 scope global wlan0"
+            ip_line = self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet'")
+            if ip_line:
+                parts = ip_line.split()
+                if len(parts) >= 2:
+                    cidr_full = parts[1] # 192.168.1.105/24
+                    if '/' in cidr_full:
+                        config['ip'], config['cidr'] = cidr_full.split('/')
+                    else:
+                        config['ip'] = cidr_full
+
+            # Get Gateway
+            # Output format ex: "default via 192.168.1.1 dev wlan0"
+            route_line = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0 | grep default'")
+            if route_line:
+                parts = route_line.split()
+                if 'via' in parts:
+                    idx = parts.index('via')
+                    if idx + 1 < len(parts):
+                        config['gateway'] = parts[idx + 1]
+
+            return config if config['ip'] else None
         except: return None
 
     # --- WiFi Utils ---
@@ -215,8 +241,10 @@ class ContainerVPN:
     def optimize_wifi(self):
         print("      Optimizing WiFi Latency (Power Save OFF)...")
         self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
+        # Prevent MAC randomization if supported
+        self.run_command(f"{self.exec_cmd} 'ip link set wlan0 addrgenmode none' 2>/dev/null || true")
 
-    def setup_client_mode(self, ssid, password, target_ip=None):
+    def setup_client_mode(self, ssid, password, static_config=None):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
@@ -226,31 +254,52 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
 
-        # --- MODIFIED DHCP LOGIC ---
-        if target_ip:
-            print(f"      Requesting previous IP: {target_ip}...")
-            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -r {target_ip}'")
+        # --- IP ALLOCATION STRATEGY ---
+        gateway_ip = "172.16.16.16" # Fallback dummy
+
+        if static_config and static_config.get('ip'):
+            print(f"      [RESUME] Taking IP by force: {static_config['ip']}")
+            try:
+                # 1. Force IP Add
+                cidr = static_config.get('cidr', '24')
+                ip_cmd = f"ip addr add {static_config['ip']}/{cidr} dev wlan0"
+                self.run_command(f"{self.exec_cmd} '{ip_cmd}'")
+
+                # 2. Force Route Add
+                gw = static_config.get('gateway')
+                if gw:
+                    print(f"      [RESUME] Restoring Gateway: {gw}")
+                    self.run_command(f"{self.exec_cmd} 'ip route add default via {gw} dev wlan0'")
+                    gateway_ip = gw
+                else:
+                    # Fallback if we somehow lost the gateway
+                    print("      [WARN] No saved gateway. Attempting DHCP for route only...")
+                    self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
+            except Exception as e:
+                print(f"      [ERROR] Static Force Failed: {e}. Falling back to DHCP.")
+                self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
         else:
-            print("      Requesting dynamic IP...")
+            print("      Requesting dynamic IP (DHCP)...")
             self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
-        # ---------------------------
 
-        gateway_ip = "172.16.16.16"
-        try:
-            output = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
-            if output:
-                for line in output.split('\n'):
-                    if 'src' in line and '/' in line:
-                        subnet = line.split()[0].split('/')[0]
-                        octets = subnet.split('.')
-                        if len(octets) == 4:
-                            if subnet.startswith("192.168.50"): gateway_ip = "192.168.50.1"
-                            else: gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.16"
-                        break
-        except: pass
+            # Gateway Detection (Only needed if we used DHCP)
+            try:
+                output = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
+                if output:
+                    for line in output.split('\n'):
+                        if 'src' in line and '/' in line:
+                            subnet = line.split()[0].split('/')[0]
+                            octets = subnet.split('.')
+                            if len(octets) == 4:
+                                if subnet.startswith("192.168.50"): gateway_ip = "192.168.50.1"
+                                else: gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.16"
+                            break
+            except: pass
 
-        self.run_command(f"{self.exec_cmd} 'ip route del default || true'")
-        self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0'")
+        # Ensure default route is strictly via wlan0 inside container
+        self.run_command(f"{self.exec_cmd} 'ip route del default 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0 2>/dev/null || true'")
+
         print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
@@ -294,7 +343,10 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def show_status(self, mode):
-        lan_ip = self.get_current_wan_ip() or "Unknown"
+        # We try to read network state, but if we are in resume loop, we might have it in memory
+        lan_ip = "Unknown"
+        state = self.get_current_network_state()
+        if state: lan_ip = state['ip']
 
         print("\n" + "="*40)
         print(f"   CONNECTION ESTABLISHED ({mode})")
@@ -308,7 +360,7 @@ dhcp-option=6,8.8.8.8"""
             print(f"You are a CLIENT. Host IP: 192.168.50.1")
         print("="*40)
         print(" [Enter] or 'stop' : Full Cleanup & Exit")
-        print(" 'pause'           : Save Session (SSID+IP), Cleanup & Exit")
+        print(" 'pause'           : Save Session (IP+SSID), Cleanup & Exit")
         print(" 'bg'              : Detach (Run in Background)")
         print("="*40)
 
@@ -337,7 +389,7 @@ def main():
         ssid = ""
         password = ""
         mode_code = "1"
-        last_ip = None
+        net_config = None
 
         saved_session = vpn.load_session()
         use_saved = False
@@ -345,15 +397,16 @@ def main():
         if saved_session:
             print(f"\n[?] PAUSED SESSION FOUND: {saved_session['mode']}")
             print(f"    SSID: {saved_session['ssid']}")
-            if saved_session.get('last_ip'):
-                print(f"    IP:   {saved_session['last_ip']}")
+            nc = saved_session.get('net_config')
+            if nc:
+                print(f"    IP:   {nc.get('ip')} (Gateway: {nc.get('gateway')})")
 
             choice = input("    Resume this session? (Y/n): ").strip().lower()
             if choice != 'n':
                 use_saved = True
                 ssid = saved_session['ssid']
                 password = saved_session['password']
-                last_ip = saved_session.get('last_ip')
+                net_config = saved_session.get('net_config')
                 mode_code = '1' if saved_session['mode'] == 'Client Mode' else '2'
             else:
                 vpn.clear_session()
@@ -392,7 +445,7 @@ def main():
         active_mode_str = ""
         if mode_code == '1':
             active_mode_str = "Client Mode"
-            vpn.setup_client_mode(ssid, password, target_ip=last_ip)
+            vpn.setup_client_mode(ssid, password, static_config=net_config)
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
         else:
             active_mode_str = "AP Mode"
@@ -407,9 +460,9 @@ def main():
         if user_in == 'bg':
             vpn.shutdown_on_exit = False
         elif user_in == 'pause':
-            # Grab IP before destroying container
-            current_ip = vpn.get_current_wan_ip()
-            vpn.save_session(active_mode_str, ssid, password, last_ip=current_ip)
+            # Grab Full Network Config before destroying container
+            nc = vpn.get_current_network_state()
+            vpn.save_session(active_mode_str, ssid, password, net_config=nc)
             vpn.shutdown_on_exit = True
         elif user_in == 'stop' or user_in == '':
             vpn.clear_session()

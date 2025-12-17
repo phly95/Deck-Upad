@@ -23,7 +23,7 @@ SUBNET_CIDR = "24"
 AP_GATEWAY_IP = "192.168.50.1"
 AP_DHCP_RANGE = "192.168.50.10,192.168.50.50,12h"
 
-# Host-Side Session Persistence
+# Host-Side Session Persistence (Clears on Reboot)
 HOST_SESSION_FILE = "/var/run/wifi_container_session.conf"
 
 class ContainerVPN:
@@ -52,31 +52,39 @@ class ContainerVPN:
             print("Error: This script must be run as root (sudo).")
             sys.exit(1)
 
-    # --- Session Management ---
+    # --- Session Management (Host Side) ---
     def save_session_host(self, mode, ssid, password):
+        """Saves session to Host /var/run so we can survive container death."""
         content = f"{mode}\n{ssid}\n{password}\n{self.wifi_interface}"
         try:
-            with open(HOST_SESSION_FILE, "w") as f: f.write(content)
+            with open(HOST_SESSION_FILE, "w") as f:
+                f.write(content)
             os.chmod(HOST_SESSION_FILE, 0o600)
-        except Exception as e: print(f"Warning: Could not save session: {e}")
+        except Exception as e:
+            print(f"Warning: Could not save session: {e}")
 
     def load_session_host(self):
-        if not os.path.exists(HOST_SESSION_FILE): return None
+        if not os.path.exists(HOST_SESSION_FILE):
+            return None
         try:
-            with open(HOST_SESSION_FILE, "r") as f: lines = f.read().splitlines()
-            if len(lines) >= 3: return lines
+            with open(HOST_SESSION_FILE, "r") as f:
+                lines = f.read().splitlines()
+            if len(lines) >= 3:
+                return lines
         except: pass
         return None
 
     def clear_session_host(self):
-        if os.path.exists(HOST_SESSION_FILE): os.remove(HOST_SESSION_FILE)
+        if os.path.exists(HOST_SESSION_FILE):
+            os.remove(HOST_SESSION_FILE)
 
     def is_container_running(self):
         res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
     def get_container_pid(self):
-        try: return self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+        try:
+            return self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
         except: return None
 
     # --- WiFi Utils ---
@@ -90,7 +98,7 @@ class ContainerVPN:
             output = self.run_command("iw dev | grep Interface", shell=True)
             if output: return output.split()[-1]
         except: pass
-        return "wlp9s0"
+        return "wlp9s0" # Fallback
 
     def scan_wifi(self):
         print(f"Scanning networks on {self.wifi_interface}...")
@@ -124,7 +132,9 @@ class ContainerVPN:
         print("Restoring Host WiFi...")
         self.run_command("rfkill unblock wifi", check=False)
         time.sleep(1)
+
         target_iface = self.wifi_interface
+        # Check if name changed back
         try:
             out = self.run_command("iw dev | grep Interface", shell=True)
             if out: target_iface = out.split()[-1]
@@ -135,7 +145,8 @@ class ContainerVPN:
         self.run_command(f"nmcli device connect {target_iface}", check=False)
 
     def cleanup(self):
-        if not self.shutdown_on_exit: return
+        if not self.shutdown_on_exit:
+            return
 
         print("\n\n--- Cleaning Up ---")
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
@@ -145,6 +156,7 @@ class ContainerVPN:
         print("Stopping container (Releasing WiFi Card)...")
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+
         self.force_restore_host_wifi()
 
         if self.is_pausing:
@@ -176,7 +188,8 @@ class ContainerVPN:
                     self.run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache wpa_supplicant iw iptables hostapd dnsmasq iproute2")
                     break
                 except:
-                    if i < max_retries - 1: time.sleep(5)
+                    if i < max_retries - 1:
+                        time.sleep(5)
                     else: raise
             print(f"      Caching image to '{CUSTOM_IMAGE}'...")
             self.run_command(f"podman commit {CONTAINER_NAME} {CUSTOM_IMAGE}")
@@ -199,9 +212,11 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
 
         nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR}"
-        if is_client_mode: nm_cmd += f" gw4 {IP_CTR}"
+        if is_client_mode:
+            nm_cmd += f" gw4 {IP_CTR}"
 
         self.run_command(nm_cmd)
+
         metric = "50" if is_client_mode else "600"
         self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric {metric}")
         if is_client_mode: self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
@@ -221,67 +236,47 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.optimize_wifi()
 
-        # --- SAFE CONFIG GENERATION (FIXED) ---
-        # We generate the config manually to avoid shell interpretation issues
-        # wpa_passphrase calculates the PMK (256-bit key) from the passphrase
-        # We run this command inside the container but handle input/output safely
+        # --- SAFE CONFIG GENERATION ---
+        # We calculate the config in Python to avoid shell injection issues with special chars
         try:
-            # We construct a command that takes literal arguments safely
-            # Note: We use the list format for subprocess to avoid local shell expansion
-            # But since we are piping into podman, we need to be careful.
-            # Easiest way: Use python to write the file content directly.
+            # Generate config block using wpa_passphrase locally via python wrapper
+            safe_cmd = f"wpa_passphrase {shlex.quote(ssid)} {shlex.quote(password)}"
+            block = self.run_command(f"{self.exec_cmd} '{safe_cmd}'")
 
-            # 1. Write header
             header = "ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\nnetwork={\n"
+            full_conf = header + block[block.find("network={") + 9:] # clean append
 
-            # 2. Append SSID and Password safely
-            # We use wpa_passphrase to generate the block properly
-            safe_gen_cmd = f"wpa_passphrase {shlex.quote(ssid)} {shlex.quote(password)}"
-
-            # Run inside container to get the output block
-            block = self.run_command(f"{self.exec_cmd} '{safe_gen_cmd}'")
-
-            full_conf = header + block[block.find("network={") + 9:] # strip duplicate network={
-
-            # Write safely using stdin
+            # Write to file safely
             self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=full_conf)
-
         except Exception as e:
             print(f"Error generating config: {e}")
             sys.exit(1)
 
-        # Start WPA Supplicant
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
 
-        # --- CONNECTION WAIT LOOP ---
+        # --- WAIT FOR CONNECTION (FIX FOR DHCP) ---
         print("      Waiting for association...")
         connected = False
-        for i in range(40): # Wait up to 40 seconds
+        for i in range(40):
             status = self.run_command(f"{self.exec_cmd} 'wpa_cli -i wlan0 status'")
-
             state = "UNKNOWN"
-            for line in status.split('\n'):
-                if line.startswith("wpa_state="):
-                    state = line.split('=')[1]
+            if status:
+                for line in status.split('\n'):
+                    if line.startswith("wpa_state="):
+                        state = line.split('=')[1]
+                        break
 
             sys.stdout.write(f"\r      Status: {state} ({i}s)   ")
             sys.stdout.flush()
 
             if state == "COMPLETED":
-                print("\n      [OK] WiFi Associated!")
+                print("\n      [OK] Associated!")
                 connected = True
                 break
-            elif state == "DISCONNECTED" and i > 10:
-                # If we are disconnected after 10s, it's likely authentication failure
-                pass
-
             time.sleep(1)
 
         if not connected:
-            print("\n      [ERROR] Connection timed out.")
-            print("      Possible causes: Wrong Password, Weak Signal, or Captive Portal.")
-            # We do NOT exit here, we let it try DHCP just in case the status check lied,
-            # but usually this means game over.
+            print("\n      [WARNING] Connection timed out. Password might be wrong.")
 
         print("      Requesting IP (DHCP)...")
         self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
@@ -311,7 +306,6 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
         self.optimize_wifi()
 
-        # AP Mode config is safer because we write raw strings, but let's be careful
         hostapd_conf = f"""interface=wlan0
 ssid={ssid}
 country_code=US

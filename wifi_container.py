@@ -127,12 +127,12 @@ class ContainerVPN:
         self.run_command(f"iw phy phy0 set netns {ctr_pid}")
         return ctr_pid
 
-    def setup_veth_link(self, ctr_pid):
+    def setup_veth_link(self, ctr_pid, is_client_mode):
         print(f"[5/6] Creating High-Speed Veth Link (Host <-> Container)...")
         # 1. Create Veth Pair
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
 
-        # 2. Performance Tuning: Increase Queue Length to prevent drops/bufferbloat
+        # 2. Performance Tuning
         self.run_command(f"ip link set {VETH_HOST} txqueuelen 1000")
 
         # 3. Move Container-side end
@@ -142,13 +142,31 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
 
-        # 5. Configure Host Side
-        self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR} gw4 {IP_CTR}")
-        self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
-        self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 50")
+        # 5. Configure Host Side [FIXED LOGIC HERE]
+        # Base command for the connection
+        nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR}"
+
+        # Only add the container as a Gateway if we are in Client Mode (trying to get internet FROM it)
+        if is_client_mode:
+            print("      Configuring Container as Default Gateway...")
+            nm_cmd += f" gw4 {IP_CTR}"
+        else:
+            print("      AP Mode: Skipping Default Gateway configuration to prevent Host freeze.")
+
+        self.run_command(nm_cmd)
+
+        if is_client_mode:
+            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
+            # High Priority (50) for Client Mode
+            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 50")
+        else:
+            # Low Priority (600) for AP Mode so Host uses its own internet
+            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 600")
+
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
         # 6. Add Explicit Route on Host to WiFi Subnet via Container
+        # This allows you to ping AP clients even without the gateway set
         self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
 
         # 7. Enable NAT on Container (Postrouting)
@@ -164,7 +182,7 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
 
-        self.optimize_wifi() # Disable Power Save
+        self.optimize_wifi()
 
         psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
         self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
@@ -202,7 +220,7 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
 
-        self.optimize_wifi() # Disable Power Save
+        self.optimize_wifi()
 
         hostapd_conf = f"""interface=wlan0
 ssid={ssid}
@@ -276,8 +294,11 @@ def main():
             while True:
                 sel = input("Select # or SSID: ")
                 if sel.isdigit() and 1 <= int(sel) <= len(nets):
-                    ssid = nets[int(sel)-1]; break
-                elif sel: ssid = sel; break
+                    ssid = nets[int(sel)-1]
+                    break
+                elif sel:
+                    ssid = sel
+                    break
         else:
             ssid = input("Enter new SSID: ")
 
@@ -288,11 +309,13 @@ def main():
 
         if c == '1':
             vpn.setup_client_mode(ssid, pw)
-            vpn.setup_veth_link(ctr_pid)
+            # Pass True for Client Mode (Sets Gateway + High Priority)
+            vpn.setup_veth_link(ctr_pid, is_client_mode=True)
             vpn.show_status("Client Mode")
         else:
             vpn.setup_ap_mode(ssid, pw)
-            vpn.setup_veth_link(ctr_pid)
+            # Pass False for AP Mode (No Gateway + Low Priority)
+            vpn.setup_veth_link(ctr_pid, is_client_mode=False)
             vpn.show_status("AP Mode")
 
         input("\nPress ENTER to stop...")

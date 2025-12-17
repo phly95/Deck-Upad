@@ -96,33 +96,33 @@ class ContainerVPN:
         return None
 
     def get_current_network_state(self):
-        """Scrapes IP, CIDR, and Gateway from inside the container."""
-        config = {"ip": None, "cidr": "24", "gateway": None}
-        try:
-            # Get IP and CIDR
-            # Output format ex: "    inet 192.168.1.105/24 scope global wlan0"
-            ip_line = self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet'")
-            if ip_line:
-                parts = ip_line.split()
-                if len(parts) >= 2:
-                    cidr_full = parts[1] # 192.168.1.105/24
-                    if '/' in cidr_full:
-                        config['ip'], config['cidr'] = cidr_full.split('/')
-                    else:
-                        config['ip'] = cidr_full
+            """Scrapes IP, CIDR, and Gateway from inside the container."""
+            config = {"ip": None, "cidr": "24", "gateway": None}
+            try:
+                # Get IP and CIDR
+                # FIX: Added check=False so if grep finds nothing, it doesn't raise an exception
+                ip_line = self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet'", check=False)
+                if ip_line:
+                    parts = ip_line.split()
+                    if len(parts) >= 2:
+                        # Usually "inet 192.168.X.X/24" -> parts[1] is the IP/CIDR
+                        cidr_full = parts[1]
+                        if '/' in cidr_full:
+                            config['ip'], config['cidr'] = cidr_full.split('/')
+                        else:
+                            config['ip'] = cidr_full
 
-            # Get Gateway
-            # Output format ex: "default via 192.168.1.1 dev wlan0"
-            route_line = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0 | grep default'")
-            if route_line:
-                parts = route_line.split()
-                if 'via' in parts:
-                    idx = parts.index('via')
-                    if idx + 1 < len(parts):
-                        config['gateway'] = parts[idx + 1]
+                # Get Gateway
+                route_line = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0 | grep default'", check=False)
+                if route_line:
+                    parts = route_line.split()
+                    if 'via' in parts:
+                        idx = parts.index('via')
+                        if idx + 1 < len(parts):
+                            config['gateway'] = parts[idx + 1]
 
-            return config if config['ip'] else None
-        except: return None
+                return config if config['ip'] else None
+            except: return None
 
     # --- WiFi Utils ---
     def get_active_wifi_interface(self):
@@ -343,26 +343,32 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def show_status(self, mode):
-        # We try to read network state, but if we are in resume loop, we might have it in memory
-        lan_ip = "Unknown"
-        state = self.get_current_network_state()
-        if state: lan_ip = state['ip']
+            # We try to read network state, but if we are in resume loop, we might have it in memory
+            lan_ip = "Unknown"
 
-        print("\n" + "="*40)
-        print(f"   CONNECTION ESTABLISHED ({mode})")
-        print("="*40)
-        print(f"YOUR WIFI IP:         {lan_ip}")
-        print(f"INTERNAL VETH IP:     {IP_HOST}")
-        print("-" * 40)
-        if mode == "AP Mode":
-            print(f"You are the HOST. Clients: 192.168.50.10 - 50")
-        else:
-            print(f"You are a CLIENT. Host IP: 192.168.50.1")
-        print("="*40)
-        print(" [Enter] or 'stop' : Full Cleanup & Exit")
-        print(" 'pause'           : Save Session (IP+SSID), Cleanup & Exit")
-        print(" 'bg'              : Detach (Run in Background)")
-        print("="*40)
+            # FIX: If in AP Mode, use the static IP defined at the top
+            if mode == "AP Mode":
+                lan_ip = AP_GATEWAY_IP
+            else:
+                # Only scrape if we are a client (DHCP)
+                state = self.get_current_network_state()
+                if state: lan_ip = state['ip']
+
+            print("\n" + "="*40)
+            print(f"   CONNECTION ESTABLISHED ({mode})")
+            print("="*40)
+            print(f"YOUR WIFI IP:         {lan_ip}")
+            print(f"INTERNAL VETH IP:     {IP_HOST}")
+            print("-" * 40)
+            if mode == "AP Mode":
+                print(f"You are the HOST. Clients: 192.168.50.10 - 50")
+            else:
+                print(f"You are a CLIENT. Host IP: 192.168.50.1")
+            print("="*40)
+            print(" [Enter] or 'stop' : Full Cleanup & Exit")
+            print(" 'pause'           : Save Session (IP+SSID), Cleanup & Exit")
+            print(" 'bg'              : Detach (Run in Background)")
+            print("="*40)
 
 def main():
     vpn = ContainerVPN()

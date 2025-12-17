@@ -50,11 +50,31 @@ class ContainerUSBIP:
         res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
-    def stop_container(self):
+def stop_container(self):
         print("\nStopping containers...")
+
+        # --- [FIX START] Sender Cleanup: Release devices back to Host ---
+        try:
+            print("      Releasing local devices back to host...")
+            # We look into the sysfs directory for usbip-host to see what is currently bound.
+            # We must do this BEFORE killing the container, using the container's usbip tool.
+            unbind_cmd = (
+                "for busid in $(ls /sys/bus/usb/drivers/usbip-host/ 2>/dev/null | grep -E '^[0-9]+-[0-9]+'); do "
+                "  echo Releasing $busid...; "
+                "  usbip unbind -b $busid; "
+                "done"
+            )
+            # We wrap it in /bin/bash -c to ensure the loop and wildcards run correctly
+            self.run_command(f"{self.exec_cmd} '/bin/bash -c \"{unbind_cmd}\"'", check=False)
+        except Exception as e:
+            # If this fails, we just print a warning and continue to force kill
+            print(f"      [Warning] Could not unbind devices: {e}")
+        # --- [FIX END] ---
+
         self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
         self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
+        # Receiver Cleanup (Existing logic)
         try:
             print("      Detaching all imported USBIP devices...")
             for i in range(8):

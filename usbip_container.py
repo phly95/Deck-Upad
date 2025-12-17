@@ -51,23 +51,49 @@ class ContainerUSBIP:
         return bool(res)
 
     def stop_container(self):
-        print("\nStopping containers...")
-        self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
-        self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
+            print("\nStopping containers...")
 
-        # Attempt to detach all ports cleanly before killing container
-        try:
-            print("      Detaching all imported USBIP devices...")
-            for i in range(8):
-                port_str = f"{i:02}"
-                self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
-        except:
-            pass
+            # 1. Stop the Receiver side logic
+            self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
 
-        self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
-        self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
-        self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-        print("Cleaned up.")
+            # 2. Stop the Sender side daemon
+            self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
+
+            # 3. Receiver Cleanup: Detach imported ports
+            try:
+                print("      Detaching all imported USBIP devices (Receiver)...")
+                for i in range(8):
+                    port_str = f"{i:02}"
+                    self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
+            except:
+                pass
+
+            # --- NEW SECTION: SENDER CLEANUP ---
+            # 4. Sender Cleanup: Unbind the device so Steam Deck gets it back
+            try:
+                print("      Unbinding devices to return control to Host...")
+                # We list local devices to find which one is bound to usbip-host
+                # output format example: "busid=3-1"
+                out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
+
+                if out:
+                    # Regex to find bus IDs (like '1-1', '3-2') that are currently exported
+                    # Note: The output usually looks like " - busid 1-1 (28de:1205)"
+                    bound_devices = re.findall(r"busid\s+([\d\.-]+)", out)
+
+                    for bus_id in bound_devices:
+                        print(f"      Releasing Bus {bus_id}...")
+                        self.run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
+                        # Optional: specific to Steam Deck, trigger udev to re-detect immediately
+                        self.run_command(f"{self.exec_cmd} 'udevadm trigger'", check=False)
+            except Exception as e:
+                print(f"      Error during unbind: {e}")
+            # -----------------------------------
+
+            self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
+            self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+            self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+            print("Cleaned up.")
 
     def ensure_image_exists(self):
         print("[1/5] Checking for USBIP tools image...")

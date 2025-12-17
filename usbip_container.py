@@ -178,8 +178,16 @@ class ContainerUSBIP:
     def setup_sender(self, resume=False, auto_bg=False):
         print("\n--- SENDER MODE (Steam Deck) ---")
 
+        target_bus = None # Variable to store the bus ID for the watchdog
+
         if resume:
             print(">> Resuming existing Sender session.")
+            # Try to find what was previously bound to pass to watchdog
+            out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
+            if out:
+                found = re.search(r"busid\s+([\d\.-]+)", out)
+                if found:
+                    target_bus = found.group(1)
         else:
             print("      Loading 'usbip-host' kernel module...")
             self.run_command(f"{self.exec_cmd} 'modprobe usbip-host'")
@@ -187,7 +195,7 @@ class ContainerUSBIP:
             self.run_command(f"{self.exec_cmd} 'usbipd -D'")
 
             candidates = self.find_deck_controller_on_host()
-            target_bus = None
+
             if len(candidates) == 1:
                 target_bus = candidates[0]
                 print(f"      Auto-selected Steam Deck Controller: {target_bus}")
@@ -204,17 +212,62 @@ class ContainerUSBIP:
             print(f"      Binding {target_bus}...")
             self.run_command(f"{self.exec_cmd} 'usbip bind -b {target_bus}'")
 
+        # --- NEW: INJECT CONNECTION WATCHDOG ---
+        if target_bus:
+            print(f"      Starting Connection Watchdog for {target_bus}...")
+            # We monitor /proc/net/tcp for Port 3240 (0CA8 hex) in State 01 (ESTABLISHED)
+            watchdog_code = f"""#!/bin/bash
+            BUS_ID="{target_bus}"
+            echo "[Watchdog] Waiting for client to connect..."
+
+            # 1. Wait for a connection to appear
+            while true; do
+                # Look for local_address ending in :0CA8 (port 3240) and state 01 (ESTABLISHED)
+                if grep -q ":0CA8.\\+ 01 " /proc/net/tcp; then
+                    echo "[Watchdog] Client CONNECTED."
+                    break
+                fi
+                sleep 2
+            done
+
+            # 2. Wait for the connection to drop
+            while true; do
+                if ! grep -q ":0CA8.\\+ 01 " /proc/net/tcp; then
+                    echo "[Watchdog] Client DISCONNECTED. Releasing device..."
+
+                    # Unbind device so Steam Deck takes it back
+                    usbip unbind -b $BUS_ID
+
+                    # Kill daemon
+                    pkill usbipd
+
+                    # Trigger udev to ensure Deck UI picks it up immediately
+                    udevadm trigger
+                    exit 0
+                fi
+                sleep 2
+            done
+            """
+
+            watchdog_path = "/usr/local/bin/sender-watchdog.sh"
+            self.run_command(f"{self.exec_cmd} 'cat > {watchdog_path}'", input=watchdog_code)
+            self.run_command(f"{self.exec_cmd} 'chmod +x {watchdog_path}'")
+            # Run in background
+            self.run_command(f"{self.exec_cmd} 'nohup {watchdog_path} > /var/log/watchdog.log 2>&1 &'")
+        # ---------------------------------------
+
         print("\n" + "="*40)
         print(" SENDER IS RUNNING")
-        print(" 1. Press ENTER to Stop and Cleanup.")
-        print(" 2. Type 'bg' and ENTER to keep running in background (Safe to Close).")
+        print(" * Connection Watchdog Active:")
+        print("   If the PC disconnects/sleeps, the controller will")
+        print("   automatically revert to the Steam Deck.")
         print("="*40)
 
         if auto_bg:
             print(">> Auto-backgrounding enabled. Exiting script, container remains running.")
             sys.exit(0)
 
-        user_in = input().strip().lower()
+        user_in = input("Type 'bg' to background, or ENTER to stop manually: ").strip().lower()
         if user_in == 'bg':
             print("Running in background. Run this script again to stop it.")
             sys.exit(0)

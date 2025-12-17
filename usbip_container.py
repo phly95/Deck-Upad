@@ -178,11 +178,10 @@ class ContainerUSBIP:
     def setup_sender(self, resume=False, auto_bg=False):
         print("\n--- SENDER MODE (Steam Deck) ---")
 
-        target_bus = None # Variable to store the bus ID for the watchdog
+        target_bus = None
 
         if resume:
             print(">> Resuming existing Sender session.")
-            # Try to find what was previously bound to pass to watchdog
             out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
             if out:
                 found = re.search(r"busid\s+([\d\.-]+)", out)
@@ -212,38 +211,51 @@ class ContainerUSBIP:
             print(f"      Binding {target_bus}...")
             self.run_command(f"{self.exec_cmd} 'usbip bind -b {target_bus}'")
 
-        # --- NEW: INJECT CONNECTION WATCHDOG ---
+        # --- IMPROVED: SYSFS WATCHDOG ---
         if target_bus:
-            print(f"      Starting Connection Watchdog for {target_bus}...")
-            # We monitor /proc/net/tcp for Port 3240 (0CA8 hex) in State 01 (ESTABLISHED)
+            print(f"      Starting Kernel Watchdog for {target_bus}...")
+
+            # This script monitors the specific device's socket file descriptor in /sys
             watchdog_code = f"""#!/bin/bash
             BUS_ID="{target_bus}"
-            echo "[Watchdog] Waiting for client to connect..."
+            SYS_PATH="/sys/bus/usb/devices/$BUS_ID/usbip_sockfd"
 
-            # 1. Wait for a connection to appear
+            echo "[Watchdog] Monitoring $SYS_PATH"
+
+            # 1. Wait for active attachment (Socket FD > -1)
+            # We check if the file content is NOT "-1"
             while true; do
-                # Look for local_address ending in :0CA8 (port 3240) and state 01 (ESTABLISHED)
-                if grep -q ":0CA8.\\+ 01 " /proc/net/tcp; then
-                    echo "[Watchdog] Client CONNECTED."
-                    break
+                if [ -f "$SYS_PATH" ]; then
+                    SOCK_FD=$(cat "$SYS_PATH")
+                    if [ "$SOCK_FD" != "-1" ]; then
+                        echo "[Watchdog] Client ATTACHED (Socket: $SOCK_FD)."
+                        break
+                    fi
                 fi
-                sleep 2
+                sleep 1
             done
 
-            # 2. Wait for the connection to drop
+            # 2. Wait for detach (Socket FD returns to -1)
             while true; do
-                if ! grep -q ":0CA8.\\+ 01 " /proc/net/tcp; then
-                    echo "[Watchdog] Client DISCONNECTED. Releasing device..."
+                if [ -f "$SYS_PATH" ]; then
+                    SOCK_FD=$(cat "$SYS_PATH")
+                    if [ "$SOCK_FD" == "-1" ]; then
+                        echo "[Watchdog] Client DETACHED. Releasing device..."
 
-                    # Unbind device so Steam Deck takes it back
-                    usbip unbind -b $BUS_ID
+                        # Unbind device so Steam Deck takes it back
+                        usbip unbind -b $BUS_ID
 
-                    # Kill daemon
-                    pkill usbipd
+                        # Kill daemon to reset state
+                        pkill usbipd
 
-                    # Trigger udev to ensure Deck UI picks it up immediately
-                    udevadm trigger
-                    exit 0
+                        # Trigger udev for immediate UI detection
+                        udevadm trigger
+                        exit 0
+                    fi
+                else
+                    # Fallback: If sys path is gone, something weird happened, just exit
+                    echo "[Watchdog] Device path vanished. Exiting."
+                    exit 1
                 fi
                 sleep 2
             done
@@ -258,9 +270,9 @@ class ContainerUSBIP:
 
         print("\n" + "="*40)
         print(" SENDER IS RUNNING")
-        print(" * Connection Watchdog Active:")
-        print("   If the PC disconnects/sleeps, the controller will")
-        print("   automatically revert to the Steam Deck.")
+        print(" * Watchdog Active: Waiting for Receiver to Attach...")
+        print(" * Once attached, if the Receiver stops, the Deck")
+        print("   will automatically reclaim the controller.")
         print("="*40)
 
         if auto_bg:

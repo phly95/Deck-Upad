@@ -26,16 +26,21 @@ VALVE_PID = "1205"
 # --- EMBEDDED PYTHON SCRIPTS (Running Inside Container) ---
 
 # 1. Receiver Heartbeat (PC Side)
-# Sends "HEARTBEAT" packets to the Sender so it knows we are alive.
+# Starts IMMEDIATELY to tell Sender "I am here" before attaching.
 RECEIVER_HEARTBEAT_CODE = f"""
 import socket
 import time
 import sys
 
-target_ips = sys.argv[1].split(',')
+# Parse IPs
+try:
+    target_ips = [x.strip() for x in sys.argv[1].split(',')]
+except:
+    sys.exit(0)
+
 port = {HEARTBEAT_PORT}
 
-print(f"[Heartbeat] Starting pulse to {{target_ips}}:{{port}}...")
+print(f"[Heartbeat] Pulse started to {{target_ips}}...")
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -43,19 +48,22 @@ while True:
     for ip in target_ips:
         try:
             sock.sendto(b'HEARTBEAT', (ip, port))
-        except Exception as e:
+        except:
             pass
     time.sleep(1)
 """
 
 # 2. Sender Watchdog (Steam Deck Side)
-# Listens for Heartbeats. If they stop, it kills the connection and returns the controller to the Deck.
+# Logic:
+#   - We assume device is ALREADY bound when this starts.
+#   - We wait for the first Heartbeat.
+#   - Once Heartbeats start flowling, we enter "Armed" mode.
+#   - If Heartbeats stop while "Armed", we UNBIND immediately.
 SENDER_WATCHDOG_CODE = f"""
 import socket
 import time
 import subprocess
 import sys
-import os
 
 HOST = "0.0.0.0"
 PORT = {HEARTBEAT_PORT}
@@ -68,29 +76,24 @@ def run_cmd(cmd):
     except:
         pass
 
-print(f"[Watchdog] Listening on port {{PORT}} for Bus {{BUS_ID}}...")
+print(f"[Watchdog] Monitoring UDP {{PORT}} for Bus {{BUS_ID}}...")
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((HOST, PORT))
 sock.setblocking(False)
 
-last_heartbeat = 0
-client_connected = False
-active = True
+last_heartbeat = time.time()
+session_active = False # False = Waiting for client; True = Client connected
 
-while active:
+while True:
     try:
         data, addr = sock.recvfrom(1024)
         if data == b'HEARTBEAT':
             now = time.time()
 
-            # Initial Connection Logic
-            if not client_connected:
-                print(f"[Watchdog] New Client Detected from {{addr[0]}}!")
-                print("[Watchdog] Locking controller to USBIP...")
-                # Ensure it is bound
-                run_cmd(f"usbip bind -b {{BUS_ID}}")
-                client_connected = True
+            if not session_active:
+                print(f"[Watchdog] Connection Established from {{addr[0]}}!")
+                session_active = True
 
             last_heartbeat = now
 
@@ -99,21 +102,27 @@ while active:
     except Exception as e:
         print(f"[Watchdog] Error: {{e}}")
 
-    # Timeout Logic (Dead Man's Switch)
-    if client_connected:
+    # DEAD MAN'S SWITCH LOGIC
+    if session_active:
+        # If we haven't heard from the client in TIMEOUT seconds...
         if time.time() - last_heartbeat > TIMEOUT:
-            print("[Watchdog] LOST SIGNAL! Client is gone.")
-            print("[Watchdog] Emergency Unbind - Returning Controller to Deck...")
+            print("[Watchdog] LOST SIGNAL! Client disconnected.")
+            print("[Watchdog] RELEASING CONTROL TO STEAM DECK...")
 
-            # 1. Unbind driver (Critical step)
+            # 1. Kill the USBIP Daemon (stops network sharing)
+            run_cmd("pkill usbipd")
+
+            # 2. Unbind the driver (This gives it back to the Kernel)
+            # We try multiple times to be sure
+            run_cmd(f"usbip unbind -b {{BUS_ID}}")
+            time.sleep(0.5)
             run_cmd(f"usbip unbind -b {{BUS_ID}}")
 
-            # 2. Trigger udev so SteamOS picks it up instantly
+            # 3. Trigger Udev (Forces SteamOS to see the 'new' device)
             run_cmd("udevadm trigger")
 
-            # 3. Reset state so we wait for new connection
-            client_connected = False
-            print("[Watchdog] Device released. Waiting for new client...")
+            print("[Watchdog] Device released. Exiting.")
+            sys.exit(0) # We exit; user must restart script to share again.
 
     time.sleep(0.5)
 """
@@ -151,13 +160,14 @@ class ContainerUSBIP:
 
     def stop_container(self):
         print("\nStopping containers...")
-        self.run_command(f"{self.exec_cmd} 'pkill -f python3'", check=False) # Kills watchdogs
+        # Kill python scripts first (watchdogs)
+        self.run_command(f"{self.exec_cmd} 'pkill -f python3'", check=False)
         self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
         self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
-        # Cleanup Unbind (just in case watchdog didn't catch it)
+        # Force Unbind on Stop
         try:
-            print("      Ensuring devices are unbound...")
+            print("      Ensuring devices are returned to host...")
             out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
             if out:
                 bound_devices = re.findall(r"busid\s+([\d\.-]+)", out)
@@ -266,9 +276,8 @@ class ContainerUSBIP:
                 print("No Steam Deck controller found via Host scan.")
                 return
 
-            # Note: We do NOT bind here anymore. The Watchdog binds when a client appears!
-            # actually, we can bind once to be safe, but the watchdog manages re-binding.
-            print(f"      Initial bind of {target_bus}...")
+            # CRITICAL CHANGE: Bind IMMEDIATELY so it is ready for the Receiver
+            print(f"      Binding {target_bus} to network (Waiting for connection)...")
             self.run_command(f"{self.exec_cmd} 'usbip bind -b {target_bus}'", check=False)
 
         # INJECT AND START WATCHDOG
@@ -280,9 +289,9 @@ class ContainerUSBIP:
 
         print("\n" + "="*40)
         print(" SENDER IS RUNNING")
-        print(" * State: Waiting for connection...")
-        print(" * Logic: If Receiver disconnects (Heartbeat lost),")
-        print("          controller returns to Deck automatically.")
+        print(" 1. Controller is now HIDDEN from Steam Deck.")
+        print(" 2. Waiting for Receiver (PC) to start.")
+        print(" 3. If Receiver connects and then disconnects, Deck regains control.")
         print("="*40)
 
         if auto_bg: sys.exit(0)
@@ -307,13 +316,16 @@ class ContainerUSBIP:
             print("      Loading 'vhci-hcd' kernel module...")
             self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
 
-            # 1. Start UDP Heartbeat FIRST (so Sender knows we are here)
-            print("      Starting Heartbeat Emitter...")
+            # 1. Start UDP Heartbeat FIRST (Critical Fix)
+            # This ensures the Sender knows we are here immediately.
+            print("      Starting Heartbeat Emitter (so Sender stays active)...")
             hb_path = "/usr/local/bin/receiver_heartbeat.py"
             ip_str = ",".join(ips)
             self.run_command(f"{self.exec_cmd} 'cat > {hb_path}'", input=RECEIVER_HEARTBEAT_CODE)
             self.run_command(f"{self.exec_cmd} 'nohup python3 {hb_path} {ip_str} > /dev/null 2>&1 &'")
-            time.sleep(1) # Give it a moment to ping the sender
+
+            # Brief pause to let packets fly
+            time.sleep(1)
 
             # 2. Proceed with USBIP Attach
             targets = []
@@ -327,7 +339,7 @@ class ContainerUSBIP:
                         targets.append(f"{sender_ip}:{found_bus}")
                         self.run_command(f"{self.exec_cmd} 'usbip attach -r {sender_ip} -b {found_bus}'", check=False)
                 except:
-                    print(f"      Could not connect to {sender_ip}.")
+                    print(f"      Could not connect to {sender_ip}. (Is Sender script running?)")
 
             if not targets: return
 
@@ -352,8 +364,9 @@ class ContainerUSBIP:
 
         print("\n" + "="*40)
         print(" RECEIVER IS RUNNING")
-        print(" * Heartbeat is active.")
-        print(" * If this script stops, Steam Deck gets controls back.")
+        print(" * Heartbeat is firing.")
+        print(" * Keepalive is active.")
+        print(" * To return control to Deck, simply stop this script (Ctrl+C).")
         print("="*40)
 
         if auto_bg: sys.exit(0)

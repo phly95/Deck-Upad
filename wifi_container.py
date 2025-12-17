@@ -59,7 +59,6 @@ class ContainerVPN:
         try:
             with open(HOST_SESSION_FILE, "w") as f:
                 f.write(content)
-            # Make it readable only by root
             os.chmod(HOST_SESSION_FILE, 0o600)
         except Exception as e:
             print(f"Warning: Could not save session: {e}")
@@ -71,7 +70,6 @@ class ContainerVPN:
             with open(HOST_SESSION_FILE, "r") as f:
                 lines = f.read().splitlines()
             if len(lines) >= 3:
-                # mode, ssid, pw.  Line 4 is iface (optional)
                 return lines
         except: pass
         return None
@@ -91,19 +89,16 @@ class ContainerVPN:
 
     # --- WiFi Utils ---
     def get_active_wifi_interface(self):
-        # 1. Trust NM first
         try:
             output = self.run_command("nmcli -t -f DEVICE,TYPE,STATE device")
             for line in output.split('\n'):
                 if ":wifi:" in line: return line.split(':')[0]
         except: pass
-
-        # 2. Trust 'iw'
         try:
             output = self.run_command("iw dev | grep Interface", shell=True)
             if output: return output.split()[-1]
         except: pass
-        return "wlp9s0" # Fallback
+        return "wlp9s0"
 
     def scan_wifi(self):
         print(f"Scanning networks on {self.wifi_interface}...")
@@ -123,39 +118,26 @@ class ContainerVPN:
 
     # --- ACTION HANDLERS ---
     def trigger_pause(self):
-        """Clean shutdown that preserves the session file."""
         print("\n[PAUSING SESSION]")
         self.is_pausing = True
         self.shutdown_on_exit = True
-        # Logic moves to cleanup() which checks self.is_pausing
         sys.exit(0)
 
     def trigger_bg(self):
-        """Detach without stopping anything."""
         print("\n[BACKGROUND MODE] Detaching script.")
         self.shutdown_on_exit = False
         sys.exit(0)
 
     def force_restore_host_wifi(self):
-        """Called after container death to ensure host gets WiFi back."""
         print("Restoring Host WiFi...")
-        # 1. Unblock
         self.run_command("rfkill unblock wifi", check=False)
-
-        # 2. Wait for interface to reappear in default namespace
-        # When container dies, kernel moves phy0 back to host.
-        # It might be named 'wlan0' or renamed automatically by udev.
         time.sleep(1)
-
         target_iface = self.wifi_interface
-
-        # Try to find it if name changed
         try:
             out = self.run_command("iw dev | grep Interface", shell=True)
             if out: target_iface = out.split()[-1]
         except: pass
 
-        # 3. Bring Up and Connect
         self.run_command(f"ip link set {target_iface} up", check=False)
         self.run_command(f"nmcli device set {target_iface} managed yes", check=False)
         self.run_command(f"nmcli device connect {target_iface}", check=False)
@@ -165,21 +147,16 @@ class ContainerVPN:
             return
 
         print("\n\n--- Cleaning Up ---")
-
-        # 1. Destroy Network Link
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
 
-        # 2. Destroy Container (This ejects WiFi card to Host)
         print("Stopping container (Releasing WiFi Card)...")
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # 3. Restore Host
         self.force_restore_host_wifi()
 
-        # 4. Handle Session File
         if self.is_pausing:
             print(f"Session saved to {HOST_SESSION_FILE}")
             print("Run script again to RESUME.")
@@ -251,19 +228,40 @@ class ContainerVPN:
 
     def setup_client_mode(self, ssid, password):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
-        # Save session to host immediately
         self.save_session_host("client", ssid, password)
 
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.optimize_wifi()
 
+        # 1. Start WPA Supplicant
         psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
         self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
-        print("      Requesting IP...")
+
+        # 2. WAIT FOR ASSOCIATION (Fixes DHCP Issue)
+        print("      Waiting for WiFi association (max 30s)...")
+        connected = False
+        for i in range(30):
+            try:
+                # Check status inside container
+                status = self.run_command(f"{self.exec_cmd} 'wpa_cli -i wlan0 status'")
+                if "wpa_state=COMPLETED" in status:
+                    print("      WiFi Connected!")
+                    connected = True
+                    break
+            except: pass
+            time.sleep(1)
+
+        if not connected:
+            print("      [WARNING] WiFi did not associate. Password might be wrong or signal low.")
+            # We continue anyway to let the user see errors, but DHCP will likely fail.
+
+        # 3. Request IP
+        print("      Requesting IP (DHCP)...")
         self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
 
+        # 4. Gateway Fix
         gateway_ip = "192.168.1.1"
         try:
             out = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
@@ -333,19 +331,16 @@ dhcp-option=6,8.8.8.8"""
         val = input().strip().lower()
         if val == 'bg': self.trigger_bg()
         elif val == 'pause': self.trigger_pause()
-        # Else (Enter) falls through to main cleanup (which clears session)
 
 def main():
     vpn = ContainerVPN()
     vpn.check_root()
     try:
-        # --- AUTO-RESUME CHECK ---
         saved = vpn.load_session_host()
         if saved:
             mode, ssid, pw = saved[0], saved[1], saved[2]
             print(f"\n[!] Found saved session ({mode}). Resuming automatically...")
 
-            # If a previous container is stuck, kill it first
             if vpn.is_container_running():
                 vpn.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
@@ -362,7 +357,6 @@ def main():
                 vpn.show_status("AP Mode")
             return
 
-        # --- FRESH START ---
         print(f"Detected WiFi: {vpn.wifi_interface}")
         print("\nSelect Mode:\n1. Client (Join)\n2. Host (Create AP)")
         while True:

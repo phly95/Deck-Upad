@@ -14,7 +14,7 @@ CUSTOM_IMAGE = "vpn-ap-ready"
 NM_CONN_NAME = "veth-host-conn"
 VETH_HOST = "veth-host"
 VETH_CTR = "veth-ctr"
-STATE_FILE = "wifi_session.json"  # Stores paused session state
+STATE_FILE = "wifi_session.json"
 
 # IPs for the Virtual Cable
 IP_CTR = "10.13.13.1"
@@ -29,7 +29,7 @@ class ContainerVPN:
     def __init__(self):
         self.wifi_interface = self.get_active_wifi_interface()
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
-        self.shutdown_on_exit = True  # Default to cleaning up on exit
+        self.shutdown_on_exit = True
 
     def run_command(self, cmd, shell=False, check=True, input=None):
         if not shell and isinstance(cmd, str):
@@ -51,19 +51,23 @@ class ContainerVPN:
             sys.exit(1)
 
     # --- Session Management ---
-    def save_session(self, mode, ssid, password):
-        """Saves current config to disk for pausing."""
-        data = {"mode": mode, "ssid": ssid, "password": password}
+    def save_session(self, mode, ssid, password, last_ip=None):
+        """Saves current config AND the last known IP."""
+        data = {
+            "mode": mode,
+            "ssid": ssid,
+            "password": password,
+            "last_ip": last_ip
+        }
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump(data, f)
-            os.chmod(STATE_FILE, 0o600)  # Secure: Read/Write only for root
-            print(f"\n[Session Saved] State written to {STATE_FILE}")
+            os.chmod(STATE_FILE, 0o600)
+            print(f"\n[Session Saved] State (IP: {last_ip}) written to {STATE_FILE}")
         except Exception as e:
             print(f"Warning: Could not save session: {e}")
 
     def load_session(self):
-        """Checks for a paused session."""
         if not os.path.exists(STATE_FILE): return None
         try:
             with open(STATE_FILE, "r") as f:
@@ -71,25 +75,28 @@ class ContainerVPN:
         except: return None
 
     def clear_session(self):
-        """Deletes the paused session file."""
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
             print("[Session Cleared] Saved state removed.")
 
     # --- State Detection ---
     def is_container_running(self):
-        """Checks if the container is currently active."""
         res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
     def get_active_mode(self):
-        """Detects if the running container is in AP or Client mode."""
         try:
             ps = self.run_command(f"{self.exec_cmd} 'ps'").lower()
             if "hostapd" in ps: return "AP Mode"
             if "wpa_supplicant" in ps: return "Client Mode"
         except: pass
         return None
+
+    def get_current_wan_ip(self):
+        """Helper to get the current IP inside the container."""
+        try:
+            return self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet | awk \"{{print \\$2}}\"'").split('/')[0]
+        except: return None
 
     # --- WiFi Utils ---
     def get_active_wifi_interface(self):
@@ -209,7 +216,7 @@ class ContainerVPN:
         print("      Optimizing WiFi Latency (Power Save OFF)...")
         self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
 
-    def setup_client_mode(self, ssid, password):
+    def setup_client_mode(self, ssid, password, target_ip=None):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
@@ -218,8 +225,15 @@ class ContainerVPN:
         psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
         self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
-        print("      Requesting IP...")
-        self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
+
+        # --- MODIFIED DHCP LOGIC ---
+        if target_ip:
+            print(f"      Requesting previous IP: {target_ip}...")
+            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -r {target_ip}'")
+        else:
+            print("      Requesting dynamic IP...")
+            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
+        # ---------------------------
 
         gateway_ip = "172.16.16.16"
         try:
@@ -280,9 +294,7 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def show_status(self, mode):
-        lan_ip = "Unknown"
-        try: lan_ip = self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet | awk \"{{print \\$2}}\"'").split('/')[0]
-        except: pass
+        lan_ip = self.get_current_wan_ip() or "Unknown"
 
         print("\n" + "="*40)
         print(f"   CONNECTION ESTABLISHED ({mode})")
@@ -295,8 +307,8 @@ dhcp-option=6,8.8.8.8"""
         else:
             print(f"You are a CLIENT. Host IP: 192.168.50.1")
         print("="*40)
-        print(" [Enter] or 'stop' : Full Cleanup & Exit (Clears Saved Session)")
-        print(" 'pause'           : Save State, Cleanup & Exit (Auto-Resume next time)")
+        print(" [Enter] or 'stop' : Full Cleanup & Exit")
+        print(" 'pause'           : Save Session (SSID+IP), Cleanup & Exit")
         print(" 'bg'              : Detach (Run in Background)")
         print("="*40)
 
@@ -304,7 +316,7 @@ def main():
     vpn = ContainerVPN()
     vpn.check_root()
     try:
-        # --- RESUME LOGIC (Running Container) ---
+        # --- RESUME ATTACH (Already Running) ---
         if vpn.is_container_running():
             active_mode = vpn.get_active_mode()
             if active_mode:
@@ -312,25 +324,20 @@ def main():
                 print("    Resuming control...")
                 vpn.show_status(active_mode)
 
-                # Check if we should override the file with what's actually running
-                # (Simple approach: just let user control from here)
                 user_in = input().strip().lower()
                 if user_in == 'bg': vpn.shutdown_on_exit = False
                 elif user_in == 'pause':
-                    # We don't have the SSID/PW in variables here if we just attached.
-                    # We can't easily pause a resumed session without re-entering creds
-                    # unless we read the config from inside the container.
-                    # For simplicity, warn user or just clean up.
-                    print("Cannot pause an attached session (credentials unknown). Use 'stop' or 'bg'.")
+                    print("Cannot pause an attached session (credentials unknown). Use 'stop'.")
                 return
             else:
                 print("[!] Container running but no active session found. Restarting...")
                 vpn.cleanup()
 
-        # --- PAUSE/RESUME LOGIC (Saved File) ---
+        # --- LOAD SAVED SESSION ---
         ssid = ""
         password = ""
-        mode_code = "1" # Default client
+        mode_code = "1"
+        last_ip = None
 
         saved_session = vpn.load_session()
         use_saved = False
@@ -338,11 +345,15 @@ def main():
         if saved_session:
             print(f"\n[?] PAUSED SESSION FOUND: {saved_session['mode']}")
             print(f"    SSID: {saved_session['ssid']}")
+            if saved_session.get('last_ip'):
+                print(f"    IP:   {saved_session['last_ip']}")
+
             choice = input("    Resume this session? (Y/n): ").strip().lower()
             if choice != 'n':
                 use_saved = True
                 ssid = saved_session['ssid']
                 password = saved_session['password']
+                last_ip = saved_session.get('last_ip')
                 mode_code = '1' if saved_session['mode'] == 'Client Mode' else '2'
             else:
                 vpn.clear_session()
@@ -381,7 +392,7 @@ def main():
         active_mode_str = ""
         if mode_code == '1':
             active_mode_str = "Client Mode"
-            vpn.setup_client_mode(ssid, password)
+            vpn.setup_client_mode(ssid, password, target_ip=last_ip)
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
         else:
             active_mode_str = "AP Mode"
@@ -396,9 +407,10 @@ def main():
         if user_in == 'bg':
             vpn.shutdown_on_exit = False
         elif user_in == 'pause':
-            vpn.save_session(active_mode_str, ssid, password)
+            # Grab IP before destroying container
+            current_ip = vpn.get_current_wan_ip()
+            vpn.save_session(active_mode_str, ssid, password, last_ip=current_ip)
             vpn.shutdown_on_exit = True
-            # Cleanup happens in finally block
         elif user_in == 'stop' or user_in == '':
             vpn.clear_session()
             vpn.shutdown_on_exit = True

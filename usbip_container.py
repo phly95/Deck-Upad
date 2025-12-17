@@ -6,6 +6,7 @@ import os
 import shlex
 import traceback
 import re
+import argparse
 
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
@@ -148,7 +149,7 @@ class ContainerUSBIP:
         return None
 
     # --- SENDER LOGIC ---
-    def setup_sender(self, resume=False):
+    def setup_sender(self, resume=False, auto_bg=False):
         print("\n--- SENDER MODE (Steam Deck) ---")
 
         if resume:
@@ -183,6 +184,10 @@ class ContainerUSBIP:
         print(" 2. Type 'bg' and ENTER to keep running in background (Safe to Close).")
         print("="*40)
 
+        if auto_bg:
+            print(">> Auto-backgrounding enabled. Exiting script, container remains running.")
+            sys.exit(0)
+
         user_in = input().strip().lower()
         if user_in == 'bg':
             print("Running in background. Run this script again to stop it.")
@@ -191,15 +196,19 @@ class ContainerUSBIP:
             self.stop_container()
 
     # --- RECEIVER LOGIC ---
-    def setup_receiver(self, resume=False):
+    def setup_receiver(self, resume=False, cli_ips=None, auto_bg=False):
         print("\n--- RECEIVER MODE (Bazzite PC) ---")
 
         if resume:
             print(">> Resuming existing Receiver session (Keep-alive active).")
         else:
-            print("Enter Steam Deck IP addresses (comma separated for multiple Decks).")
-            ip_input = input("IPs: ").strip()
-            ips = [x.strip() for x in ip_input.split(',')]
+            if cli_ips:
+                ips = cli_ips
+                print(f"Using provided IPs: {ips}")
+            else:
+                print("Enter Steam Deck IP addresses (comma separated for multiple Decks).")
+                ip_input = input("IPs: ").strip()
+                ips = [x.strip() for x in ip_input.split(',')]
 
             print("      Loading 'vhci-hcd' kernel module...")
             self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
@@ -267,6 +276,10 @@ class ContainerUSBIP:
         print(" 2. Type 'bg' and ENTER to keep running in background.")
         print("="*40)
 
+        if auto_bg:
+            print(">> Auto-backgrounding enabled. Exiting script, container remains running.")
+            sys.exit(0)
+
         user_in = input().strip().lower()
         if user_in == 'bg':
             print("Running in background. Run this script again to stop it.")
@@ -275,6 +288,13 @@ class ContainerUSBIP:
             self.stop_container()
 
 def main():
+    # --- ARGUMENT PARSING ---
+    parser = argparse.ArgumentParser(description="USBIP Container Wrapper")
+    parser.add_argument("-m", "--mode", choices=["sender", "receiver", "1", "2"], help="Mode: sender (1) or receiver (2)")
+    parser.add_argument("-i", "--ips", help="Comma-separated IPs (Receiver mode only)")
+    parser.add_argument("--bg", action="store_true", help="Automatically run in background (detach) after setup")
+    args = parser.parse_args()
+
     tool = ContainerUSBIP()
     tool.check_root()
 
@@ -285,27 +305,41 @@ def main():
         active_mode = tool.get_active_mode()
         if active_mode:
             print(f"\n[!] Existing {active_mode.upper()} session detected.")
+            # If args provided, warn user, but default to resuming
+            if args.mode or args.ips:
+                print("    (Ignoring flags because session is already active)")
+
             if active_mode == 'sender':
-                tool.setup_sender(resume=True)
+                tool.setup_sender(resume=True, auto_bg=args.bg)
             elif active_mode == 'receiver':
-                tool.setup_receiver(resume=True)
+                tool.setup_receiver(resume=True, auto_bg=args.bg)
             return
         else:
             print("[!] Container running but no active session detected. Cleaning up...")
             tool.stop_container()
 
-    print("1. Sender (Steam Deck)")
-    print("2. Receiver (Bazzite PC)")
-    mode = input("Select Mode (1/2): ").strip()
+    # DETERMINE MODE
+    mode_selection = ""
+    if args.mode:
+        if args.mode in ['sender', '1']: mode_selection = '1'
+        elif args.mode in ['receiver', '2']: mode_selection = '2'
+    # Implicit Receiver mode if IPs are provided
+    elif args.ips:
+        mode_selection = '2'
+    else:
+        print("1. Sender (Steam Deck)")
+        print("2. Receiver (Bazzite PC)")
+        mode_selection = input("Select Mode (1/2): ").strip()
 
     try:
         tool.ensure_image_exists()
         tool.start_runtime_container()
 
-        if mode == '1':
-            tool.setup_sender()
-        elif mode == '2':
-            tool.setup_receiver()
+        if mode_selection == '1':
+            tool.setup_sender(auto_bg=args.bg)
+        elif mode_selection == '2':
+            cli_ips = [x.strip() for x in args.ips.split(',')] if args.ips else None
+            tool.setup_receiver(cli_ips=cli_ips, auto_bg=args.bg)
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

@@ -253,19 +253,22 @@ class ContainerVPN:
         self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
 
         print("      Enabling Global NAT & Forwarding...")
-        # 1. NAT for Internet Access
+        # 1. NAT for Internet Access (wlan0)
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
 
-        # 2. Host (veth) <-> Internet (wlan0)
+        # 2. NAT for Local AP Access (wlan1) - ESSENTIAL for Ping from Host -> Client
+        # This masks the Host IP (10.13.13.2) so Clients see the Gateway IP (192.168.50.1)
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan1 -j MASQUERADE' 2>/dev/null || true")
+
+        # 3. Host (veth) <-> Internet (wlan0)
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
-        # 3. Clients (wlan1) <-> Internet (wlan0) (For Repeater Mode)
+        # 4. Clients (wlan1) <-> Internet (wlan0)
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o wlan0 -j ACCEPT' 2>/dev/null || true")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o wlan1 -m state --state RELATED,ESTABLISHED -j ACCEPT' 2>/dev/null || true")
 
-        # 4. Host (veth) <-> Clients (wlan1) (Allow Host to ping repeater clients)
-        # This Bridges the Host to the AP Subnet
+        # 5. Host (veth) <-> Clients (wlan1) (Allow Host to ping repeater clients)
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan1 -j ACCEPT' 2>/dev/null || true")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o {VETH_CTR} -j ACCEPT' 2>/dev/null || true")
 

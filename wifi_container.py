@@ -7,6 +7,7 @@ import shlex
 import traceback
 import json
 import re
+import random
 
 # --- Configuration ---
 CONTAINER_NAME = "vpn-test"
@@ -43,7 +44,10 @@ class ContainerVPN:
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            if check: raise e
+            if check:
+                print(f"\n[CMD ERROR]: {cmd}")
+                print(f"[STDERR]: {e.stderr}")
+                raise e
             return None
 
     def check_root(self):
@@ -53,7 +57,6 @@ class ContainerVPN:
 
     # --- Session Management ---
     def save_session(self, mode, ssid, password, net_config=None, repeater_config=None):
-        """Saves current config AND the full network state."""
         data = {
             "mode": mode,
             "ssid": ssid,
@@ -96,10 +99,8 @@ class ContainerVPN:
         return None
 
     def get_current_network_state(self):
-            """Scrapes IP, CIDR, and Gateway from inside the container."""
             config = {"ip": None, "cidr": "24", "gateway": None}
             try:
-                # Get IP and CIDR
                 ip_line = self.run_command(f"{self.exec_cmd} 'ip -4 addr show wlan0 | grep inet'", check=False)
                 if ip_line:
                     parts = ip_line.split()
@@ -110,7 +111,6 @@ class ContainerVPN:
                         else:
                             config['ip'] = cidr_full
 
-                # Get Gateway
                 route_line = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0 | grep default'", check=False)
                 if route_line:
                     parts = route_line.split()
@@ -132,39 +132,39 @@ class ContainerVPN:
         except: pass
         return "wlp9s0"
 
-    def scan_wifi(self):
+    def scan_wifi(self, band_filter=None):
+        # REVERTED TO ORIGINAL ROBUST SCANNER
         print(f"Scanning networks on {self.wifi_interface}...")
         try:
             self.run_command(f"nmcli device wifi rescan ifname {self.wifi_interface}", check=False)
             time.sleep(2)
-            output = self.run_command("nmcli -t -f SSID,SIGNAL,SECURITY device wifi list")
+            # Simple scan (SSID only). This avoids parsing issues with Frequency/Signal columns.
+            output = self.run_command("nmcli -t -f SSID device wifi list")
             networks = []
             seen = set()
             for line in output.split('\n'):
-                parts = line.split(':')
-                if len(parts) >= 1 and parts[0] and parts[0] not in seen:
-                    networks.append(parts[0])
-                    seen.add(parts[0])
+                # nmcli -t escapes colons, but since we only ask for SSID, the whole line is the SSID (mostly).
+                # To be safe against potential parsing artifacts:
+                ssid = line.replace('\\:', ':').strip()
+                if ssid and ssid not in seen:
+                    networks.append(ssid)
+                    seen.add(ssid)
             return networks
         except: return []
 
     def get_wifi_channel(self, iface="wlan0"):
-        """Detects the channel an interface is currently using."""
         try:
-            # Try iw dev info
             output = self.run_command(f"{self.exec_cmd} 'iw dev {iface} info'", check=False)
             if output:
                 match = re.search(r"channel\s+(\d+)", output)
                 if match: return int(match.group(1))
 
-            # Fallback to iw link
             output = self.run_command(f"{self.exec_cmd} 'iw dev {iface} link'", check=False)
             if output:
                 match = re.search(r"freq:\s+(\d+)", output)
-                # Approximate freq to channel is hard, hoping 'info' worked.
                 pass
         except: pass
-        return 36 # Fallback default
+        return 36
 
     def cleanup(self):
         if not self.shutdown_on_exit:
@@ -251,24 +251,82 @@ class ContainerVPN:
 
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
         self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
+
+        print("      Enabling Global NAT & Forwarding...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o wlan0 -j ACCEPT' 2>/dev/null || true")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o wlan1 -m state --state RELATED,ESTABLISHED -j ACCEPT' 2>/dev/null || true")
 
     def optimize_wifi(self):
         print("      Optimizing WiFi Latency (Power Save OFF)...")
         self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 addrgenmode none' 2>/dev/null || true")
 
-    def setup_client_mode(self, ssid, password, static_config=None):
-        print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
+    def connect_wlan0(self, ssid, password, run_dhcp=True):
+        """ Robust WiFi connection. """
+        print(f"      Connecting wlan0 to '{ssid}'...")
+
+        self.run_command(f"{self.exec_cmd} 'killall wpa_supplicant 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'killall udhcpc 2>/dev/null || true'")
+
+        self.run_command(f"{self.exec_cmd} 'ip link set wlan0 down 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'ip addr flush dev wlan0 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.optimize_wifi()
 
-        psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
-        self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
-        self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
+        # Generate Config
+        psk_hex = f'psk="{password}"'
+        try:
+            out = self.run_command(f"{self.exec_cmd} 'wpa_passphrase \"{ssid}\" \"{password}\"'")
+            for line in out.split('\n'):
+                if 'psk=' in line and '#' not in line:
+                    psk_hex = line.strip()
+        except: pass
 
-        gateway_ip = "172.16.16.16" # Fallback
+        conf = f"""ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country=US
+
+network={{
+    ssid="{ssid}"
+    {psk_hex}
+    scan_ssid=1
+}}
+"""
+        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=conf)
+
+        # Start Supplicant with default driver (removed legacy fallbacks)
+        self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
+
+        self.run_command(f"{self.exec_cmd} 'ip route del default 2>/dev/null || true'")
+
+        print("      Waiting for Upstream Connection (Max 30s)...")
+        connected = False
+        for i in range(30):
+            if self.run_command(f"{self.exec_cmd} 'iw dev wlan0 link | grep SSID'", check=False):
+                connected = True
+                break
+            time.sleep(1)
+            if i > 0 and i % 5 == 0: print(f"      ... waiting ({i}s)")
+
+        if not connected:
+            print("\n[ERROR] Connection timed out.")
+            print("Debug (iw dev wlan0 link):")
+            print(self.run_command(f"{self.exec_cmd} 'iw dev wlan0 link'", check=False))
+            raise Exception("Failed to connect to upstream WiFi")
+
+        if run_dhcp:
+            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
+
+    def setup_client_mode(self, ssid, password, static_config=None):
+        print(f"[4/6] Initializing Client Mode...")
+        should_dhcp = (static_config is None)
+        self.connect_wlan0(ssid, password, run_dhcp=should_dhcp)
+
+        gateway_ip = "172.16.16.16"
 
         if static_config and static_config.get('ip'):
             print(f"      [RESUME] Taking IP by force: {static_config['ip']}")
@@ -283,12 +341,9 @@ class ContainerVPN:
                     self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
             except:
                 self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
-        else:
-            print("      Requesting dynamic IP (DHCP)...")
-            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
 
-            # Gateway Detection
-            try:
+        if should_dhcp:
+             try:
                 output = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
                 if output:
                     for line in output.split('\n'):
@@ -299,7 +354,7 @@ class ContainerVPN:
                                 if subnet.startswith("192.168.50"): gateway_ip = "192.168.50.1"
                                 else: gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.16"
                             break
-            except: pass
+             except: pass
 
         self.run_command(f"{self.exec_cmd} 'ip route del default 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0 2>/dev/null || true'")
@@ -337,47 +392,33 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
-        # DMZ for AP Mode
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def setup_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
-        print(f"[4/6] Initializing Repeater Mode (Concurrency)...")
+        print(f"[4/6] Initializing Repeater Mode (Auto-Sync Band)...")
 
-        # 1. Bring up Client Interface (wlan0)
-        print(f"      Connecting wlan0 to '{client_ssid}'...")
-        self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
-        self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
-        self.optimize_wifi()
+        self.connect_wlan0(client_ssid, client_pass, run_dhcp=True)
 
-        psk_cmd = f"wpa_passphrase \"{client_ssid}\" \"{client_pass}\" > /etc/wpa_supplicant.conf"
-        self.run_command(f"{self.exec_cmd} '{psk_cmd}'")
-        self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf -s'")
-
-        # Wait for connection to get Channel
-        print("      Waiting for Upstream Connection...")
-        for _ in range(10):
-            if self.run_command(f"{self.exec_cmd} 'iw dev wlan0 link | grep SSID'", check=False):
-                break
-            time.sleep(1)
-
-        self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
-
-        # 2. Detect Channel (Hardware Restriction: AP must match Client Channel)
         active_channel = self.get_wifi_channel("wlan0")
         print(f"      Detected Upstream Channel: {active_channel}")
 
-        # 3. Bring up AP Interface (wlan1)
+        hw_mode = "g"
+        if active_channel > 14: hw_mode = "a"
+        print(f"      Setting Hardware Mode: {hw_mode}")
+
         print(f"      Starting Hotspot '{ap_ssid}' on wlan1 (Channel {active_channel})...")
-        self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan1 type __ap 2>/dev/null || true'")
+        rand_mac = "02:00:00:%02x:%02x:%02x" % (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+        self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan1 type __ap addr {rand_mac} 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan1 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan1'")
 
         hostapd_conf = f"""interface=wlan1
 ssid={ap_ssid}
 country_code=US
-hw_mode=g
+hw_mode={hw_mode}
 channel={active_channel}
 ieee80211n=1
 wpa=2
@@ -386,21 +427,59 @@ wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
-        self.run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
 
-        # 4. DHCP for AP
-        dnsmasq_conf = f"""interface=wlan1
-dhcp-range={AP_DHCP_RANGE}
-dhcp-option=3,{AP_GATEWAY_IP}
-dhcp-option=6,8.8.8.8"""
-        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
+        try:
+            self.run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
+        except Exception as e:
+            print("\n[CRITICAL ERROR] Failed to start Hostapd.")
+            print("Try running 'iw list' inside container to see 'valid interface combinations'.")
+            raise e
+
+        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
-        # 5. Routing (NAT wlan1 -> wlan0)
-        print("      Enabling Repeater NAT...")
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
-        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o wlan0 -j ACCEPT'")
-        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o wlan1 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
+
+    def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
+        print(f"[4/6] Initializing Cross-Band Repeater (2.4GHz -> 5GHz 80MHz)...")
+
+        self.connect_wlan0(client_ssid, client_pass, run_dhcp=True)
+
+        print(f"      Starting High-Performance Hotspot '{ap_ssid}' on wlan1...")
+        print(f"      (Target: Channel 36, VHT80, 5GHz)")
+
+        rand_mac = "02:00:00:%02x:%02x:%02x" % (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+        self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan1 type __ap addr {rand_mac} 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'ip link set wlan1 up'")
+        self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan1'")
+
+        hostapd_conf = f"""interface=wlan1
+ssid={ap_ssid}
+country_code=US
+hw_mode=a
+channel=36
+ieee80211n=1
+ieee80211ac=1
+ieee80211ax=1
+ht_capab=[HT40+]
+vht_oper_chwidth=1
+vht_oper_centr_freq_seg0_idx=42
+wpa=2
+wpa_passphrase={ap_pass}
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+rsn_pairwise=CCMP"""
+        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
+
+        try:
+            self.run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
+        except Exception as e:
+            print("\n[CRITICAL ERROR] Failed to start 5GHz AP while connected to 2.4GHz.")
+            print("Your WiFi card likely does not support simultaneous dual-band (RSDB).")
+            raise e
+
+        self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
+        self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
 
     def show_status(self, mode):
@@ -412,7 +491,7 @@ dhcp-option=6,8.8.8.8"""
             elif mode == "Client Mode":
                 state = self.get_current_network_state()
                 if state: lan_ip = state['ip']
-            elif mode == "Repeater Mode":
+            elif "Repeater" in mode or "CrossBand" in mode:
                 lan_ip = AP_GATEWAY_IP
                 state = self.get_current_network_state()
                 if state: wan_ip = state['ip']
@@ -420,7 +499,7 @@ dhcp-option=6,8.8.8.8"""
             print("\n" + "="*45)
             print(f"   CONNECTION ESTABLISHED ({mode})")
             print("="*45)
-            if mode == "Repeater Mode":
+            if "Repeater" in mode or "CrossBand" in mode:
                 print(f"WAN IP (Internet):    {wan_ip}")
                 print(f"LAN IP (Your AP):     {lan_ip}")
             else:
@@ -430,7 +509,7 @@ dhcp-option=6,8.8.8.8"""
             print("-" * 45)
             if mode == "AP Mode":
                 print(f"You are the HOST. Clients: 192.168.50.10 - 50")
-            elif mode == "Repeater Mode":
+            elif "Repeater" in mode or "CrossBand" in mode:
                 print(f"Internet Source: wlan0 -> Broadcasting: wlan1")
             else:
                 print(f"You are a CLIENT. Host IP: 192.168.50.1")
@@ -473,7 +552,7 @@ def main():
 
         if saved_session:
             print(f"\n[?] PAUSED SESSION FOUND: {saved_session['mode']}")
-            if saved_session['mode'] == 'Repeater Mode':
+            if 'Repeater' in saved_session['mode'] or 'CrossBand' in saved_session['mode']:
                 r = saved_session.get('repeater_config', {})
                 print(f"    In: {r.get('client_ssid')} -> Out: {r.get('ap_ssid')}")
             else:
@@ -489,7 +568,8 @@ def main():
 
                 if saved_session['mode'] == 'Client Mode': mode_code = '1'
                 elif saved_session['mode'] == 'AP Mode': mode_code = '2'
-                else: mode_code = '3'
+                elif saved_session['mode'] == 'Repeater Mode': mode_code = '3'
+                elif saved_session['mode'] == 'CrossBand Mode': mode_code = '4'
             else:
                 vpn.clear_session()
 
@@ -499,19 +579,28 @@ def main():
             print("\nSelect Mode:")
             print("1. Client (Join WiFi)")
             print("2. Host (Create AP)")
-            print("3. Repeater (Join WiFi -> Create AP)")
+            print("3. Repeater (Join WiFi -> Create AP same band)")
+            print("4. Cross-Band Repeater (May not work, 2.4GHz In -> 5GHz 80MHz Out)")
 
             while True:
-                c = input("Choice (1-3): ")
-                if c in ['1','2','3']:
+                c = input("Choice (1-4): ")
+                if c in ['1','2','3','4']:
                     mode_code = c
                     break
 
             # Logic for Repeater Mode Inputs
-            if mode_code == '3':
+            if mode_code == '3' or mode_code == '4':
+                # We do not use filter here anymore since we scan ALL bands
                 nets = vpn.scan_wifi()
                 print("\n[Input] Select UPSTREAM Network (Internet Source):")
-                for i, n in enumerate(nets): print(f"{i+1}: {n}")
+                if not nets:
+                    print("No networks found! (Check filters or range)")
+
+                # Nets is list of strings
+                for i, n in enumerate(nets):
+                    print(f"{i+1}: {n}")
+
+                selected_net = None
                 while True:
                     sel = input("Select # or SSID: ")
                     if sel.isdigit() and 1 <= int(sel) <= len(nets):
@@ -520,6 +609,7 @@ def main():
                     elif sel:
                         client_ssid = sel
                         break
+
                 client_pass = input(f"Password for {client_ssid}: ")
 
                 print("\n[Output] Configure LOCAL Hotspot:")
@@ -536,7 +626,9 @@ def main():
                 if mode_code == '1':
                     nets = vpn.scan_wifi()
                     print("\nNetworks:")
-                    for i, n in enumerate(nets): print(f"{i+1}: {n}")
+                    for i, n in enumerate(nets):
+                        print(f"{i+1}: {n}")
+
                     while True:
                         sel = input("Select # or SSID: ")
                         if sel.isdigit() and 1 <= int(sel) <= len(nets):
@@ -545,6 +637,7 @@ def main():
                         elif sel:
                             ssid = sel
                             break
+
                 else:
                     ssid = input("Enter new SSID: ")
 
@@ -567,7 +660,11 @@ def main():
             active_mode_str = "Repeater Mode"
             rc = repeater_config
             vpn.setup_repeater_mode(rc['client_ssid'], rc['client_pass'], rc['ap_ssid'], rc['ap_pass'])
-            # Treat Veth as client mode (host gets internet from container)
+            vpn.setup_veth_link(ctr_pid, is_client_mode=True)
+        elif mode_code == '4':
+            active_mode_str = "CrossBand Mode"
+            rc = repeater_config
+            vpn.setup_crossband_repeater_mode(rc['client_ssid'], rc['client_pass'], rc['ap_ssid'], rc['ap_pass'])
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
 
         vpn.show_status(active_mode_str)

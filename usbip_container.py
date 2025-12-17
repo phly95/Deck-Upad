@@ -5,7 +5,6 @@ import sys
 import os
 import shlex
 import traceback
-import re
 import argparse
 
 # --- Configuration ---
@@ -46,46 +45,40 @@ class ContainerUSBIP:
             sys.exit(1)
 
     def is_container_running(self):
-        """Checks if the sidecar container is currently active."""
         res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
     def stop_container(self):
-            print("\nStopping containers...")
+        print("\nStopping containers...")
 
-            # --- [FIX START] Sender Cleanup: Release devices back to Host ---
-            try:
-                print("      Releasing local devices back to host...")
-                # We look into the sysfs directory for usbip-host to see what is currently bound.
-                # We must do this BEFORE killing the container, using the container's usbip tool.
-                unbind_cmd = (
-                    "for busid in $(ls /sys/bus/usb/drivers/usbip-host/ 2>/dev/null | grep -E '^[0-9]+-[0-9]+'); do "
-                    "  echo Releasing $busid...; "
-                    "  usbip unbind -b $busid; "
-                    "done"
-                )
-                # We wrap it in /bin/bash -c to ensure the loop and wildcards run correctly
-                self.run_command(f"{self.exec_cmd} '/bin/bash -c \"{unbind_cmd}\"'", check=False)
-            except Exception as e:
-                # If this fails, we just print a warning and continue to force kill
-                print(f"      [Warning] Could not unbind devices: {e}")
-            # --- [FIX END] ---
+        # --- Sender Cleanup: Release devices back to Host ---
+        try:
+            print("      Releasing local devices back to host...")
+            unbind_cmd = (
+                "for busid in $(ls /sys/bus/usb/drivers/usbip-host/ 2>/dev/null | grep -E '^[0-9]+-[0-9]+'); do "
+                "  echo Releasing $busid...; "
+                "  usbip unbind -b $busid; "
+                "done"
+            )
+            self.run_command(f"{self.exec_cmd} '/bin/bash -c \"{unbind_cmd}\"'", check=False)
+        except Exception as e:
+            print(f"      [Warning] Could not unbind devices: {e}")
 
-            self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
-            self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
+        self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
+        self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
-            # Receiver Cleanup (Existing logic)
-            try:
-                print("      Detaching all imported USBIP devices...")
-                for i in range(8):
-                    port_str = f"{i:02}"
-                    self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
-            except: pass
+        # Receiver Cleanup
+        try:
+            print("      Detaching all imported USBIP devices...")
+            for i in range(8):
+                port_str = f"{i:02}"
+                self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
+        except: pass
 
-            self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
-            self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
-            self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-            print("Cleaned up.")
+        self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
+        self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+        self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+        print("Cleaned up.")
 
     def ensure_image_exists(self):
         print("[1/5] Checking for USBIP tools image...")
@@ -134,14 +127,13 @@ class ContainerUSBIP:
         if "usbip-keepalive.sh" in ps_out: return "receiver"
         return None
 
-    # --- SENDER LOGIC ---
+    # --- SENDER LOGIC (Steam Deck) ---
     def setup_sender(self, resume=False, host_ip=None, auto_bg=False):
         print("\n--- SENDER MODE (Steam Deck) ---")
 
         if resume:
             print(">> Resuming existing Sender session.")
         else:
-            # If not provided via CLI, ask for it (Optional)
             target_ip = host_ip
             if not target_ip:
                 print("Tip: Enter your PC IP to auto-release controller when PC is off.")
@@ -166,16 +158,17 @@ class ContainerUSBIP:
                     print("No Steam Deck controller found via Host scan.")
                     return
 
-            # Keepalive Script with "Host Watchdog"
+            # Note: We rely on ping to detect if Host is UP.
+            # Host Firewall MUST allow ICMP (Ping) for this to work!
             sender_keepalive = f"""#!/bin/bash
             BUS_ID="{target_bus}"
             HOST_IP="{target_ip if target_ip else ''}"
 
-            echo "Starting Sender Keepalive for $BUS_ID (Host: $HOST_IP)"
+            echo "Starting Sender Keepalive for $BUS_ID"
 
             bind_device() {{
-                # Only bind if not already bound
                 DRIVER_PATH="/sys/bus/usb/devices/$BUS_ID/driver"
+                # Check if already bound to usbip-host
                 if [ -e "$DRIVER_PATH" ]; then
                     CURRENT=$(readlink "$DRIVER_PATH")
                     if [[ "$CURRENT" == *"usbip-host"* ]]; then return; fi
@@ -185,7 +178,6 @@ class ContainerUSBIP:
             }}
 
             unbind_device() {{
-                # Only unbind if currently bound to usbip
                 DRIVER_PATH="/sys/bus/usb/devices/$BUS_ID/driver"
                 if [ -e "$DRIVER_PATH" ]; then
                     CURRENT=$(readlink "$DRIVER_PATH")
@@ -198,16 +190,12 @@ class ContainerUSBIP:
 
             while true; do
                 if [ -n "$HOST_IP" ]; then
-                    # Watchdog Mode: Check if Host is reachable
                     if ping -c 1 -W 2 "$HOST_IP" > /dev/null 2>&1; then
-                        # Host UP -> Steal Controller
                         bind_device
                     else
-                        # Host DOWN -> Release Controller
                         unbind_device
                     fi
                 else
-                    # Dumb Mode: Always keep bound
                     bind_device
                 fi
                 sleep 3
@@ -223,10 +211,7 @@ class ContainerUSBIP:
         print(" SENDER IS RUNNING")
         if host_ip:
             print(f" * Watching Host ({host_ip}).")
-            print(" * If PC is OFF, controller works on Deck.")
-            print(" * If PC is ON, controller moves to PC.")
-        else:
-            print(" * No Host IP provided. Controller will stay bound to Network.")
+            print(" * NOTE: Ensure your PC Firewall allows Pings!")
         print("-" * 40)
         print(" 1. Press ENTER to Stop and Cleanup.")
         print(" 2. Type 'bg' and ENTER to keep running in background.")
@@ -236,7 +221,7 @@ class ContainerUSBIP:
         if input().strip().lower() == 'bg': sys.exit(0)
         self.stop_container()
 
-    # --- RECEIVER LOGIC ---
+    # --- RECEIVER LOGIC (PC) ---
     def setup_receiver(self, resume=False, cli_ips=None, auto_bg=False):
         print("\n--- RECEIVER MODE (Bazzite PC) ---")
 
@@ -245,48 +230,59 @@ class ContainerUSBIP:
         else:
             ips = cli_ips
             if not ips:
-                ip_input = input("Enter Steam Deck IPs (comma separated): ").strip()
+                ip_input = input("Enter Steam Deck IP(s) (comma separated): ").strip()
                 ips = [x.strip() for x in ip_input.split(',')]
 
             print("      Loading 'vhci-hcd' kernel module...")
             self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
 
-            targets = []
-            for sender_ip in ips:
-                print(f"\n[Scanning {sender_ip}]...")
-                try:
-                    output = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
-                    print(output)
-                    found_bus = input(f"Enter Bus ID from {sender_ip} (ENTER to skip): ").strip()
-                    if found_bus:
-                        targets.append(f"{sender_ip}:{found_bus}")
-                        self.run_command(f"{self.exec_cmd} 'usbip attach -r {sender_ip} -b {found_bus}'", check=False)
-                except: print(f"      Skipping {sender_ip}.")
+            # Convert list of IPs to space-separated string for bash
+            ip_list_str = " ".join(ips)
 
-            if not targets: return
+            # Updated Receiver Keepalive: "Hunter/Seeker" Mode
+            # It constantly scans the target IPs for the Valve VID:PID (28de:1205).
+            # If found, it attaches automatically.
+            receiver_keepalive = f"""#!/bin/bash
+            TARGET_IPS="{ip_list_str}"
+            TARGET_VID="{VALVE_VID}"
+            TARGET_PID="{VALVE_PID}"
 
-            target_str = " ".join(targets)
-            keepalive_code = f"""#!/bin/bash
-            TARGETS="{target_str}"
+            echo "Starting Hunter Agent for Valve Controller ($TARGET_VID:$TARGET_PID)..."
+
             while true; do
-                for PAIR in $TARGETS; do
-                    IP=${{PAIR%%:*}}; BUS=${{PAIR##*:}}
-                    if ! usbip port | grep -q "$IP" | grep -q "$BUS"; then
-                        usbip attach -r $IP -b $BUS
+                for IP in $TARGET_IPS; do
+                    # 1. Check if we are already connected to this IP
+                    # (Simple check: is there a port using this IP?)
+                    if usbip port | grep -q "$IP"; then
+                        continue
+                    fi
+
+                    # 2. Scan remote list for our specific controller
+                    OUTPUT=$(usbip list -r $IP 2>/dev/null)
+
+                    # Grep for the VID:PID and extract the Bus ID (e.g., "1-3")
+                    # Output format is usually: "   1-3: Valve... (28de:1205)"
+                    REMOTE_BUS=$(echo "$OUTPUT" | grep "$TARGET_VID:$TARGET_PID" | awk -F: '{{print $1}}' | xargs)
+
+                    if [ -n "$REMOTE_BUS" ]; then
+                        echo "Found Controller at $IP Bus $REMOTE_BUS. Attaching..."
+                        usbip attach -r $IP -b $REMOTE_BUS
                     fi
                 done
                 sleep 5
             done
             """
 
-            self.run_command(f"{self.exec_cmd} 'cat > {KEEPALIVE_SCRIPT}'", input=keepalive_code)
+            self.run_command(f"{self.exec_cmd} 'cat > {KEEPALIVE_SCRIPT}'", input=receiver_keepalive)
             self.run_command(f"{self.exec_cmd} 'chmod +x {KEEPALIVE_SCRIPT}'")
             print(f"\n      Starting Receiver Agent...")
             self.run_command(f"{self.exec_cmd} 'nohup {KEEPALIVE_SCRIPT} > /dev/null 2>&1 &'")
             time.sleep(1)
 
         print("\n" + "="*40)
-        print(" RECEIVER IS RUNNING")
+        print(" RECEIVER IS RUNNING (Auto-Hunt Mode)")
+        print(" * It will automatically attach when the Deck becomes available.")
+        print("-" * 40)
         print(" 1. Press ENTER to Detach All and Stop.")
         print(" 2. Type 'bg' and ENTER to keep running in background.")
         print("="*40)
@@ -315,7 +311,7 @@ class ContainerUSBIP:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", choices=["sender", "receiver", "1", "2"])
-    parser.add_argument("-i", "--ips", help="IPs (Comma separated). Used as Client IP list for Receiver OR Host IP for Sender watchdog.")
+    parser.add_argument("-i", "--ips", help="IPs (Comma separated).")
     parser.add_argument("--bg", action="store_true", help="Auto-background")
     args = parser.parse_args()
 
@@ -333,11 +329,6 @@ def main():
 
     mode_sel = ""
     if args.mode: mode_sel = '1' if args.mode in ['sender','1'] else '2'
-    elif args.ips:
-        # Guess mode based on context? Default to receiver if IPs provided, unless user explicitly says sender
-        # Actually, for Sender mode, -i implies "Host IP". For Receiver, it implies "Sender IPs".
-        # We will default to Prompt if mode not specified.
-        pass
 
     if not mode_sel:
         print("1. Sender (Steam Deck)")
@@ -351,7 +342,6 @@ def main():
         cli_ips = [x.strip() for x in args.ips.split(',')] if args.ips else None
 
         if mode_sel == '1':
-            # Use the first IP in the list as the Host IP for watchdog
             host_ip = cli_ips[0] if cli_ips else None
             tool.setup_sender(host_ip=host_ip, auto_bg=args.bg)
         elif mode_sel == '2':

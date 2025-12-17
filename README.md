@@ -17,7 +17,7 @@ The project uses **Podman** containers to manage complex, low-level Linux functi
     * The receiver supports a high input rate (up to 240Hz).
 * **Controller Passthrough (USB/IP):** The physical Steam Deck Controller (Neptune, VID `28de`:PID `1205`) is virtually attached to the remote PC via USB/IP, using a container-based wrapper (`usbip_container.py`) that implements a **hybrid host-side device discovery** method.
 * **P2P Low Latency Networking:** Consistently achieves low latency (under 9 ms ping).
-* **QoS Optimized Repeater:** Continues to acheive low latency while maintaining a wifi connection on the host with a single WiFi card. QoS allows stable gameplay, even while downloading in the background. Running a Speedtest while performing a ping resulted in about 2-12 ms ping between the Steam Deck and the PC via the direct P2P WiFi connection.
+* **QoS Optimized Repeater:** Continues to acheive low latency while maintaining a WiFi internet connection on the host with a single WiFi card. QoS allows stable gameplay, even while downloading in the background. Running a Speedtest while performing a ping resulted in about 2-12 ms ping between the Steam Deck and the PC via the direct P2P WiFi connection.
 
 ## What Needs Work
 

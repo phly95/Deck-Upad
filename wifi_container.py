@@ -27,6 +27,7 @@ class ContainerVPN:
     def __init__(self):
         self.wifi_interface = self.get_active_wifi_interface()
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
+        self.shutdown_on_exit = True  # Default to cleaning up on exit
 
     def run_command(self, cmd, shell=False, check=True, input=None):
         if not shell and isinstance(cmd, str):
@@ -47,6 +48,26 @@ class ContainerVPN:
             print("Error: This script must be run as root (sudo).")
             sys.exit(1)
 
+    # --- State Detection ---
+    def is_container_running(self):
+        """Checks if the container is currently active."""
+        res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
+        return bool(res)
+
+    def get_active_mode(self):
+        """Detects if the running container is in AP or Client mode."""
+        try:
+            # Check running processes
+            ps = self.run_command(f"{self.exec_cmd} 'ps'").lower()
+            if "hostapd" in ps:
+                return "AP Mode"
+            if "wpa_supplicant" in ps:
+                return "Client Mode"
+        except:
+            pass
+        return None
+
+    # --- WiFi Utils ---
     def get_active_wifi_interface(self):
         try:
             output = self.run_command("nmcli -t -f DEVICE,TYPE,STATE device")
@@ -74,6 +95,10 @@ class ContainerVPN:
         except: return []
 
     def cleanup(self):
+        if not self.shutdown_on_exit:
+            print("\n[Background Mode] Detaching script. Container left running.")
+            return
+
         print("\n\n--- Cleaning Up ---")
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
@@ -142,8 +167,7 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
 
-        # 5. Configure Host Side [FIXED LOGIC HERE]
-        # Base command for the connection
+        # 5. Configure Host Side
         nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR}"
 
         # Only add the container as a Gateway if we are in Client Mode (trying to get internet FROM it)
@@ -151,7 +175,7 @@ class ContainerVPN:
             print("      Configuring Container as Default Gateway...")
             nm_cmd += f" gw4 {IP_CTR}"
         else:
-            print("      AP Mode: Skipping Default Gateway configuration to prevent Host freeze.")
+            print("      AP Mode: Skipping Default Gateway configuration.")
 
         self.run_command(nm_cmd)
 
@@ -166,7 +190,6 @@ class ContainerVPN:
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
         # 6. Add Explicit Route on Host to WiFi Subnet via Container
-        # This allows you to ping AP clients even without the gateway set
         self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
 
         # 7. Enable NAT on Container (Postrouting)
@@ -275,11 +298,32 @@ dhcp-option=6,8.8.8.8"""
             print(f"You are a CLIENT.")
             print(f"Ping the Host at:     192.168.50.1")
         print("="*40)
+        print(" 1. Press ENTER to Stop and Cleanup.")
+        print(" 2. Type 'bg' and ENTER to Detach (Run in Background).")
+        print("="*40)
 
 def main():
     vpn = ContainerVPN()
     vpn.check_root()
     try:
+        # --- RESUME LOGIC ---
+        if vpn.is_container_running():
+            active_mode = vpn.get_active_mode()
+            if active_mode:
+                print(f"\n[!] Detected running session: {active_mode}")
+                print("    Resuming control...")
+                vpn.show_status(active_mode)
+
+                # Input loop for Resume
+                user_in = input().strip().lower()
+                if user_in == 'bg':
+                    vpn.shutdown_on_exit = False
+                return # Exit main, finally block handles the rest
+            else:
+                print("[!] Container running but no active session found. Restarting...")
+                vpn.cleanup()
+
+        # --- STARTUP LOGIC ---
         print(f"Detected WiFi: {vpn.wifi_interface}")
         print("\nSelect Mode:\n1. Client (Join)\n2. Host (Create AP)")
         while True:
@@ -309,16 +353,17 @@ def main():
 
         if c == '1':
             vpn.setup_client_mode(ssid, pw)
-            # Pass True for Client Mode (Sets Gateway + High Priority)
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
             vpn.show_status("Client Mode")
         else:
             vpn.setup_ap_mode(ssid, pw)
-            # Pass False for AP Mode (No Gateway + Low Priority)
             vpn.setup_veth_link(ctr_pid, is_client_mode=False)
             vpn.show_status("AP Mode")
 
-        input("\nPress ENTER to stop...")
+        user_in = input().strip().lower()
+        if user_in == 'bg':
+            vpn.shutdown_on_exit = False
+
     except KeyboardInterrupt: print("\nInterrupted.")
     except Exception as e:
         print(f"\nError: {e}")

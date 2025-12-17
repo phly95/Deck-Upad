@@ -23,11 +23,15 @@ SUBNET_CIDR = "24"
 AP_GATEWAY_IP = "192.168.50.1"
 AP_DHCP_RANGE = "192.168.50.10,192.168.50.50,12h"
 
+# Host-Side Session Persistence (Clears on Reboot)
+HOST_SESSION_FILE = "/var/run/wifi_container_session.conf"
+
 class ContainerVPN:
     def __init__(self):
         self.wifi_interface = self.get_active_wifi_interface()
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
-        self.shutdown_on_exit = True  # Default to cleaning up on exit
+        self.shutdown_on_exit = True
+        self.is_pausing = False
 
     def run_command(self, cmd, shell=False, check=True, input=None):
         if not shell and isinstance(cmd, str):
@@ -48,35 +52,58 @@ class ContainerVPN:
             print("Error: This script must be run as root (sudo).")
             sys.exit(1)
 
-    # --- State Detection ---
+    # --- Session Management (Host Side) ---
+    def save_session_host(self, mode, ssid, password):
+        """Saves session to Host /var/run so we can survive container death."""
+        content = f"{mode}\n{ssid}\n{password}\n{self.wifi_interface}"
+        try:
+            with open(HOST_SESSION_FILE, "w") as f:
+                f.write(content)
+            # Make it readable only by root
+            os.chmod(HOST_SESSION_FILE, 0o600)
+        except Exception as e:
+            print(f"Warning: Could not save session: {e}")
+
+    def load_session_host(self):
+        if not os.path.exists(HOST_SESSION_FILE):
+            return None
+        try:
+            with open(HOST_SESSION_FILE, "r") as f:
+                lines = f.read().splitlines()
+            if len(lines) >= 3:
+                # mode, ssid, pw.  Line 4 is iface (optional)
+                return lines
+        except: pass
+        return None
+
+    def clear_session_host(self):
+        if os.path.exists(HOST_SESSION_FILE):
+            os.remove(HOST_SESSION_FILE)
+
     def is_container_running(self):
-        """Checks if the container is currently active."""
         res = self.run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
-    def get_active_mode(self):
-        """Detects if the running container is in AP or Client mode."""
+    def get_container_pid(self):
         try:
-            # Check running processes
-            ps = self.run_command(f"{self.exec_cmd} 'ps'").lower()
-            if "hostapd" in ps:
-                return "AP Mode"
-            if "wpa_supplicant" in ps:
-                return "Client Mode"
-        except:
-            pass
-        return None
+            return self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+        except: return None
 
     # --- WiFi Utils ---
     def get_active_wifi_interface(self):
+        # 1. Trust NM first
         try:
             output = self.run_command("nmcli -t -f DEVICE,TYPE,STATE device")
             for line in output.split('\n'):
                 if ":wifi:" in line: return line.split(':')[0]
+        except: pass
+
+        # 2. Trust 'iw'
+        try:
             output = self.run_command("iw dev | grep Interface", shell=True)
             if output: return output.split()[-1]
         except: pass
-        return "wlp9s0"
+        return "wlp9s0" # Fallback
 
     def scan_wifi(self):
         print(f"Scanning networks on {self.wifi_interface}...")
@@ -94,27 +121,73 @@ class ContainerVPN:
             return networks
         except: return []
 
+    # --- ACTION HANDLERS ---
+    def trigger_pause(self):
+        """Clean shutdown that preserves the session file."""
+        print("\n[PAUSING SESSION]")
+        self.is_pausing = True
+        self.shutdown_on_exit = True
+        # Logic moves to cleanup() which checks self.is_pausing
+        sys.exit(0)
+
+    def trigger_bg(self):
+        """Detach without stopping anything."""
+        print("\n[BACKGROUND MODE] Detaching script.")
+        self.shutdown_on_exit = False
+        sys.exit(0)
+
+    def force_restore_host_wifi(self):
+        """Called after container death to ensure host gets WiFi back."""
+        print("Restoring Host WiFi...")
+        # 1. Unblock
+        self.run_command("rfkill unblock wifi", check=False)
+
+        # 2. Wait for interface to reappear in default namespace
+        # When container dies, kernel moves phy0 back to host.
+        # It might be named 'wlan0' or renamed automatically by udev.
+        time.sleep(1)
+
+        target_iface = self.wifi_interface
+
+        # Try to find it if name changed
+        try:
+            out = self.run_command("iw dev | grep Interface", shell=True)
+            if out: target_iface = out.split()[-1]
+        except: pass
+
+        # 3. Bring Up and Connect
+        self.run_command(f"ip link set {target_iface} up", check=False)
+        self.run_command(f"nmcli device set {target_iface} managed yes", check=False)
+        self.run_command(f"nmcli device connect {target_iface}", check=False)
+
     def cleanup(self):
         if not self.shutdown_on_exit:
-            print("\n[Background Mode] Detaching script. Container left running.")
             return
 
         print("\n\n--- Cleaning Up ---")
+
+        # 1. Destroy Network Link
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
 
-        print("Stopping container...")
+        # 2. Destroy Container (This ejects WiFi card to Host)
+        print("Stopping container (Releasing WiFi Card)...")
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        print("Restoring Host Network Manager...")
-        try:
-            iface = self.get_active_wifi_interface()
-            self.run_command(f"nmcli device connect {iface}", check=False)
-            print("Done. Host internet should return shortly.")
-        except: print("Warning: Could not auto-trigger WiFi reconnect.")
+        # 3. Restore Host
+        self.force_restore_host_wifi()
 
+        # 4. Handle Session File
+        if self.is_pausing:
+            print(f"Session saved to {HOST_SESSION_FILE}")
+            print("Run script again to RESUME.")
+        else:
+            print("Session cleared.")
+            self.clear_session_host()
+
+    # --- SETUP LOGIC ---
     def initialize_container(self):
         print("\n[1/6] Initializing Container...")
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
@@ -137,7 +210,6 @@ class ContainerVPN:
                     break
                 except:
                     if i < max_retries - 1:
-                        print(f"      Retry {i+1}/{max_retries}...")
                         time.sleep(5)
                     else: raise
             print(f"      Caching image to '{CUSTOM_IMAGE}'...")
@@ -148,63 +220,42 @@ class ContainerVPN:
     def move_wifi_card(self):
         print(f"[3/6] Moving {self.wifi_interface} to container...")
         self.run_command(f"nmcli device disconnect {self.wifi_interface}", check=False)
-        ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+        ctr_pid = self.get_container_pid()
         self.run_command(f"iw phy phy0 set netns {ctr_pid}")
         return ctr_pid
 
     def setup_veth_link(self, ctr_pid, is_client_mode):
-        print(f"[5/6] Creating High-Speed Veth Link (Host <-> Container)...")
-        # 1. Create Veth Pair
+        print(f"[5/6] Creating High-Speed Veth Link...")
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
-
-        # 2. Performance Tuning
         self.run_command(f"ip link set {VETH_HOST} txqueuelen 1000")
-
-        # 3. Move Container-side end
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
-
-        # 4. Configure Container Side
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR}/{SUBNET_CIDR} dev {VETH_CTR}'")
 
-        # 5. Configure Host Side
         nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST}/{SUBNET_CIDR}"
-
-        # Only add the container as a Gateway if we are in Client Mode (trying to get internet FROM it)
         if is_client_mode:
-            print("      Configuring Container as Default Gateway...")
             nm_cmd += f" gw4 {IP_CTR}"
-        else:
-            print("      AP Mode: Skipping Default Gateway configuration.")
 
         self.run_command(nm_cmd)
 
-        if is_client_mode:
-            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
-            # High Priority (50) for Client Mode
-            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 50")
-        else:
-            # Low Priority (600) for AP Mode so Host uses its own internet
-            self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric 600")
+        metric = "50" if is_client_mode else "600"
+        self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.route-metric {metric}")
+        if is_client_mode: self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
 
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
-
-        # 6. Add Explicit Route on Host to WiFi Subnet via Container
         self.run_command(f"ip route add 192.168.50.0/24 via {IP_CTR} dev {VETH_HOST}", check=False)
-
-        # 7. Enable NAT on Container (Postrouting)
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
 
     def optimize_wifi(self):
-        """Disables Power Saving to reduce latency."""
-        print("      Optimizing WiFi Latency (Power Save OFF)...")
         self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
 
     def setup_client_mode(self, ssid, password):
         print(f"[4/6] Connecting to '{ssid}' (Client Mode)...")
+        # Save session to host immediately
+        self.save_session_host("client", ssid, password)
+
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
-
         self.optimize_wifi()
 
         psk_cmd = f"wpa_passphrase \"{ssid}\" \"{password}\" > /etc/wpa_supplicant.conf"
@@ -213,36 +264,28 @@ class ContainerVPN:
         print("      Requesting IP...")
         self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
 
-        # Gateway Detection
-        gateway_ip = "172.16.16.16"
+        gateway_ip = "192.168.1.1"
         try:
-            output = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
-            if output:
-                for line in output.split('\n'):
-                    if 'src' in line and '/' in line:
-                        subnet = line.split()[0].split('/')[0]
-                        octets = subnet.split('.')
-                        if len(octets) == 4:
-                            if subnet.startswith("192.168.50"):
-                                gateway_ip = "192.168.50.1"
-                            else:
-                                gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.16"
-                        break
+            out = self.run_command(f"{self.exec_cmd} 'ip route show dev wlan0'")
+            for line in out.split('\n'):
+                if 'src' in line:
+                    parts = line.split()
+                    subnet = parts[0].split('.')
+                    gateway_ip = f"{subnet[0]}.{subnet[1]}.{subnet[2]}.1"
+                    break
         except: pass
 
         self.run_command(f"{self.exec_cmd} 'ip route del default || true'")
         self.run_command(f"{self.exec_cmd} 'ip route add default via {gateway_ip} dev wlan0'")
-
-        # DMZ Forwarding (Client Mode)
-        print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def setup_ap_mode(self, ssid, password):
-        print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode - 5GHz AX)...")
+        print(f"[4/6] Starting Hotspot '{ssid}'...")
+        self.save_session_host("ap", ssid, password)
+
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
-
         self.optimize_wifi()
 
         hostapd_conf = f"""interface=wlan0
@@ -254,10 +297,6 @@ ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
 ht_capab=[HT40+]
-vht_oper_chwidth=1
-vht_oper_centr_freq_seg0_idx=42
-he_oper_chwidth=1
-he_oper_centr_freq_seg0_idx=42
 wpa=2
 wpa_passphrase={password}
 wpa_key_mgmt=WPA-PSK
@@ -273,10 +312,6 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
-        # DMZ Forwarding (AP Mode)
-        print("      Enabling DMZ...")
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'") # DHCP
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'") # DNS
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def show_status(self, mode):
@@ -290,40 +325,44 @@ dhcp-option=6,8.8.8.8"""
         print(f"YOUR WIFI IP:         {lan_ip}")
         print(f"INTERNAL VETH IP:     {IP_HOST}")
         print("-" * 40)
-        if mode == "AP Mode":
-            print(f"You are the HOST.")
-            print(f"Clients will connect from: 192.168.50.10 - 50")
-            print(f"Ping Client IPs directly (e.g., ping 192.168.50.48)")
-        else:
-            print(f"You are a CLIENT.")
-            print(f"Ping the Host at:     192.168.50.1")
+        print(" 1. Press ENTER to Stop and Cleanup (Session Cleared).")
+        print(" 2. Type 'bg' to Detach (Run in Background).")
+        print(" 3. Type 'pause' to Pause (Give Wifi back to OS, Save Session).")
         print("="*40)
-        print(" 1. Press ENTER to Stop and Cleanup.")
-        print(" 2. Type 'bg' and ENTER to Detach (Run in Background).")
-        print("="*40)
+
+        val = input().strip().lower()
+        if val == 'bg': self.trigger_bg()
+        elif val == 'pause': self.trigger_pause()
+        # Else (Enter) falls through to main cleanup (which clears session)
 
 def main():
     vpn = ContainerVPN()
     vpn.check_root()
     try:
-        # --- RESUME LOGIC ---
-        if vpn.is_container_running():
-            active_mode = vpn.get_active_mode()
-            if active_mode:
-                print(f"\n[!] Detected running session: {active_mode}")
-                print("    Resuming control...")
-                vpn.show_status(active_mode)
+        # --- AUTO-RESUME CHECK ---
+        saved = vpn.load_session_host()
+        if saved:
+            mode, ssid, pw = saved[0], saved[1], saved[2]
+            print(f"\n[!] Found saved session ({mode}). Resuming automatically...")
 
-                # Input loop for Resume
-                user_in = input().strip().lower()
-                if user_in == 'bg':
-                    vpn.shutdown_on_exit = False
-                return # Exit main, finally block handles the rest
+            # If a previous container is stuck, kill it first
+            if vpn.is_container_running():
+                vpn.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+
+            vpn.initialize_container()
+            ctr_pid = vpn.move_wifi_card()
+
+            if mode == 'client':
+                vpn.setup_client_mode(ssid, pw)
+                vpn.setup_veth_link(ctr_pid, is_client_mode=True)
+                vpn.show_status("Client Mode")
             else:
-                print("[!] Container running but no active session found. Restarting...")
-                vpn.cleanup()
+                vpn.setup_ap_mode(ssid, pw)
+                vpn.setup_veth_link(ctr_pid, is_client_mode=False)
+                vpn.show_status("AP Mode")
+            return
 
-        # --- STARTUP LOGIC ---
+        # --- FRESH START ---
         print(f"Detected WiFi: {vpn.wifi_interface}")
         print("\nSelect Mode:\n1. Client (Join)\n2. Host (Create AP)")
         while True:
@@ -340,9 +379,7 @@ def main():
                 if sel.isdigit() and 1 <= int(sel) <= len(nets):
                     ssid = nets[int(sel)-1]
                     break
-                elif sel:
-                    ssid = sel
-                    break
+                elif sel: ssid = sel; break
         else:
             ssid = input("Enter new SSID: ")
 
@@ -359,10 +396,6 @@ def main():
             vpn.setup_ap_mode(ssid, pw)
             vpn.setup_veth_link(ctr_pid, is_client_mode=False)
             vpn.show_status("AP Mode")
-
-        user_in = input().strip().lower()
-        if user_in == 'bg':
-            vpn.shutdown_on_exit = False
 
     except KeyboardInterrupt: print("\nInterrupted.")
     except Exception as e:

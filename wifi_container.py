@@ -133,18 +133,15 @@ class ContainerVPN:
         return "wlp9s0"
 
     def scan_wifi(self, band_filter=None):
-        # REVERTED TO ORIGINAL ROBUST SCANNER
         print(f"Scanning networks on {self.wifi_interface}...")
         try:
             self.run_command(f"nmcli device wifi rescan ifname {self.wifi_interface}", check=False)
             time.sleep(2)
-            # Simple scan (SSID only). This avoids parsing issues with Frequency/Signal columns.
+            # Robust Scan (SSID Only to prevent parsing errors)
             output = self.run_command("nmcli -t -f SSID device wifi list")
             networks = []
             seen = set()
             for line in output.split('\n'):
-                # nmcli -t escapes colons, but since we only ask for SSID, the whole line is the SSID (mostly).
-                # To be safe against potential parsing artifacts:
                 ssid = line.replace('\\:', ':').strip()
                 if ssid and ssid not in seen:
                     networks.append(ssid)
@@ -205,7 +202,8 @@ class ContainerVPN:
             max_retries = 3
             for i in range(max_retries):
                 try:
-                    self.run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache wpa_supplicant iw iptables hostapd dnsmasq iproute2")
+                    # Added iproute2-tc here for FQ_CoDel support
+                    self.run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc")
                     break
                 except:
                     if i < max_retries - 1:
@@ -257,7 +255,6 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
 
         # 2. NAT for Local AP Access (wlan1) - ESSENTIAL for Ping from Host -> Client
-        # This masks the Host IP (10.13.13.2) so Clients see the Gateway IP (192.168.50.1)
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan1 -j MASQUERADE' 2>/dev/null || true")
 
         # 3. Host (veth) <-> Internet (wlan0)
@@ -268,9 +265,19 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o wlan0 -j ACCEPT' 2>/dev/null || true")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o wlan1 -m state --state RELATED,ESTABLISHED -j ACCEPT' 2>/dev/null || true")
 
-        # 5. Host (veth) <-> Clients (wlan1) (Allow Host to ping repeater clients)
+        # 5. Host (veth) <-> Clients (wlan1)
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan1 -j ACCEPT' 2>/dev/null || true")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan1 -o {VETH_CTR} -j ACCEPT' 2>/dev/null || true")
+
+    def enable_aqm(self):
+        """Enables FQ_CoDel (Fair Queuing Controlled Delay) to fix bufferbloat."""
+        print("      Enabling Active Queue Management (FQ_CoDel)...")
+        # Apply to uplink (Internet)
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel' 2>/dev/null || true")
+        # Apply to downlink (Host connection)
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev {VETH_CTR} root fq_codel' 2>/dev/null || true")
+        # Apply to local AP (Steam Deck connection)
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan1 root fq_codel' 2>/dev/null || true")
 
     def optimize_wifi(self):
         print("      Optimizing WiFi Latency (Power Save OFF)...")
@@ -278,7 +285,6 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 addrgenmode none' 2>/dev/null || true")
 
     def connect_wlan0(self, ssid, password, run_dhcp=True):
-        """ Robust WiFi connection. """
         print(f"      Connecting wlan0 to '{ssid}'...")
 
         self.run_command(f"{self.exec_cmd} 'killall wpa_supplicant 2>/dev/null || true'")
@@ -290,7 +296,7 @@ class ContainerVPN:
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.optimize_wifi()
 
-        # Generate Config
+        # Generate Config (Auto-Negotiate)
         psk_hex = f'psk="{password}"'
         try:
             out = self.run_command(f"{self.exec_cmd} 'wpa_passphrase \"{ssid}\" \"{password}\"'")
@@ -311,7 +317,7 @@ network={{
 """
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=conf)
 
-        # Start Supplicant with default driver (removed legacy fallbacks)
+        # Start Supplicant with default driver
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
 
         self.run_command(f"{self.exec_cmd} 'ip route del default 2>/dev/null || true'")
@@ -374,6 +380,7 @@ network={{
 
         print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
+        self.enable_aqm()
 
     def setup_ap_mode(self, ssid, password):
         print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode)...")
@@ -408,6 +415,7 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
+        self.enable_aqm()
 
     def setup_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
         print(f"[4/6] Initializing Repeater Mode (Auto-Sync Band)...")
@@ -434,6 +442,8 @@ country_code=US
 hw_mode={hw_mode}
 channel={active_channel}
 ieee80211n=1
+ieee80211ac=1
+ieee80211ax=1
 wpa=2
 wpa_passphrase={ap_pass}
 wpa_key_mgmt=WPA-PSK
@@ -450,6 +460,7 @@ rsn_pairwise=CCMP"""
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
+        self.enable_aqm()
 
 
     def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
@@ -493,6 +504,7 @@ rsn_pairwise=CCMP"""
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
+        self.enable_aqm()
 
 
     def show_status(self, mode):

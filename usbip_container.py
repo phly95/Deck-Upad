@@ -26,7 +26,6 @@ class ContainerUSBIP:
         if not shell and isinstance(cmd, str):
             cmd = shlex.split(cmd)
         try:
-            [cite_start]# [cite: 2]
             result = subprocess.run(
                 cmd, shell=shell, check=check,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -34,7 +33,6 @@ class ContainerUSBIP:
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            [cite_start]# [cite: 3]
             if check:
                 print(f"Command failed: {cmd}")
                 print(f"Stderr: {e.stderr}")
@@ -43,7 +41,6 @@ class ContainerUSBIP:
 
     def check_root(self):
         if os.geteuid() != 0:
-            [cite_start]# [cite: 4]
             print("Error: This script must be run as root (sudo).")
             sys.exit(1)
 
@@ -58,10 +55,8 @@ class ContainerUSBIP:
         self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
         # Attempt to detach all ports cleanly before killing container
-        # This prevents "zombie" connections on the host kernel
         try:
             print("      Detaching all imported USBIP devices...")
-            # Simple loop to detach ports 00 through 08 (common range)
             for i in range(8):
                 port_str = f"{i:02}"
                 self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
@@ -71,24 +66,20 @@ class ContainerUSBIP:
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-        [cite_start]# [cite: 5]
         print("Cleaned up.")
 
     def ensure_image_exists(self):
         print("[1/5] Checking for USBIP tools image...")
-        [cite_start]# [cite: 5]
         has_image = self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False)
         if has_image:
             print("      Image found. Skipping build.")
             return
 
         print("      Image not found. Building...")
-        [cite_start]# [cite: 6]
         self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
         self.run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
         print("      Installing packages...")
-        [cite_start]# [cite: 7]
         install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils --exclude=kernel-debug*"
 
         try:
@@ -97,7 +88,6 @@ class ContainerUSBIP:
             self.run_command(f"podman commit {BUILDER_NAME} {CUSTOM_IMAGE}")
             self.run_command(f"podman rm -f {BUILDER_NAME}")
         except Exception as e:
-            [cite_start]# [cite: 8]
             print("\n[ERROR] Build failed. Check internet.")
             self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
             sys.exit(1)
@@ -110,7 +100,6 @@ class ContainerUSBIP:
         print("[3/5] Starting Runtime Container...")
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         # CRITICAL: Mount /sys and /dev so container can act on the Host Kernel
-        [cite_start]# [cite: 9]
         self.run_command(
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
@@ -123,7 +112,6 @@ class ContainerUSBIP:
 
     # --- HOST-SIDE DISCOVERY ---
     def find_deck_controller_on_host(self):
-        [cite_start]# [cite: 10]
         """Scans the Host OS /sys/bus/usb to find the Neptune controller."""
         base_path = "/sys/bus/usb/devices"
         candidates = []
@@ -143,7 +131,6 @@ class ContainerUSBIP:
                     with open(vid_path, 'r') as f: vid = f.read().strip()
                     with open(pid_path, 'r') as f: pid = f.read().strip()
 
-                    [cite_start]# [cite: 13]
                     if vid == VALVE_VID and pid == VALVE_PID:
                         candidates.append(device_id)
                 except: continue
@@ -188,7 +175,6 @@ class ContainerUSBIP:
                 return
 
             print(f"      Binding {target_bus}...")
-            [cite_start]# [cite: 18]
             self.run_command(f"{self.exec_cmd} 'usbip bind -b {target_bus}'")
 
         print("\n" + "="*40)
@@ -224,7 +210,6 @@ class ContainerUSBIP:
             for sender_ip in ips:
                 print(f"\n[Scanning {sender_ip}]...")
                 try:
-                    [cite_start]# [cite: 21]
                     output = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
                     print(output)
 
@@ -255,7 +240,6 @@ class ContainerUSBIP:
                     BUS=${{PAIR##*:}}
 
                     # Simple check: If 'usbip port' doesn't show this IP/BUS combo, try to attach
-                    # We grep for the specific Bus ID associated with the IP to confirm attachment
                     if ! usbip port | grep -q "$IP" | grep -q "$BUS"; then
                         echo "[$(date)] Reconnecting $IP $BUS..."
                         usbip attach -r $IP -b $BUS
@@ -320,9 +304,9 @@ def main():
 
         if mode == '1':
             tool.setup_sender()
-        [cite_start]# [cite: 25]
         elif mode == '2':
             tool.setup_receiver()
+
     except KeyboardInterrupt:
         print("\nInterrupted.")
         tool.stop_container()

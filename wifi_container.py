@@ -272,12 +272,10 @@ class ContainerVPN:
     def enable_aqm(self):
         """Enables FQ_CoDel (Fair Queuing Controlled Delay) to fix bufferbloat."""
         print("      Enabling Active Queue Management (FQ_CoDel)...")
-        # Apply to uplink (Internet)
-        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel' 2>/dev/null || true")
-        # Apply to downlink (Host connection)
-        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev {VETH_CTR} root fq_codel' 2>/dev/null || true")
-        # Apply to local AP (Steam Deck connection)
-        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan1 root fq_codel' 2>/dev/null || true")
+        # FIXED: Quotes moved to encompass the || true logic so shell handles it
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev {VETH_CTR} root fq_codel 2>/dev/null || true'")
+        self.run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan1 root fq_codel 2>/dev/null || true'")
 
     def optimize_wifi(self):
         print("      Optimizing WiFi Latency (Power Save OFF)...")
@@ -380,7 +378,6 @@ network={{
 
         print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
-        self.enable_aqm()
 
     def setup_ap_mode(self, ssid, password):
         print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode)...")
@@ -415,7 +412,6 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 67 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport 53 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
-        self.enable_aqm()
 
     def setup_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
         print(f"[4/6] Initializing Repeater Mode (Auto-Sync Band)...")
@@ -460,7 +456,6 @@ rsn_pairwise=CCMP"""
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
-        self.enable_aqm()
 
 
     def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
@@ -504,7 +499,6 @@ rsn_pairwise=CCMP"""
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
-        self.enable_aqm()
 
 
     def show_status(self, mode):
@@ -691,6 +685,9 @@ def main():
             rc = repeater_config
             vpn.setup_crossband_repeater_mode(rc['client_ssid'], rc['client_pass'], rc['ap_ssid'], rc['ap_pass'])
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
+
+        # Apply AQM *AFTER* veth links are up
+        vpn.enable_aqm()
 
         vpn.show_status(active_mode_str)
 

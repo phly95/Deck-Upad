@@ -380,17 +380,18 @@ network={{
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
     def setup_ap_mode(self, ssid, password):
-        print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode)...")
+        print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode - Channel 165)...")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
         self.optimize_wifi()
 
+        # UPDATED: Channel 165 (20 MHz)
         hostapd_conf = f"""interface=wlan0
 ssid={ssid}
 country_code=US
 hw_mode=a
-channel=36
+channel=165
 ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
@@ -465,12 +466,12 @@ rsn_pairwise=CCMP"""
 
 
     def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
-        print(f"[4/6] Initializing Cross-Band Repeater (2.4GHz -> 5GHz 80MHz)...")
+        print(f"[4/6] Initializing Cross-Band Repeater (2.4GHz -> 5GHz 20MHz)...")
 
         self.connect_wlan0(client_ssid, client_pass, run_dhcp=True)
 
         print(f"      Starting High-Performance Hotspot '{ap_ssid}' on wlan1...")
-        print(f"      (Target: Channel 36, VHT80, 5GHz)")
+        print(f"      (Target: Channel 165, 20MHz, 5GHz)")
 
         rand_mac = "02:00:00:%02x:%02x:%02x" % (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
@@ -478,17 +479,15 @@ rsn_pairwise=CCMP"""
         self.run_command(f"{self.exec_cmd} 'ip link set wlan1 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan1'")
 
+        # UPDATED: Channel 165 (20 MHz), removed HT40+/VHT80 settings
         hostapd_conf = f"""interface=wlan1
 ssid={ap_ssid}
 country_code=US
 hw_mode=a
-channel=36
+channel=165
 ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
-ht_capab=[HT40+]
-vht_oper_chwidth=1
-vht_oper_centr_freq_seg0_idx=42
 wpa=2
 wpa_passphrase={ap_pass}
 wpa_key_mgmt=WPA-PSK
@@ -503,11 +502,9 @@ rsn_pairwise=CCMP"""
             print("Your WiFi card likely does not support simultaneous dual-band (RSDB).")
             raise e
 
-        # --- FIX ADDED HERE ---
         # Forward traffic hitting the AP interface (wlan1) to the internal Host IP
         print("      Enabling DMZ for Repeater Clients...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan1 -j DNAT --to-destination {IP_HOST}'")
-        # ----------------------
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
@@ -621,6 +618,38 @@ def main():
 
             # Logic for Repeater Mode Inputs
             if mode_code == '3' or mode_code == '4':
+
+                # --- NEW WARNING BLOCK START ---
+                warning_marker = ".repeater_ack"
+                if not os.path.exists(warning_marker):
+                    print("\n" + "!"*60)
+                    print(" WARNING: HIGH POLLING FREQUENCY & SPECTRUM USAGE")
+                    print("!"*60)
+                    print("This mode uses a very high polling frequency that can degrade")
+                    print("the spectrum your home internet AP is using for other devices and your neighbors.")
+                    print("\nIt is HIGHLY RECOMMENDED to adjust your home AP to something")
+                    print("less intrusive, such as:")
+                    print("  - 40 MHz width")
+                    print("  - Upper range of UNII-3 (e.g., Channel 149+). Check a WiFi scanner to see what 5GHz spectrum is in use")
+                    print("  - If you must overlap with another AP, aim to use the upper range of the channel to avoid")
+                    print("interfering with neighboring primary channels")
+                    print("  - When you do so, you're cutting the effective frequency from the top of the neighboring channel,")
+                    print("which is why: Aim for the top if you must.")
+                    print("\nRelevance:")
+                    print("  - HIGH priority for apartment buildings (congestion risk).")
+                    print("  - Lower priority for rural homes.")
+                    print("!"*60)
+
+                    try:
+                        input("Press [Enter] to acknowledge and continue...")
+                        # Create marker file to suppress this warning in future
+                        with open(warning_marker, "w") as f:
+                            f.write("acknowledged")
+                    except KeyboardInterrupt:
+                        print("\nAborted.")
+                        return
+                # --- NEW WARNING BLOCK END ---
+
                 # We do not use filter here anymore since we scan ALL bands
                 nets = vpn.scan_wifi()
                 print("\n[Input] Select UPSTREAM Network (Internet Source):")

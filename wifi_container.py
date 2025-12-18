@@ -454,6 +454,12 @@ rsn_pairwise=CCMP"""
             print("Try running 'iw list' inside container to see 'valid interface combinations'.")
             raise e
 
+        # --- FIX ADDED HERE ---
+        # Forward traffic hitting the AP interface (wlan1) to the internal Host IP
+        print("      Enabling DMZ for Repeater Clients...")
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan1 -j DNAT --to-destination {IP_HOST}'")
+        # ----------------------
+
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
@@ -496,6 +502,12 @@ rsn_pairwise=CCMP"""
             print("\n[CRITICAL ERROR] Failed to start 5GHz AP while connected to 2.4GHz.")
             print("Your WiFi card likely does not support simultaneous dual-band (RSDB).")
             raise e
+
+        # --- FIX ADDED HERE ---
+        # Forward traffic hitting the AP interface (wlan1) to the internal Host IP
+        print("      Enabling DMZ for Repeater Clients...")
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan1 -j DNAT --to-destination {IP_HOST}'")
+        # ----------------------
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=f"interface=wlan1\ndhcp-range={AP_DHCP_RANGE}\ndhcp-option=3,{AP_GATEWAY_IP}\ndhcp-option=6,8.8.8.8")
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
@@ -598,7 +610,7 @@ def main():
             print("\nSelect Mode:")
             print("1. Client (Join WiFi)")
             print("2. Host (Create AP)")
-            print("3. Repeater (Join WiFi -> Create AP same band)")
+            print("3. Repeater (Join WiFi -> Create AP same band, Recommended for Host PC without Ethernet, QoS-optimized for stability)")
             print("4. Cross-Band Repeater (May not work, 2.4GHz In -> 5GHz 80MHz Out)")
 
             while True:

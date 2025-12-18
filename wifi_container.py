@@ -56,13 +56,14 @@ class ContainerVPN:
             sys.exit(1)
 
     # --- Session Management ---
-    def save_session(self, mode, ssid, password, net_config=None, repeater_config=None):
+    def save_session(self, mode, ssid, password, net_config=None, repeater_config=None, ap_channel=165):
         data = {
             "mode": mode,
             "ssid": ssid,
             "password": password,
             "net_config": net_config,
-            "repeater_config": repeater_config
+            "repeater_config": repeater_config,
+            "ap_channel": ap_channel
         }
         try:
             with open(STATE_FILE, "w") as f:
@@ -379,19 +380,19 @@ network={{
         print("      Enabling DMZ...")
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -j DNAT --to-destination {IP_HOST}'")
 
-    def setup_ap_mode(self, ssid, password):
-        print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode - Channel 165)...")
+    def setup_ap_mode(self, ssid, password, channel=165):
+        print(f"[4/6] Starting Hotspot '{ssid}' (AP Mode - Channel {channel})...")
         self.run_command(f"{self.exec_cmd} 'iw phy phy0 interface add wlan0 type managed 2>/dev/null || true'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan0'")
         self.optimize_wifi()
 
-        # UPDATED: Channel 165 (20 MHz)
+        # UPDATED: Dynamic Channel, Hardcoded US Region
         hostapd_conf = f"""interface=wlan0
 ssid={ssid}
 country_code=US
 hw_mode=a
-channel=165
+channel={channel}
 ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
@@ -465,13 +466,13 @@ rsn_pairwise=CCMP"""
         self.run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
 
-    def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass):
+    def setup_crossband_repeater_mode(self, client_ssid, client_pass, ap_ssid, ap_pass, channel=165):
         print(f"[4/6] Initializing Cross-Band Repeater (2.4GHz -> 5GHz 20MHz)...")
 
         self.connect_wlan0(client_ssid, client_pass, run_dhcp=True)
 
         print(f"      Starting High-Performance Hotspot '{ap_ssid}' on wlan1...")
-        print(f"      (Target: Channel 165, 20MHz, 5GHz)")
+        print(f"      (Target: Channel {channel}, 20MHz, 5GHz)")
 
         rand_mac = "02:00:00:%02x:%02x:%02x" % (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
@@ -479,12 +480,12 @@ rsn_pairwise=CCMP"""
         self.run_command(f"{self.exec_cmd} 'ip link set wlan1 up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev wlan1'")
 
-        # UPDATED: Channel 165 (20 MHz), removed HT40+/VHT80 settings
+        # UPDATED: Dynamic Channel
         hostapd_conf = f"""interface=wlan1
 ssid={ap_ssid}
 country_code=US
 hw_mode=a
-channel=165
+channel={channel}
 ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
@@ -574,6 +575,7 @@ def main():
         mode_code = "1"
         net_config = None
         repeater_config = None
+        target_ap_channel = 165
 
         saved_session = vpn.load_session()
         use_saved = False
@@ -593,6 +595,8 @@ def main():
                 password = saved_session['password']
                 net_config = saved_session.get('net_config')
                 repeater_config = saved_session.get('repeater_config')
+                # Load saved channel or default to 165 if missing
+                target_ap_channel = saved_session.get('ap_channel', 165)
 
                 if saved_session['mode'] == 'Client Mode': mode_code = '1'
                 elif saved_session['mode'] == 'AP Mode': mode_code = '2'
@@ -603,6 +607,23 @@ def main():
 
         # --- MANUAL SETUP ---
         if not use_saved:
+            print("\n" + "="*60)
+            print(" REGIONAL SPECTRUM SELECTION")
+            print("="*60)
+            print("Is WiFi Channel 165 (5GHz UNII-3) allowed in your region?")
+            print(" - Answer YES if in North America, South America, Philippines, or Taiwan.")
+            print(" - Answer NO if in Europe, Japan, or most of Asia/Middle East.")
+            print("-" * 60)
+
+            reg_choice = input("Allowed? (Y/n): ").strip().lower()
+            if reg_choice == 'n':
+                # Channel 36 is widely allowed in 5GHz (Europe/Japan included)
+                print(" -> Selected Channel 36 (Safe 5GHz fallback).")
+                target_ap_channel = 36
+            else:
+                print(" -> Selected Channel 165 (High Performance).")
+                target_ap_channel = 165
+
             print(f"Detected WiFi: {vpn.wifi_interface}")
             print("\nSelect Mode:")
             print("1. Client (Join WiFi)")
@@ -714,7 +735,8 @@ def main():
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
         elif mode_code == '2':
             active_mode_str = "AP Mode"
-            vpn.setup_ap_mode(ssid, password)
+            # Updated to use target_ap_channel
+            vpn.setup_ap_mode(ssid, password, channel=target_ap_channel)
             vpn.setup_veth_link(ctr_pid, is_client_mode=False)
         elif mode_code == '3':
             active_mode_str = "Repeater Mode"
@@ -724,7 +746,8 @@ def main():
         elif mode_code == '4':
             active_mode_str = "CrossBand Mode"
             rc = repeater_config
-            vpn.setup_crossband_repeater_mode(rc['client_ssid'], rc['client_pass'], rc['ap_ssid'], rc['ap_pass'])
+            # Updated to use target_ap_channel
+            vpn.setup_crossband_repeater_mode(rc['client_ssid'], rc['client_pass'], rc['ap_ssid'], rc['ap_pass'], channel=target_ap_channel)
             vpn.setup_veth_link(ctr_pid, is_client_mode=True)
 
         # Apply AQM *AFTER* veth links are up
@@ -739,7 +762,7 @@ def main():
             vpn.shutdown_on_exit = False
         elif user_in == 'pause':
             nc = vpn.get_current_network_state()
-            vpn.save_session(active_mode_str, ssid, password, net_config=nc, repeater_config=repeater_config)
+            vpn.save_session(active_mode_str, ssid, password, net_config=nc, repeater_config=repeater_config, ap_channel=target_ap_channel)
             vpn.shutdown_on_exit = True
         elif user_in == 'stop' or user_in == '':
             vpn.clear_session()

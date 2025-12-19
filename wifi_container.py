@@ -617,9 +617,9 @@ def main():
 
             reg_choice = input("Allowed? (Y/n): ").strip().lower()
             if reg_choice == 'n':
-                # Channel 36 is widely allowed in 5GHz (Europe/Japan included)
-                print(" -> Selected Channel 36 (Safe 5GHz fallback).")
-                target_ap_channel = 36
+                # Channel 48 is widely allowed in 5GHz (Europe/Japan included)
+                print(" -> Selected Channel 48 (Safe 5GHz fallback).")
+                target_ap_channel = 48
             else:
                 print(" -> Selected Channel 165 (High Performance).")
                 target_ap_channel = 165

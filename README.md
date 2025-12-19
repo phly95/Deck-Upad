@@ -1,6 +1,10 @@
 # Deck-Upad
 A high-performance, low latency system to transmit controller input and video output over a wireless network. It enables the first practical Linux-compatible implementation of native resolution dual-screen emulation over standard Wi-Fi. The implementation uses the Steam Deck as a controller with a screen for a remote PC, similar to the Wii U gamepad.
 
+While this project is applied to a gaming use-case, the underlying architecture implements a novel containerized network isolation pattern to solve for deterministic latency in real-time wireless systems.
+ 
+👉 Read [the technical overview](https://github.com/phly95/Deck-Upad/blob/main/TECHNICAL_OVERVIEW.md) for a deep-dive into the Network Namespaces, Kernel Isolation, and VETH bridging strategies used to achieve sub-9ms latency.
+
 https://github.com/user-attachments/assets/9d859c82-4915-40b5-b0e8-9d2090256aee
 
 

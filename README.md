@@ -1,4 +1,7 @@
 # Deck-Upad
+
+tl;dr: This turns your Steam Deck into a Steam Deck into a Steam Controller 2 you can also use as a Wii U gamepad with a screen. It has wired-like latency, making intense games like Celeste playable. If you are here to game, you can feel free to disregard the following paragraphs.
+
 A high-performance, low latency system to transmit controller input and video output over a wireless network. It enables the first practical Linux-compatible implementation of native resolution dual-screen emulation over standard Wi-Fi. The implementation uses the Steam Deck as a controller with a screen for a remote PC, similar to the Wii U gamepad.
 
 While this project is applied to a gaming use-case, the underlying architecture implements a novel containerized network isolation pattern to solve for deterministic latency in real-time wireless systems.

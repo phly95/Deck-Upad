@@ -1,20 +1,10 @@
 # Deck-Upad
 
-tl;dr: This turns your Steam Deck into a Steam Controller 2 (yes, touchpads, gyro and haptics work) you can also use as a Wii U gamepad with a screen. It has wired-like latency, making intense games like Celeste playable. To make necessary WiFi tweaks without the system intervening, it uses containers to perform these changes temporarily, to hide WiFi from the Operating System, and make it possible on read-only OSs like SteamOS. Think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot.
+The goal of this project is to enable turning your Steam Deck into a Steam Controller 2 (yes, touchpads, gyro and haptics work) you can also use as a Wii U gamepad with a screen. It has wired-like latency (ping times of 2-5ms have been observed when using the wifi container), making intense games like Celeste playable. To make low latency gameplay possible, the project leverages USB/IP as well as removing smart features normally performed by Network Manager, without making permanent changes to the system. To make the necessary WiFi and controller tweaks without the system intervening, it uses containers to perform these changes temporarily. This enables using USB/IP and iw (an alternative lightweight WiFi network manager) on read-only OSs like SteamOS. Think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot. Think of usbip_container as a preconfigued script to redirect inputs from the Steam Deck's built-in controller to another PC over that WiFi connection. USB/IP relies on a wired-like network connection due to its use of the TCP protocol, and that is why it relies on the tweaks made by WiFi container to introduce that stability.
 
 Pro Tip: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
 
 AI use disclosure is located in [AI_DISCLOSURE.md](AI_DISCLOSURE.md) .
-
-If you are here to game, you can feel free to disregard the following paragraphs.
-
-## Description
-
-A high-performance, low latency system to transmit controller input and video output over a wireless network. It enables the first practical Linux-compatible implementation of native resolution dual-screen emulation over standard Wi-Fi. The implementation uses the Steam Deck as a controller with a screen for a remote PC, similar to the Wii U gamepad.
-
-While this project is applied to a gaming use-case, the underlying architecture implements a novel containerized network isolation pattern to solve for deterministic latency in real-time wireless systems.
- 
-👉 Read [the technical overview](https://github.com/phly95/Deck-Upad/blob/main/TECHNICAL_OVERVIEW.md) for a deep-dive into the Network Namespaces, Kernel Isolation, and VETH bridging strategies used to achieve sub-9ms latency.
 
 https://github.com/user-attachments/assets/9d859c82-4915-40b5-b0e8-9d2090256aee
 

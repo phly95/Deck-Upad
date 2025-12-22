@@ -4,7 +4,7 @@ tl;dr: This turns your Steam Deck into a Steam Controller 2 (yes, touchpads, gyr
 
 Pro Tip: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
 
-AI use disclosure is located in [DEVELOPMENT_METHODOLOGY.md](DEVELOPMENT_METHODOLOGY.md) .
+AI use disclosure is located in [AI_DISCLOSURE.md](AI_DISCLOSURE.md) .
 
 If you are here to game, you can feel free to disregard the following paragraphs.
 

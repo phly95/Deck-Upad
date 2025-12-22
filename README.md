@@ -6,6 +6,8 @@ Pro Tip: If you want to use host mode while maintaining internet, plug your phon
 
 If you are here to game, you can feel free to disregard the following paragraphs.
 
+## Description
+
 A high-performance, low latency system to transmit controller input and video output over a wireless network. It enables the first practical Linux-compatible implementation of native resolution dual-screen emulation over standard Wi-Fi. The implementation uses the Steam Deck as a controller with a screen for a remote PC, similar to the Wii U gamepad.
 
 While this project is applied to a gaming use-case, the underlying architecture implements a novel containerized network isolation pattern to solve for deterministic latency in real-time wireless systems.

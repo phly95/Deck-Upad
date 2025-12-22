@@ -4,6 +4,8 @@ tl;dr: This turns your Steam Deck into a Steam Deck into a Steam Controller 2 (y
 
 Pro Tip: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
 
+AI use disclosure is located in DEVELOPMENT_METHODOLOGY.md .
+
 If you are here to game, you can feel free to disregard the following paragraphs.
 
 ## Description

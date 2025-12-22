@@ -1,6 +1,6 @@
 # Deck-Upad
 
-tl;dr: This turns your Steam Deck into a Steam Deck into a Steam Controller 2 (yes, touchpads, gyro and haptics work) you can also use as a Wii U gamepad with a screen. It has wired-like latency, making intense games like Celeste playable. To make necessary WiFi tweaks without the system intervening, it uses containers to perform these changes temporarily, to hide WiFi from the Operating System, and make it possible on read-only OSs like SteamOS. Think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot.
+tl;dr: This turns your Steam Deck into a Steam Controller 2 (yes, touchpads, gyro and haptics work) you can also use as a Wii U gamepad with a screen. It has wired-like latency, making intense games like Celeste playable. To make necessary WiFi tweaks without the system intervening, it uses containers to perform these changes temporarily, to hide WiFi from the Operating System, and make it possible on read-only OSs like SteamOS. Think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot.
 
 Pro Tip: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
 

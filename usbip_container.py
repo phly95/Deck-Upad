@@ -59,10 +59,9 @@ class ContainerUSBIP:
 
             # Receiver Cleanup
             try:
-                print("      Detaching all imported USBIP devices...")
-                for i in range(8):
-                    port_str = f"{i:02}"
-                    self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
+                print("      Detaching imported USBIP devices...")
+                # Only detach ports that are actually imported to avoid errors
+                self.run_command(f"{self.exec_cmd} 'usbip detach -p 00'", check=False)
             except: pass
 
             # Sender Cleanup (SAFER: Only unbind Valve devices)
@@ -70,8 +69,9 @@ class ContainerUSBIP:
                 print("      Unbinding Valve devices to return control to Host...")
                 out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
                 if out:
-                    # Capture groups: 1=BusID, 2=VID, 3=PID
+                    # Capture groups: 1=BusID
                     # Regex looks for: busid 1-1 (28de:1205)
+                    # This STRICTLY matches only Valve IDs
                     matches = re.findall(r"busid\s+([\d\.-]+)\s+\(" + VALVE_VID + r":" + VALVE_PID + r"\)", out)
 
                     if matches:

@@ -4,7 +4,7 @@ The goal of this project is to enable turning your Steam Deck into a Steam Contr
 
 To make low latency gameplay possible, the project leverages USB/IP as well as removing smart features normally performed by Network Manager, without making permanent changes to the system. To make the necessary WiFi and controller tweaks without the system intervening, it uses containers to perform these changes temporarily. This enables using USB/IP and iw (an alternative lightweight WiFi network manager) on read-only OSs like SteamOS. In over-simplified terms, think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot. Think of usbip_container as a preconfigued script to redirect inputs from the Steam Deck's built-in controller to another PC over that WiFi connection. USB/IP relies on a wired-like network connection due to its use of the TCP protocol and the time-sensitivity of the application, and that is why it relies on the tweaks made by WiFi container to introduce that stability.
 
-Pro Tip: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
+**Pro Tip**: If you want to use host mode while maintaining internet, plug your phone into your computer and enable USB tethering.
 
 AI use disclosure is located in [AI_DISCLOSURE.md](AI_DISCLOSURE.md) .
 

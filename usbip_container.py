@@ -12,7 +12,7 @@ import argparse
 CONTAINER_NAME = "usbip-sidecar"
 BUILDER_NAME = "usbip-builder"
 BASE_IMAGE = "fedora:41"
-CUSTOM_IMAGE = "usbip-ready-v2" # Version bump to force rebuild with Avahi
+CUSTOM_IMAGE = "usbip-ready-v2"
 KEEPALIVE_SCRIPT = "/usr/local/bin/usbip-keepalive.sh"
 
 # Steam Deck Controller Hardware ID
@@ -55,7 +55,7 @@ class ContainerUSBIP:
             print("\nStopping containers...")
             self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
             self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
-            self.run_command(f"{self.exec_cmd} 'pkill avahi-publish'", check=False) # Stop advertising
+            self.run_command(f"{self.exec_cmd} 'pkill avahi-publish'", check=False)
 
             # Receiver Cleanup
             try:
@@ -65,17 +65,24 @@ class ContainerUSBIP:
                     self.run_command(f"{self.exec_cmd} 'usbip detach -p {port_str}'", check=False)
             except: pass
 
-            # Sender Cleanup
+            # Sender Cleanup (SAFER: Only unbind Valve devices)
             try:
-                print("      Unbinding devices to return control to Host...")
+                print("      Unbinding Valve devices to return control to Host...")
                 out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
                 if out:
-                    bound_devices = re.findall(r"busid\s+([\d\.-]+)", out)
-                    for bus_id in bound_devices:
-                        print(f"      Releasing Bus {bus_id}...")
-                        self.run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
-                        self.run_command(f"{self.exec_cmd} 'udevadm trigger'", check=False)
-            except: pass
+                    # Capture groups: 1=BusID, 2=VID, 3=PID
+                    # Regex looks for: busid 1-1 (28de:1205)
+                    matches = re.findall(r"busid\s+([\d\.-]+)\s+\(" + VALVE_VID + r":" + VALVE_PID + r"\)", out)
+
+                    if matches:
+                        for bus_id in matches:
+                            print(f"      Releasing Steam Deck Controller (Bus {bus_id})...")
+                            self.run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
+                            self.run_command(f"{self.exec_cmd} 'udevadm trigger'", check=False)
+                    else:
+                        print("      No bound Steam Deck controllers found to release.")
+            except Exception as e:
+                print(f"      Cleanup warning: {e}")
 
             self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
             self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
@@ -93,7 +100,6 @@ class ContainerUSBIP:
         self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
         self.run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
-        # Added avahi-tools for discovery
         install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils avahi-tools --exclude=kernel-debug*"
 
         try:
@@ -113,8 +119,6 @@ class ContainerUSBIP:
         print("[3/5] Starting Runtime Container...")
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # WE MOUNT DBUS/AVAHI SOCKET SO CONTAINER CAN TALK TO HOST DISCOVERY
-        # This makes the container appear as the Host on the network.
         self.run_command(
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
@@ -129,33 +133,24 @@ class ContainerUSBIP:
 
     # --- DISCOVERY UTILS ---
     def start_advertising(self, bus_id):
-        """Announce this Steam Deck to the network."""
         print(f"      [Discovery] Announcing 'SteamDeck-USBIP-{bus_id}'...")
-        # We run avahi-publish in background. It uses the Host's daemon via the socket mount.
         cmd = f"avahi-publish -s 'SteamDeck-USBIP' -p _usbip._tcp 3240 --txt='busid={bus_id}'"
         self.run_command(f"{self.exec_cmd} 'nohup {cmd} > /dev/null 2>&1 &'")
 
     def scan_for_senders(self):
-        """Scan network for announced Steam Decks."""
-        print("      [Discovery] Scanning for Steam Decks (3s)...")
+        print("      [Discovery] Scanning network...")
         found_ips = set()
-
-        # Run avahi-browse inside container to leverage installed tools
-        # -r: resolve IPs, -p: parsable output, -t: terminate after dump
         try:
+            # -r: resolve, -p: parsable, -t: terminate (dump cache)
             out = self.run_command(f"{self.exec_cmd} 'avahi-browse -r -p -t _usbip._tcp'", check=False)
             if out:
-                # Output format: =;eth0;IPv4;SteamDeck-USBIP;_usbip._tcp;local;hostname.local;192.168.1.50;3240;
                 for line in out.splitlines():
                     parts = line.split(';')
                     if len(parts) > 7 and parts[0] == '=':
                         ip = parts[7]
-                        # Verify it's an IPv4 address
                         if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                             found_ips.add(ip)
-        except Exception as e:
-            print(f"Discovery error: {e}")
-
+        except: pass
         return list(found_ips)
 
     def find_deck_controller_on_host(self):
@@ -201,8 +196,6 @@ class ContainerUSBIP:
 
             print(f"      Binding {target_bus}...")
             self.run_command(f"{self.exec_cmd} 'usbip bind -b {target_bus}'")
-
-            # START DISCOVERY ADVERTISEMENT
             self.start_advertising(target_bus)
 
         print("\n" + "="*40)
@@ -226,14 +219,23 @@ class ContainerUSBIP:
                 ips = cli_ips
                 print(f"Using provided IPs: {ips}")
             else:
-                # AUTO-DISCOVERY LOGIC
-                ips = self.scan_for_senders()
-                if not ips:
-                    print("      [!] No Steam Decks found via Discovery.")
+                # --- FIXED DISCOVERY LOOP ---
+                while True:
+                    ips = self.scan_for_senders()
+
+                    if ips:
+                        print(f"      [Discovery] Found Steam Decks: {ips}")
+                        break
+
+                    print("      [!] No Steam Decks found.")
                     ip_input = input("      Enter IP manually (or ENTER to retry): ").strip()
-                    if ip_input: ips = [x.strip() for x in ip_input.split(',')]
-                else:
-                    print(f"      [Discovery] Found Steam Decks: {ips}")
+
+                    if ip_input:
+                        ips = [x.strip() for x in ip_input.split(',')]
+                        break
+
+                    print("      Retrying scan...")
+                    time.sleep(1) # Brief pause before rescanning
 
             if not ips:
                 print("No IPs configured. Exiting.")
@@ -247,10 +249,8 @@ class ContainerUSBIP:
                 try:
                     output = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
                     print(output)
-                    # Auto-parse the output for the Valve Controller if possible
                     found_bus = None
                     if "28de:1205" in output:
-                         # Regex to find the busid preceding the Valve ID
                          match = re.search(r"([\d\.-]+):.*28de:1205", output)
                          if match: found_bus = match.group(1)
 

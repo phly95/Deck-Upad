@@ -7,13 +7,17 @@ import shlex
 import traceback
 import re
 import argparse
+import threading
+import tempfile
 
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
 BUILDER_NAME = "usbip-builder"
 BASE_IMAGE = "fedora:41"
-CUSTOM_IMAGE = "usbip-ready-v8" # Version 8: True Container-Side Daemon
+# We stick to v9 base to avoid rebuilding, but we will patch it at runtime
+CUSTOM_IMAGE = "usbip-ready-v9"
 INTERNAL_DAEMON_PATH = "/usr/local/bin/usbip_automator.py"
+INTERNAL_LOG_PATH = "/var/log/usbip_automator.log"
 
 # Steam Deck Controller Hardware ID
 VALVE_VID = "28de"
@@ -22,6 +26,8 @@ VALVE_PID = "1205"
 class ContainerUSBIP:
     def __init__(self):
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/bash -c"
+        self.log_thread = None
+        self.stop_logging = False
 
     def run_command(self, cmd, shell=False, check=True, input=None):
         if not shell and isinstance(cmd, str):
@@ -35,6 +41,7 @@ class ContainerUSBIP:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
+                # Suppress non-critical errors
                 if "usbip list" not in str(cmd):
                     pass
                 raise e
@@ -51,7 +58,9 @@ class ContainerUSBIP:
 
     def stop_container(self):
             print("\nStopping containers...")
-            # Kill the internal python daemon
+            self.stop_logging = True
+
+            # Kill processes
             self.run_command(f"{self.exec_cmd} 'pkill -f usbip_automator.py'", check=False)
             self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
@@ -76,22 +85,32 @@ class ContainerUSBIP:
 
             self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
             self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
-            self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+            # We do NOT remove the image to save time
             print("Cleaned up.")
+
+    def ensure_runtime_dependencies(self):
+        """Patches the container if it was built without necessary tools."""
+        print("      [Init] Verifying container dependencies...")
+        # Check for python3 and timeout (coreutils)
+        check = self.run_command(f"{self.exec_cmd} 'which python3 timeout'", check=False)
+        if not check:
+            print("      [Fix] Installing missing tools (python3/coreutils)...")
+            # Install without rebuilding image
+            self.run_command(f"{self.exec_cmd} 'dnf install -y python3 coreutils procps-ng'", check=False)
 
     def ensure_image_exists(self):
         print("[1/5] Checking for USBIP tools image...")
         has_image = self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False)
         if has_image:
-            print("      Image found. Skipping build.")
+            print(f"      Image '{CUSTOM_IMAGE}' found. Skipping build.")
             return
 
         print("      Image not found. Building...")
         self.run_command(f"podman rm -f {BUILDER_NAME}", check=False)
         self.run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
-        # Added python3 explicitly for the internal daemon
-        install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils python3 --exclude=kernel-debug*"
+        # Install base tools
+        install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
 
         try:
             self.run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
@@ -118,13 +137,13 @@ class ContainerUSBIP:
             "-v /sys:/sys "
             f"{CUSTOM_IMAGE} sleep infinity"
         )
+        # Verify dependencies exist now that it's running
+        self.ensure_runtime_dependencies()
 
-    # --- THE INTERNAL DAEMON INJECTOR ---
+    # --- ROBUST DAEMON INJECTION ---
     def install_daemon_script(self):
-        """Writes the Python logic INTO the container so it runs independently."""
+        """Writes the Python logic to a host temp file, then copies it in."""
 
-        # This is the Python script that will run INSIDE the container
-        # It handles scanning, attaching, and monitoring entirely locally.
         daemon_code = r"""
 import subprocess
 import time
@@ -137,6 +156,9 @@ SCAN_SUBNET_PREFIX = "192.168.50."
 USBIP_PORT = 3240
 SCAN_INTERVAL = 5
 
+def log(msg):
+    print(msg, flush=True)
+
 def run_cmd(cmd):
     try:
         return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
@@ -144,7 +166,7 @@ def run_cmd(cmd):
 
 def check_ip(ip):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.2)
+    sock.settimeout(0.5)
     try:
         if sock.connect_ex((ip, USBIP_PORT)) == 0:
             sock.close()
@@ -153,49 +175,77 @@ def check_ip(ip):
     return None
 
 def main_loop():
-    print("[Daemon] Starting internal scanner...")
+    log("[Daemon] Starting internal scanner on 192.168.50.x...")
     run_cmd("modprobe vhci-hcd")
     ips = [f"{SCAN_SUBNET_PREFIX}{i}" for i in range(1, 255)]
 
     while True:
-        # 1. SCAN
-        found_hosts = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            for ip in ex.map(check_ip, ips):
-                if ip: found_hosts.append(ip)
+        try:
+            # 1. SCAN
+            log(f"[Daemon] Scanning subnet...")
+            found_hosts = []
+            with ThreadPoolExecutor(max_workers=15) as ex:
+                for ip in ex.map(check_ip, ips):
+                    if ip: found_hosts.append(ip)
 
-        # 2. DISCOVERY & ATTACH
-        for host in found_hosts:
-            try:
-                # Check what devices this host has
-                # We use a timeout command to prevent hanging
-                out = run_cmd(f"timeout 3 usbip list -r {host}")
+            if found_hosts:
+                log(f"[Daemon] Found hosts: {found_hosts}")
 
-                if "28de:1205" in out:
-                    match = re.search(r"([\d\.-]+):.*28de:1205", out)
-                    if match:
-                        bus = match.group(1)
+            # 2. DISCOVERY & ATTACH
+            for host in found_hosts:
+                try:
+                    # Timeout protects against hanging connections
+                    out = run_cmd(f"timeout 5 usbip list -r {host}")
 
-                        # Check if already attached
-                        ports = run_cmd("usbip port")
-                        # If the remote IP isn't in the port list, attach it
-                        if host not in ports:
-                            print(f"[Daemon] Found Deck at {host}:{bus}. Attaching...")
-                            time.sleep(1) # Safety delay
-                            run_cmd(f"usbip attach -r {host} -b {bus}")
-            except Exception as e:
-                print(f"[Error] {e}")
+                    if "28de:1205" in out:
+                        match = re.search(r"([\d\.-]+):.*28de:1205", out)
+                        if match:
+                            bus = match.group(1)
+                            ports = run_cmd("usbip port")
+
+                            if host not in ports:
+                                log(f"[Daemon] Found Deck at {host}:{bus}. Attaching...")
+                                time.sleep(2)
+                                res = run_cmd(f"usbip attach -r {host} -b {bus}")
+                                log(f"[Daemon] Attach Result: {res}")
+                            else:
+                                pass # Already attached
+                except Exception as inner_e:
+                    log(f"[Error] Host check failed: {inner_e}")
+
+        except Exception as e:
+            log(f"[Fatal Daemon Error] {e}")
 
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
-    # Flush output immediately so logs appear
-    sys.stdout.reconfigure(line_buffering=True)
     main_loop()
 """
-        # Write file to container
-        self.run_command(f"{self.exec_cmd} 'cat > {INTERNAL_DAEMON_PATH}'", input=daemon_code)
-        self.run_command(f"{self.exec_cmd} 'chmod +x {INTERNAL_DAEMON_PATH}'")
+        # SAFE WRITE: Create temp file on host, copy to container
+        # This avoids bash quoting hell.
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
+            tmp.write(daemon_code)
+            tmp_path = tmp.name
+
+        try:
+            self.run_command(f"podman cp {tmp_path} {CONTAINER_NAME}:{INTERNAL_DAEMON_PATH}")
+            self.run_command(f"{self.exec_cmd} 'chmod +x {INTERNAL_DAEMON_PATH}'")
+        finally:
+            os.unlink(tmp_path)
+
+    def stream_logs(self):
+        """Tails the internal log file."""
+        process = subprocess.Popen(
+            shlex.split(f"podman exec {CONTAINER_NAME} tail -f {INTERNAL_LOG_PATH}"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+        while not self.stop_logging:
+            line = process.stdout.readline()
+            if not line: break
+            print(f"   {line.strip()}")
+
+        process.terminate()
 
     def find_deck_controller_on_host(self):
         base_path = "/sys/bus/usb/devices"
@@ -258,26 +308,50 @@ if __name__ == "__main__":
         if resume:
             print(">> Resuming existing Receiver session.")
         else:
-            # Install the brain
+            # Install the brain (robustly)
             self.install_daemon_script()
 
-            # Start the brain in background (nohup)
+            # Reset logs
+            self.run_command(f"{self.exec_cmd} 'truncate -s 0 {INTERNAL_LOG_PATH}'")
+
+            # Start the brain
             print("      [Launcher] Starting internal Automator Daemon...")
-            self.run_command(f"{self.exec_cmd} 'nohup python3 {INTERNAL_DAEMON_PATH} > /var/log/usbip_automator.log 2>&1 &'")
+            self.run_command(f"{self.exec_cmd} 'nohup python3 -u {INTERNAL_DAEMON_PATH} > {INTERNAL_LOG_PATH} 2>&1 &'")
+
+            # Quick check if it crashed immediately
             time.sleep(1)
+            check = self.run_command(f"{self.exec_cmd} 'pgrep -f usbip_automator.py'", check=False)
+            if not check:
+                print("\n[CRITICAL ERROR] The internal daemon crashed immediately.")
+                print("--- Crash Log ---")
+                print(self.run_command(f"{self.exec_cmd} 'cat {INTERNAL_LOG_PATH}'"))
+                print("-----------------")
+                return
 
         print("\n" + "="*40)
-        print(" RECEIVER ACTIVE (Container-Managed)")
-        print(" * Daemon running inside container PID space")
-        print(" * Scans 192.168.50.x every 5 seconds")
-        print("-" * 40)
-        print(" 1. Press ENTER to Stop.")
-        print(" 2. Type 'bg' to detach (Daemon keeps running).")
+        print(" RECEIVER ACTIVE - LIVE LOGS (Ctrl+C or 'bg' to detach)")
         print("="*40)
 
-        if auto_bg: sys.exit(0)
-        if input().strip().lower() == 'bg': sys.exit(0)
-        else: self.stop_container()
+        self.stop_logging = False
+        t = threading.Thread(target=self.stream_logs, daemon=True)
+        t.start()
+
+        if auto_bg:
+            self.stop_logging = True
+            sys.exit(0)
+
+        try:
+            while True:
+                user_in = input().strip().lower()
+                if user_in == 'bg':
+                    print("[Backgrounding] Logs hidden. Daemon continues running.")
+                    self.stop_logging = True
+                    sys.exit(0)
+                elif user_in == 'stop':
+                    self.stop_container()
+                    break
+        except KeyboardInterrupt:
+            self.stop_container()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -294,7 +368,6 @@ def main():
         if active_mode == 'sender': tool.setup_sender(resume=True, auto_bg=args.bg)
         elif active_mode == 'receiver': tool.setup_receiver(resume=True, auto_bg=args.bg)
         else:
-            # If unknown state, just assume receiver to allow attaching logs
             tool.setup_receiver(resume=True, auto_bg=args.bg)
         return
 

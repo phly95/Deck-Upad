@@ -8,14 +8,13 @@ import traceback
 import re
 import argparse
 import socket
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
 BUILDER_NAME = "usbip-builder"
 BASE_IMAGE = "fedora:41"
-CUSTOM_IMAGE = "usbip-ready-v5" # Version 5: Manual Selection Restored
+CUSTOM_IMAGE = "usbip-ready-v6" # Version 6: Auto-Delay Fix
 KEEPALIVE_SCRIPT = "/usr/local/bin/usbip-keepalive.sh"
 
 # Target Subnet to Scan
@@ -42,7 +41,6 @@ class ContainerUSBIP:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
-                # Suppress verbose errors unless critical
                 if "usbip list" not in str(cmd):
                     print(f"Command failed: {cmd}")
                     print(f"Stderr: {e.stderr}")
@@ -69,7 +67,7 @@ class ContainerUSBIP:
                 self.run_command(f"{self.exec_cmd} 'usbip detach -p 00'", check=False)
             except: pass
 
-            # Sender Cleanup (Only unbind Valve devices)
+            # Sender Cleanup
             try:
                 print("      Unbinding Valve devices...")
                 out = self.run_command(f"{self.exec_cmd} 'usbip list -l'", check=False)
@@ -126,33 +124,25 @@ class ContainerUSBIP:
             f"{CUSTOM_IMAGE} sleep infinity"
         )
 
-    # --- THE MAGIC SCANNER (192.168.50.x) ---
+    # --- SCANNER ---
     def check_ip(self, ip):
-        """Checks if a single IP has port 3240 open."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.2) # Fast timeout
+        sock.settimeout(0.2)
         try:
             result = sock.connect_ex((ip, USBIP_PORT))
             sock.close()
-            if result == 0:
-                return ip
+            if result == 0: return ip
         except: pass
         return None
 
     def scan_subnet(self):
-        """Scans 192.168.50.1-254 for USBIP hosts."""
         print(f"      [Scanner] Sweeping {SCAN_SUBNET_PREFIX}x for Steam Decks...")
         found_hosts = []
-
         ips_to_scan = [f"{SCAN_SUBNET_PREFIX}{i}" for i in range(1, 255)]
-
         with ThreadPoolExecutor(max_workers=50) as executor:
             results = executor.map(self.check_ip, ips_to_scan)
-
         for ip in results:
-            if ip:
-                found_hosts.append(ip)
-
+            if ip: found_hosts.append(ip)
         return found_hosts
 
     def find_deck_controller_on_host(self):
@@ -223,47 +213,26 @@ class ContainerUSBIP:
                 print(f"Using provided IPs: {ips}")
             else:
                 while True:
-                    # 1. SCAN SUBNET (192.168.50.x)
                     found_hosts = self.scan_subnet()
 
                     if found_hosts:
                         print(f"      [Scanner] Found Hosts: {found_hosts}")
-
-                        # MANUAL SELECTION LOGIC RESTORED
                         for host in found_hosts:
-                            print(f"\n[Interrogating {host}]...")
+                            print(f"      Querying {host}...")
                             try:
-                                # Show RAW output to user
                                 raw_out = self.run_command(f"{self.exec_cmd} 'usbip list -r {host}'")
-                                print("--- Raw USBIP List Output ---")
-                                print(raw_out)
-                                print("-----------------------------")
 
-                                # Auto-detect suggestion
-                                suggestion = None
+                                # Auto-detect Valve ID
                                 if raw_out and "28de:1205" in raw_out:
                                     match = re.search(r"([\d\.-]+):.*28de:1205", raw_out)
-                                    if match: suggestion = match.group(1)
-
-                                # Ask User
-                                if suggestion:
-                                    print(f"      Auto-detected Valve Controller at Bus: {suggestion}")
-                                    user_in = input(f"      Press ENTER to use {suggestion}, or type manual Bus ID: ").strip()
-                                    final_bus = user_in if user_in else suggestion
-                                else:
-                                    final_bus = input(f"      No Valve device auto-detected. Enter Bus ID manually (or ENTER to skip): ").strip()
-
-                                if final_bus:
-                                    targets.append(f"{host}:{final_bus}")
-                                    # TEST ATTACH IMMEDIATELY
-                                    print(f"      [TEST] Attempting attach to {host} bus {final_bus}...")
-                                    res = self.run_command(f"{self.exec_cmd} 'usbip attach -r {host} -b {final_bus}'", check=False)
-                                    print(f"      [TEST RESULT] {res}")
-
-                            except Exception as e:
-                                print(f"Error querying {host}: {e}")
+                                    if match:
+                                        found_bus = match.group(1)
+                                        print(f"      -> Auto-detected Valve Controller at {host} Bus {found_bus}")
+                                        targets.append(f"{host}:{found_bus}")
+                            except: pass
 
                         if targets: break
+                        print("      [Scanner] Hosts found, but no Valve Controllers exported.")
                     else:
                         print("      [Scanner] No USBIP hosts found on 192.168.50.x")
 
@@ -272,23 +241,37 @@ class ContainerUSBIP:
                         ips = [x.strip() for x in ip_input.split(',')]
                         break
 
-            # Setup connections
             self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
 
-            # Handle manual IPs if scan failed but user provided IP
             if ips and not targets:
                  for sender_ip in ips:
                     try:
-                        print(f"Checking {sender_ip}...")
                         raw_out = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
-                        print(raw_out)
-                        bus = input("Enter Bus ID: ").strip()
-                        if bus: targets.append(f"{sender_ip}:{bus}")
+                        if "28de:1205" in raw_out:
+                             match = re.search(r"([\d\.-]+):.*28de:1205", raw_out)
+                             if match: targets.append(f"{sender_ip}:{match.group(1)}")
                     except: pass
 
             if not targets:
                 print("No targets configured. Exiting.")
                 return
+
+            # --- THE FIX: SAFETY DELAY ---
+            print(f"      [Safety Delay] Waiting 2 seconds for sockets to clear...")
+            time.sleep(2)
+
+            # Initial Attach Test
+            for t in targets:
+                ip, bus = t.split(':')
+                print(f"      [TEST] Attaching to {ip} bus {bus}...")
+                self.run_command(f"{self.exec_cmd} 'usbip attach -r {ip} -b {bus}'", check=False)
+
+            # Verify Success
+            port_check = self.run_command(f"{self.exec_cmd} 'usbip port'")
+            if "28de:1205" in str(port_check):
+                print("      [SUCCESS] Controller is attached and active!")
+            else:
+                print("      [WARNING] Attach command finished, but device not seen in port list yet.")
 
             target_str = " ".join(targets)
             keepalive_code = f"""#!/bin/bash
@@ -297,7 +280,6 @@ class ContainerUSBIP:
                 for PAIR in $TARGETS; do
                     IP=${{PAIR%%:*}}
                     BUS=${{PAIR##*:}}
-                    # Check if attached (grep for IP to be safe)
                     if ! usbip port | grep -q "$IP"; then
                         echo "Re-attaching $IP $BUS..."
                         usbip attach -r $IP -b $BUS

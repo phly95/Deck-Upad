@@ -8,18 +8,17 @@ import traceback
 import re
 import argparse
 import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
 BUILDER_NAME = "usbip-builder"
 BASE_IMAGE = "fedora:41"
-CUSTOM_IMAGE = "usbip-ready-v6" # Version 6: Auto-Delay Fix
-KEEPALIVE_SCRIPT = "/usr/local/bin/usbip-keepalive.sh"
-
-# Target Subnet to Scan
+CUSTOM_IMAGE = "usbip-ready-v7" # Version 7: Background Daemon
 SCAN_SUBNET_PREFIX = "192.168.50."
 USBIP_PORT = 3240
+SCAN_INTERVAL = 5 # Seconds between scan cycles
 
 # Steam Deck Controller Hardware ID
 VALVE_VID = "28de"
@@ -28,22 +27,24 @@ VALVE_PID = "1205"
 class ContainerUSBIP:
     def __init__(self):
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/bash -c"
+        self.running = False # Flag for background thread
 
-    def run_command(self, cmd, shell=False, check=True, input=None):
+    def run_command(self, cmd, shell=False, check=True, input=None, timeout=None):
         if not shell and isinstance(cmd, str):
             cmd = shlex.split(cmd)
         try:
             result = subprocess.run(
                 cmd, shell=shell, check=check,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, input=input
+                text=True, input=input, timeout=timeout
             )
             return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return None
         except subprocess.CalledProcessError as e:
             if check:
                 if "usbip list" not in str(cmd):
-                    print(f"Command failed: {cmd}")
-                    print(f"Stderr: {e.stderr}")
+                    pass # Suppress noise
                 raise e
             return None
 
@@ -58,7 +59,7 @@ class ContainerUSBIP:
 
     def stop_container(self):
             print("\nStopping containers...")
-            self.run_command(f"{self.exec_cmd} 'pkill -f usbip-keepalive.sh'", check=False)
+            self.running = False # Stop daemon thread
             self.run_command(f"{self.exec_cmd} 'pkill usbipd'", check=False)
 
             # Receiver Cleanup
@@ -124,10 +125,11 @@ class ContainerUSBIP:
             f"{CUSTOM_IMAGE} sleep infinity"
         )
 
-    # --- SCANNER ---
+    # --- DAEMON LOGIC ---
     def check_ip(self, ip):
+        """Checks if a single IP has port 3240 open (Low Impact)."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.2)
+        sock.settimeout(0.2) # Very short timeout
         try:
             result = sock.connect_ex((ip, USBIP_PORT))
             sock.close()
@@ -135,15 +137,64 @@ class ContainerUSBIP:
         except: pass
         return None
 
-    def scan_subnet(self):
-        print(f"      [Scanner] Sweeping {SCAN_SUBNET_PREFIX}x for Steam Decks...")
-        found_hosts = []
+    def receiver_daemon(self):
+        """Background thread that handles scanning and attaching."""
+        print(f"      [Daemon] Background Scanner Started (Interval: {SCAN_INTERVAL}s)")
+        print(f"      [Daemon] Target Subnet: {SCAN_SUBNET_PREFIX}x")
+
+        # Load kernel module once
+        self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
+
+        # Generate IP list once
         ips_to_scan = [f"{SCAN_SUBNET_PREFIX}{i}" for i in range(1, 255)]
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            results = executor.map(self.check_ip, ips_to_scan)
-        for ip in results:
-            if ip: found_hosts.append(ip)
-        return found_hosts
+        known_targets = set() # Track devices we've already attached to
+
+        while self.running:
+            try:
+                # 1. SCAN PHASE (Threaded for speed, but limited workers for gentleness)
+                # Using 10 workers ensures we don't spike the network stack
+                found_hosts = []
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    results = executor.map(self.check_ip, ips_to_scan)
+                for ip in results:
+                    if ip: found_hosts.append(ip)
+
+                # 2. DISCOVERY PHASE
+                for host in found_hosts:
+                    # Skip if we think we are already connected (Keepalive phase checks validity)
+                    # Actually, check anyway in case user rebooted Deck
+
+                    try:
+                        # Query the host with a 2s timeout
+                        raw_out = self.run_command(f"{self.exec_cmd} 'usbip list -r {host}'", check=False, timeout=3)
+
+                        if raw_out and "28de:1205" in raw_out:
+                            match = re.search(r"([\d\.-]+):.*28de:1205", raw_out)
+                            if match:
+                                bus = match.group(1)
+                                target_id = f"{host}:{bus}"
+
+                                # Check if already attached locally
+                                port_info = self.run_command(f"{self.exec_cmd} 'usbip port'", check=False)
+
+                                # If not currently attached, Attach it
+                                if host not in str(port_info):
+                                    print(f"\n      [Auto-Connect] Found Valve Device at {host} Bus {bus}")
+                                    print("      [Safety Delay] Waiting 2s...")
+                                    time.sleep(2)
+                                    self.run_command(f"{self.exec_cmd} 'usbip attach -r {host} -b {bus}'", check=False)
+                                    known_targets.add(target_id)
+                    except: pass
+
+                # 3. KEEPALIVE PHASE
+                # Check all known targets. If dropped, they will be caught by Discovery phase next loop.
+                # Just sleep now.
+
+            except Exception as e:
+                print(f"      [Daemon Error] {e}")
+
+            # 4. SLEEP PHASE
+            time.sleep(SCAN_INTERVAL)
 
     def find_deck_controller_on_host(self):
         base_path = "/sys/bus/usb/devices"
@@ -161,7 +212,7 @@ class ContainerUSBIP:
     def get_active_mode(self):
         ps_out = self.run_command(f"{self.exec_cmd} 'ps aux'", check=False)
         if "usbipd" in ps_out: return "sender"
-        if "usbip-keepalive.sh" in ps_out: return "receiver"
+        # We don't check for keepalive script anymore, just container existence
         return None
 
     # --- SENDER LOGIC ---
@@ -200,101 +251,26 @@ class ContainerUSBIP:
         else: self.stop_container()
 
     # --- RECEIVER LOGIC ---
-    def setup_receiver(self, resume=False, cli_ips=None, auto_bg=False):
+    def setup_receiver(self, resume=False, auto_bg=False):
         print("\n--- RECEIVER MODE (Bazzite PC) ---")
         if resume:
             print(">> Resuming existing Receiver session.")
-        else:
-            ips = []
-            targets = []
 
-            if cli_ips:
-                ips = cli_ips
-                print(f"Using provided IPs: {ips}")
-            else:
-                while True:
-                    found_hosts = self.scan_subnet()
+        # Start the background daemon
+        self.running = True
+        t = threading.Thread(target=self.receiver_daemon, daemon=True)
+        t.start()
 
-                    if found_hosts:
-                        print(f"      [Scanner] Found Hosts: {found_hosts}")
-                        for host in found_hosts:
-                            print(f"      Querying {host}...")
-                            try:
-                                raw_out = self.run_command(f"{self.exec_cmd} 'usbip list -r {host}'")
-
-                                # Auto-detect Valve ID
-                                if raw_out and "28de:1205" in raw_out:
-                                    match = re.search(r"([\d\.-]+):.*28de:1205", raw_out)
-                                    if match:
-                                        found_bus = match.group(1)
-                                        print(f"      -> Auto-detected Valve Controller at {host} Bus {found_bus}")
-                                        targets.append(f"{host}:{found_bus}")
-                            except: pass
-
-                        if targets: break
-                        print("      [Scanner] Hosts found, but no Valve Controllers exported.")
-                    else:
-                        print("      [Scanner] No USBIP hosts found on 192.168.50.x")
-
-                    ip_input = input("      Enter IP manually (or ENTER to rescan): ").strip()
-                    if ip_input:
-                        ips = [x.strip() for x in ip_input.split(',')]
-                        break
-
-            self.run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'")
-
-            if ips and not targets:
-                 for sender_ip in ips:
-                    try:
-                        raw_out = self.run_command(f"{self.exec_cmd} 'usbip list -r {sender_ip}'")
-                        if "28de:1205" in raw_out:
-                             match = re.search(r"([\d\.-]+):.*28de:1205", raw_out)
-                             if match: targets.append(f"{sender_ip}:{match.group(1)}")
-                    except: pass
-
-            if not targets:
-                print("No targets configured. Exiting.")
-                return
-
-            # --- THE FIX: SAFETY DELAY ---
-            print(f"      [Safety Delay] Waiting 2 seconds for sockets to clear...")
-            time.sleep(2)
-
-            # Initial Attach Test
-            for t in targets:
-                ip, bus = t.split(':')
-                print(f"      [TEST] Attaching to {ip} bus {bus}...")
-                self.run_command(f"{self.exec_cmd} 'usbip attach -r {ip} -b {bus}'", check=False)
-
-            # Verify Success
-            port_check = self.run_command(f"{self.exec_cmd} 'usbip port'")
-            if "28de:1205" in str(port_check):
-                print("      [SUCCESS] Controller is attached and active!")
-            else:
-                print("      [WARNING] Attach command finished, but device not seen in port list yet.")
-
-            target_str = " ".join(targets)
-            keepalive_code = f"""#!/bin/bash
-            TARGETS="{target_str}"
-            while true; do
-                for PAIR in $TARGETS; do
-                    IP=${{PAIR%%:*}}
-                    BUS=${{PAIR##*:}}
-                    if ! usbip port | grep -q "$IP"; then
-                        echo "Re-attaching $IP $BUS..."
-                        usbip attach -r $IP -b $BUS
-                    fi
-                done
-                sleep 5
-            done
-            """
-            self.run_command(f"{self.exec_cmd} 'cat > {KEEPALIVE_SCRIPT}'", input=keepalive_code)
-            self.run_command(f"{self.exec_cmd} 'chmod +x {KEEPALIVE_SCRIPT}'")
-            self.run_command(f"{self.exec_cmd} 'nohup {KEEPALIVE_SCRIPT} > /dev/null 2>&1 &'")
+        # Wait a moment to let the first scan start
+        time.sleep(1)
 
         print("\n" + "="*40)
-        print(" RECEIVER ACTIVE")
-        print(" Type 'bg' to run in background.")
+        print(" RECEIVER RUNNING (Background Auto-Scan Active)")
+        print(" * Scans 192.168.50.x every 5 seconds")
+        print(" * Auto-attaches Valve Controllers")
+        print("-" * 40)
+        print(" 1. Press ENTER to Stop.")
+        print(" 2. Type 'bg' to run in background.")
         print("="*40)
 
         if auto_bg: sys.exit(0)
@@ -304,7 +280,7 @@ class ContainerUSBIP:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--mode", choices=["sender", "receiver", "1", "2"])
-    parser.add_argument("-i", "--ips")
+    parser.add_argument("-i", "--ips") # Kept for compat, but ignored in auto-mode
     parser.add_argument("--bg", action="store_true")
     args = parser.parse_args()
 
@@ -312,13 +288,13 @@ def main():
     tool.check_root()
 
     if tool.is_container_running():
-        active_mode = tool.get_active_mode()
-        if active_mode:
-            print(f"\n[!] Existing {active_mode.upper()} session detected.")
-            if active_mode == 'sender': tool.setup_sender(resume=True, auto_bg=args.bg)
-            elif active_mode == 'receiver': tool.setup_receiver(resume=True, auto_bg=args.bg)
-            return
-        else: tool.stop_container()
+        # Just assume receiver if running, or check process list
+        print(f"\n[!] Container is running.")
+        # If we want to be smart, we could check if usbipd is running inside to determine mode
+        mode = tool.get_active_mode()
+        if mode == 'sender': tool.setup_sender(resume=True, auto_bg=args.bg)
+        else: tool.setup_receiver(resume=True, auto_bg=args.bg)
+        return
 
     mode_selection = ""
     if args.mode: mode_selection = '1' if args.mode in ['sender', '1'] else '2'
@@ -332,7 +308,7 @@ def main():
         tool.ensure_image_exists()
         tool.start_runtime_container()
         if mode_selection == '1': tool.setup_sender(auto_bg=args.bg)
-        elif mode_selection == '2': tool.setup_receiver(cli_ips=[x.strip() for x in args.ips.split(',')] if args.ips else None, auto_bg=args.bg)
+        elif mode_selection == '2': tool.setup_receiver(auto_bg=args.bg)
     except KeyboardInterrupt: tool.stop_container()
     except Exception as e:
         print(f"\nError: {e}")

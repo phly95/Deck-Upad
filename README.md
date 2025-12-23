@@ -13,6 +13,8 @@ https://github.com/user-attachments/assets/9d859c82-4915-40b5-b0e8-9d2090256aee
 
 This is a Work In Progress (WIP), but all major functionality is now working. This has only been tested with Bazzite KDE. (on both sides) It's quite likely that this will not work in Gnome or any other desktop environment. You will need to set up a VKMS virtual display before using this. The name will be something like Virtual-1, and you should set it to something like 1280x800 to match the Steam Deck.
 
+The text beyond this point was written with AI assistance. It will be later refined to ensure accuracy and understandability for all audiences.
+
 ## Technical Overview
 The project uses **Podman** containers to manage complex, low-level Linux functionality on the Steam Deck, including dedicated network control and virtual hardware binding. **GStreamer** and **PipeWire** are used for low-latency video streaming, and **USB/IP** handles the controller passthrough.
 

@@ -44,7 +44,8 @@ class ContainerNetwork:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
-                # We do not print here to keep output clean, but re-raise
+                # We raise the error to be handled by the caller
+                # print(f"DEBUG STDERR: {e.stderr}") # Uncomment for deeper debugging
                 raise e
             return None
 
@@ -138,7 +139,6 @@ class ContainerNetwork:
         print("      Renaming wireless interface to 'wlan0'...")
         try:
             # FIX: Use 'iw dev' inside container to find the REAL wifi card.
-            # Only wifi cards show up in 'iw dev', whereas 'eth0' does not.
             iw_out = self.run_command(f"{self.exec_cmd} 'iw dev'", check=False)
             found_iface = None
             if iw_out:
@@ -155,7 +155,6 @@ class ContainerNetwork:
                     print("      Interface is already named wlan0.")
             else:
                 print("      [CRITICAL WARNING] No wireless interface found inside container!")
-                print("      (Did the physical move fail?)")
         except Exception as e:
             print(f"      Warning during rename: {e}")
 
@@ -200,10 +199,7 @@ rsn_pairwise=CCMP"""
 
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
 
-        # Ensure wlan0 is up
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
-
-        # Try starting hostapd. If it fails, we print stdout/stderr
         try:
             self.run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         except subprocess.CalledProcessError as e:
@@ -272,6 +268,12 @@ reflect-ipv=no
 """
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'mkdir -p /etc/avahi'")
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/avahi/avahi-daemon.conf'", shell=True, input=avahi_conf)
+
+        # --- FIXED: Init DBus machine-id and directory ---
+        self.run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
+        self.run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
+        # -------------------------------------------------
+
         self.run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
         self.run_command(f"{self.exec_cmd} 'avahi-daemon -D'")
 
@@ -303,7 +305,7 @@ def main():
             return
 
         print("\n" + "="*40)
-        print("  WIFI CONTAINER (SIMPLIFIED V3)")
+        print("  WIFI CONTAINER (FINAL FIXED)")
         print("="*40)
         print("1. Client Mode (Join WiFi + Fix Discovery)")
         print("2. AP Mode (Create WiFi + True Bridging)")

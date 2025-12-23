@@ -61,10 +61,8 @@ class ContainerNetwork:
         try:
             out = self.run_command(f"{self.exec_cmd} 'ip -4 addr show {iface}'", check=False)
             if out:
-                # Look for 'inet 192.168.x.x/xx'
                 match = re.search(r"inet\s+([0-9.]+)/", out)
-                if match:
-                    return match.group(1)
+                if match: return match.group(1)
         except: pass
         return "Unknown"
 
@@ -120,7 +118,7 @@ class ContainerNetwork:
     def move_wifi_card(self):
         print(f"[3/5] Moving {self.wifi_interface} to container...")
 
-        phy = "phy0" 
+        phy = "phy0"
         try:
             out = self.run_command(f"iw dev {self.wifi_interface} info", check=False)
             if out:
@@ -131,7 +129,7 @@ class ContainerNetwork:
 
         self.run_command(f"nmcli device disconnect {self.wifi_interface}", check=False)
         ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
-        
+
         try:
             self.run_command(f"iw phy {phy} set netns {ctr_pid}")
         except Exception as e:
@@ -150,7 +148,7 @@ class ContainerNetwork:
                     if "Interface" in line:
                         found_iface = line.split()[-1]
                         break
-            
+
             if found_iface:
                 if found_iface != "wlan0":
                     self.run_command(f"{self.exec_cmd} 'ip link set {found_iface} name wlan0'")
@@ -167,19 +165,27 @@ class ContainerNetwork:
     # --- Mode: AP (Host) - The "Transparent" Bridge Method ---
     def setup_ap_mode_bridged(self, ssid, password, ctr_pid):
         print(f"[4/5] Configuring Transparent Bridge (Host <-> AP)...")
-        
+
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
-        
+
+        # --- Container Side Configuration ---
         self.run_command(f"{self.exec_cmd} 'ip link add name br0 type bridge'")
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip link set br0 up'")
         self.run_command(f"{self.exec_cmd} 'brctl addif br0 {VETH_CTR}'")
+        # Allow all traffic across bridge (disable iptables filtering on bridge)
+        self.run_command(f"{self.exec_cmd} 'sysctl -w net.bridge.bridge-nf-call-iptables=0' 2>/dev/null || true")
+        self.run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'")
 
+        # --- Host Side Configuration ---
         self.run_command(f"ip link set {VETH_HOST} up")
+
+        # NOTE: Host takes 192.168.50.2, Container Gateway is 192.168.50.1
         self.run_command(f"{self.exec_cmd} 'ip addr add {AP_GATEWAY_IP}/24 dev br0'")
-        
-        nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 192.168.50.2/24 gw4 {AP_GATEWAY_IP}"
+
+        # FIX: Set connection.zone to 'trusted' to bypass Bazzite/Fedora firewall blocks
+        nm_cmd = f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 192.168.50.2/24 gw4 {AP_GATEWAY_IP} connection.zone trusted"
         self.run_command(nm_cmd)
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
@@ -196,10 +202,10 @@ wpa_passphrase={password}
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
-        
+
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
-        
+
         try:
             self.run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         except subprocess.CalledProcessError as e:
@@ -221,8 +227,9 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self.run_command(f"{self.exec_cmd} 'ip addr add {IP_CTR_NAT}/24 dev {VETH_CTR}'")
-        
-        self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST_NAT}/24 gw4 {IP_CTR_NAT}")
+
+        # Client mode also needs trusted zone to allow mDNS reflection in
+        self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {IP_HOST_NAT}/24 gw4 {IP_CTR_NAT} connection.zone trusted")
         self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
@@ -235,7 +242,7 @@ network={{
 }}
 """
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=wpa_conf)
-        
+
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
         self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0'")
@@ -262,8 +269,7 @@ reflect-ipv=no
 """
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'mkdir -p /etc/avahi'")
         self.run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/avahi/avahi-daemon.conf'", shell=True, input=avahi_conf)
-        
-        # Init DBus machine-id and directory
+
         self.run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
         self.run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
 
@@ -281,7 +287,7 @@ reflect-ipv=no
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
-        
+
         print("Restoring WiFi to Host...")
         try:
             iface = self.get_active_wifi_interface()
@@ -302,7 +308,7 @@ def main():
         print("="*40)
         print("1. Client Mode (Join WiFi + Fix Discovery)")
         print("2. AP Mode (Create WiFi + True Bridging)")
-        
+
         mode = input("Select Mode (1/2): ").strip()
 
         if mode == '1':
@@ -313,14 +319,13 @@ def main():
             try: ssid = nets[int(sel)-1]
             except: ssid = input("Enter SSID: ")
             password = input(f"Password for {ssid}: ")
-            
+
             vpn.initialize_container()
             ctr_pid = vpn.move_wifi_card()
             vpn.setup_client_mode_with_discovery(ssid, password, ctr_pid)
-            
-            # --- UPDATED: Fetch real IP ---
+
             wifi_ip = vpn.get_container_ip("wlan0")
-            
+
             print("\n" + "="*40)
             print("  CONNECTION SUCCESSFUL")
             print("="*40)
@@ -332,15 +337,17 @@ def main():
         elif mode == '2':
             ssid = input("Enter SSID for New AP: ")
             password = input("Enter Password: ")
-            
+
             vpn.initialize_container()
             ctr_pid = vpn.move_wifi_card()
             vpn.setup_ap_mode_bridged(ssid, password, ctr_pid)
-            
+
             print("\n" + "="*40)
             print(f"  AP '{ssid}' CREATED")
             print("="*40)
-            print(f"Host IP: {AP_GATEWAY_IP}")
+            print(f"Host IP: {AP_GATEWAY_IP} (Container GW)")
+            print(f"Your IP: 192.168.50.2 (Accessible from Client)")
+            print("="*40)
 
         else:
             print("Invalid mode.")
@@ -348,7 +355,7 @@ def main():
 
         print("Press [Enter] to Stop and Cleanup...")
         input()
-    
+
     except KeyboardInterrupt: pass
     except Exception as e:
         print(f"Error: {e}")

@@ -1,1 +1,0 @@
-This project utilizes an AI-Assisted workflow. While the architectural goals, testing, and system design were directed by the author, implementation details regarding kernel isolation and VETH bridging, as well as documentation of its functionality were generated using LLMs (Gemini 3 Pro) to achieve performance targets that bypass standard OS limitations.

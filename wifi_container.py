@@ -349,8 +349,9 @@ network={{
 
 def get_reproduce_command(mode, ssid, password, channel=165):
     """Generates the command string to reproduce this setup."""
-    cmd_path = os.path.abspath(sys.argv[0])
-    base = f"sudo {cmd_path} --mode {mode} --ssid '{ssid}' --password '{password}'"
+    script_path = os.path.abspath(sys.argv[0])
+    # Now includes sys.executable to ensure 'python3' is part of the command
+    base = f"sudo {sys.executable} {script_path} --mode {mode} --ssid '{ssid}' --password '{password}'"
     if mode == 'ap':
         base += f" --channel {channel}"
     return base
@@ -379,16 +380,16 @@ def main():
     password = args.password
     mode = args.mode
     channel = args.channel
-    interactive = False
-
+    # Determine if we need to ask questions
+    interactive_setup = False
     if not mode or not ssid or not password:
-        interactive = True
+        interactive_setup = True
 
     try:
         # --- Clean start ---
         if vpn.is_container_running():
             print("[!] Container is running.")
-            if interactive:
+            if interactive_setup:
                 saved = vpn.load_session()
                 if saved: print(f"    Active: {saved.get('mode')} - {saved.get('ssid')}")
                 opt = input("    (S)top, (D)etach, or (I)gnore? ").strip().lower()
@@ -399,7 +400,7 @@ def main():
                 vpn.shutdown_on_exit = True
                 vpn.cleanup()
 
-        if interactive:
+        if interactive_setup:
             print("\n" + "="*40)
             print("  WIFI CONTAINER (PERFORMANCE MODE)")
             print("="*40)
@@ -424,7 +425,6 @@ def main():
                 print("\nChannel Selection (5GHz Only):")
                 print("  165 = 5 GHz High (Recommended, minimal interference) [Default]")
                 print("  36  = 5 GHz Low (Use if client can't see 165)")
-                # Removed 2.4 GHz as requested
                 ch_in = input("Channel [165]: ").strip()
                 if not ch_in:
                     channel = 165
@@ -453,8 +453,9 @@ def main():
         print(f" {repro_cmd}")
         print("*"*60)
 
-        # --- Loop ---
-        if interactive:
+        # --- Loop (Available for both CLI and Interactive launches) ---
+        if sys.stdin.isatty():
+            # If we are in a terminal, allow user interaction regardless of how we started
             print("\nSession Active. Type 'bg' to detach, 'stop' to end.")
             while True:
                 user_in = input("> ").strip().lower()
@@ -466,7 +467,8 @@ def main():
                     vpn.clear_session()
                     break
         else:
-            print("\n[Running in Headless Mode]. Press Ctrl+C to stop.")
+            # Headless/Background process (e.g. systemd or nohup)
+            print("\n[Running in Background/Headless]. Press Ctrl+C to stop.")
             def handler(signum, frame):
                 raise KeyboardInterrupt
             signal.signal(signal.SIGINT, handler)

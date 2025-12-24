@@ -42,7 +42,7 @@ class ContainerNetwork:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, input=input, timeout=timeout
             )
-            # Manual check if verify=False
+            # Check return code manually if check=False
             if not check and result.returncode != 0:
                 return None
             return result.stdout.strip()
@@ -131,14 +131,28 @@ class ContainerNetwork:
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         use_image = CUSTOM_IMAGE if self.run_command(f"podman images -q {CUSTOM_IMAGE}", check=False) else BASE_IMAGE
 
-        # CRITICAL CHANGE: Use --privileged to ensure hardware access works on Bazzite/SELinux
-        self.run_command(
+        # Removed causing flags: --cpuset-cpus, --memory-swappiness, --cap-add
+        # We rely on --privileged and then apply chrt (Real-Time) manually below.
+        print("      [Performance] Applying Real-Time Priority Mode...")
+
+        podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
             "--net=none "
             f"{use_image} sleep infinity"
         )
-        # Note: --net=none gives us a clean slate. We add interfaces manually.
+
+        self.run_command(podman_run)
+
+        # Apply Real-Time FIFO Scheduling to the container process
+        try:
+            ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+            # chrt -f 99: Set policy to FIFO with max priority (99)
+            # This is safer than --cpuset-cpus on Bazzite/Silverblue
+            self.run_command(f"chrt -f -p 99 {ctr_pid}")
+            print("      [Performance] Real-Time FIFO Scheduler: ENABLED")
+        except:
+            print("      [Performance] Failed to set RT Scheduler (Is 'chrt' installed?)")
 
         if use_image == BASE_IMAGE:
             print("[2/5] Installing tools (Includes Bridge, Avahi & TC)...")
@@ -198,9 +212,12 @@ class ContainerNetwork:
             print(f"      [ERROR] Failed to move Ethernet: {e}")
             return False
 
+        print("      [Router Mode] Clearing default routes to prevent conflict...")
+        self.run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
+
         print(f"      [Router Mode] Bringing up WAN inside container...")
         self.run_command(f"{self.exec_cmd} 'ip link set {self.eth_interface} up'")
-        time.sleep(2) # Wait for Link Up
+        time.sleep(2)
 
         # Check Carrier
         carrier = self.run_command(f"{self.exec_cmd} 'cat /sys/class/net/{self.eth_interface}/carrier'", check=False)
@@ -208,13 +225,10 @@ class ContainerNetwork:
              print(f"      [WARNING] Cable seems unplugged? (Carrier: {carrier})")
 
         print(f"      [Router Mode] Requesting WAN IP (via udhcpc)...")
-        # -i iface, -n exit on fail, -q quit after lease, -f foreground, -t 5 attempts
         dhcp_cmd = f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"
 
         try:
-            # Capture output to show user if it fails
             res = subprocess.run(shlex.split(dhcp_cmd), check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
-            # print(f"      [DHCP LOG] {res.stdout}")
         except subprocess.CalledProcessError as e:
             print(f"      [DHCP FAIL] Code: {e.returncode}")
             print(f"      [DHCP LOG] {e.stdout}")
@@ -224,7 +238,6 @@ class ContainerNetwork:
         wan_ip = self.get_container_ip(self.eth_interface)
         print(f"      [Router Mode] WAN IP Acquired: {wan_ip}")
 
-        # Verify Gateway
         routes = self.run_command(f"{self.exec_cmd} 'ip route show default'", check=False)
         if not routes or "default" not in routes:
              print("      [CRITICAL WARNING] No Default Gateway obtained!")
@@ -433,13 +446,11 @@ network={{
         print("Restoring Interfaces to Host...")
         time.sleep(2)
         try:
-            # Restore WiFi
             iface = self.get_active_wifi_interface()
             self.run_command(f"nmcli device connect {iface}", check=False)
         except: pass
 
         try:
-            # Restore Ethernet
             eth = self.eth_interface if self.eth_interface else "eno1"
             self.run_command(f"nmcli device connect {eth}", check=False)
         except: pass

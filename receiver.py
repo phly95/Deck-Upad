@@ -78,7 +78,12 @@ def run_host_logic():
         "podman", "run", "--rm", "-it",
         "--name", CONTAINER_NAME,
         "--pull=never",
-        "--net=host", "--userns=keep-id", "--ipc=host", "--security-opt", "label=disable",
+        # REMOVED: --net=host (This exposes us to the host firewall blocking traffic)
+        # ADDED: Explicit port mapping. Podman adds iptables rules to allow this.
+        "-p", "5000:5000/udp", # Video Stream
+        "-p", "5002:5002/udp", # Resolution Control
+
+        "--userns=keep-id", "--ipc=host", "--security-opt", "label=disable",
         "--device", "/dev/dri",
 
         # Pass Host Config to Container
@@ -86,8 +91,8 @@ def run_host_logic():
         "-e", f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', 'wayland-0')}",
         "-e", f"XDG_RUNTIME_DIR={runtime_dir}",
         "-e", "GDK_BACKEND=wayland,x11",
-        "-e", f"SENDER_IP={sender_ip}",        # <--- PASSED HERE
-        "-e", f"USE_FULLSCREEN={use_fullscreen}", # <--- PASSED HERE
+        "-e", f"SENDER_IP={sender_ip}",
+        "-e", f"USE_FULLSCREEN={use_fullscreen}",
 
         "-v", "/tmp/.X11-unix:/tmp/.X11-unix:ro",
         "-v", f"{runtime_dir}:{runtime_dir}:rw",
@@ -108,7 +113,7 @@ def run_gui_worker():
     try:
         gi.require_version('Gst', '1.0')
         gi.require_version('Gtk', '3.0')
-        gi.require_version('Gio', '2.0') # For DBus/Screensaver inhibit
+        gi.require_version('Gio', '2.0')
         from gi.repository import Gst, Gtk, Gdk, GLib, Gio
     except ImportError: sys.exit(1)
 

@@ -29,6 +29,11 @@ HOST_LAN_IP = "192.168.50.2"
 CLIENT_GATEWAY_IP = "10.13.13.1"
 CLIENT_HOST_IP = "10.13.13.2"
 
+# --- PORTS TO FORWARD ---
+# We forward everything from 2000 to 65535 to avoid missing anything.
+# This covers USBIP (3240), GStreamer (5000+), and Input (5001+).
+FWD_PORT_RANGE = "2000:65535"
+
 class ContainerNetwork:
     def __init__(self):
         self.wifi_interface = self.get_active_wifi_interface()
@@ -148,7 +153,6 @@ class ContainerNetwork:
 
         try:
             ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
-            # Real-Time FIFO Scheduler (safe for Bazzite)
             self.run_command(f"chrt -f -p 99 {ctr_pid}")
             print("      [Performance] Real-Time FIFO Scheduler: ENABLED")
         except:
@@ -225,7 +229,6 @@ class ContainerNetwork:
 
         print(f"      [Router Mode] Requesting WAN IP (via udhcpc)...")
         dhcp_cmd = f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"
-
         try:
             res = subprocess.run(shlex.split(dhcp_cmd), check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
         except subprocess.CalledProcessError as e:
@@ -248,7 +251,6 @@ class ContainerNetwork:
         print("\n" + "="*40)
         print("  DIAGNOSTICS")
         print("="*40)
-
         print("1. Container WAN Access (Ping 8.8.8.8)...")
         try:
             if self.run_command(f"{self.exec_cmd} 'ping -c 2 -W 2 8.8.8.8'", check=False, timeout=5):
@@ -261,10 +263,8 @@ class ContainerNetwork:
         try:
             res1 = self.run_command(f"ping -c 2 -W 2 {ROUTER_LAN_IP}", check=False, timeout=5)
             res2 = self.run_command(f"ping -c 2 -W 2 {CLIENT_GATEWAY_IP}", check=False, timeout=5)
-            if res1 or res2:
-                print("   [PASS] Host can reach Container.")
-            else:
-                print("   [FAIL] Host cannot reach Container (Check veth-host).")
+            if res1 or res2: print("   [PASS] Host can reach Container.")
+            else: print("   [FAIL] Host cannot reach Container (Check veth-host).")
         except: print("   [FAIL] Error executing ping.")
 
         print("3. Host Internet Access (Ping 8.8.8.8)...")
@@ -282,9 +282,19 @@ class ContainerNetwork:
             else:
                 print("   [FAIL] Host DNS failed (Resolution Error).")
         except: print("   [FAIL] Error executing ping.")
-
         print("="*40 + "\n")
 
+    def open_host_ports(self):
+        """Forces Host Firewall to accept ALL High Ports (2000-65535)."""
+        if shutil.which("firewall-cmd"):
+            print(f"      [Firewall] Opening Port Range {FWD_PORT_RANGE} (UDP/TCP) on Host...")
+            try:
+                # Wide open range for gaming/streaming/usbip
+                self.run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/udp", check=False)
+                self.run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/tcp", check=False)
+                self.run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/udp", check=False)
+                self.run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/tcp", check=False)
+            except: pass
 
     # --- Optimization Methods ---
     def enable_aqm(self):
@@ -298,7 +308,7 @@ class ContainerNetwork:
         self.run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 addrgenmode none' 2>/dev/null || true")
 
-    # --- Mode: AP (Router Mode - Exclusive Hardware) ---
+    # --- Mode: AP (Router Mode) ---
     def setup_ap_mode_router(self, ssid, password, channel, ctr_pid):
         print(f"[4/5] Configuring Container as Dedicated Router...")
 
@@ -323,8 +333,12 @@ class ContainerNetwork:
         self.run_command(nm_cmd)
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
+        # Explicitly Open Firewall Ports for AP Host (Receiver)
+        self.open_host_ports()
+
         if has_wan:
             print(f"      [Routing] Enabling NAT: br0 (LAN) -> {wan_iface} (WAN)...")
+            self.run_command(f"{self.exec_cmd} 'sysctl -w net.ipv4.ip_forward=1'")
             self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o {wan_iface} -j MASQUERADE'")
             self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i br0 -o {wan_iface} -j ACCEPT'")
             self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
@@ -369,7 +383,6 @@ dhcp-option=6,8.8.8.8"""
     # --- Mode: Client (Guest) ---
     def setup_client_mode_with_discovery(self, ssid, password, ctr_pid):
         print(f"[4/5] Connecting to '{ssid}' (Client Mode)...")
-
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
@@ -391,49 +404,41 @@ network={{
         self.run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self.optimize_wifi()
 
-        # --- CRITICAL FIXES FOR CLIENT MODE ---
         print("      [Client Mode] Waiting for WPA Association...")
         self.run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
-
-        # Wait for association (up to 15s)
-        associated = False
         for _ in range(15):
             status = self.run_command(f"{self.exec_cmd} 'wpa_cli status'", check=False)
-            if status and "wpa_state=COMPLETED" in status:
-                associated = True
-                break
+            if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
 
-        if not associated:
-            print("      [WARNING] WiFi did not associate in time. DHCP might fail.")
-
-        print("      [Client Mode] Flushing default routes to prevent conflict...")
-        self.run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
-
         print("      [Client Mode] Requesting IP...")
-        # Try DHCP with retries
-        try:
-            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
-        except:
-            print("      [WARNING] DHCP failed initially. Retrying...")
-            self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'", check=False)
+        self.run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
+        try: self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
+        except: self.run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'", check=False)
 
-        # NAT & Forwarding
-        print("      [Routing] Configuring NAT and USBIP Forwarding...")
+        # --- NAT & PORT FORWARDING (SLEDGEHAMMER MODE) ---
+        print(f"      [Routing] Forwarding ALL Ports ({FWD_PORT_RANGE}) to Host...")
+
+        # 1. Masquerade Outbound
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
+
+        # 2. Allow Forwarding (Container -> Host)
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
-        # Port Forwarding for USBIP
-        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 3240 -j DNAT --to-destination {CLIENT_HOST_IP}:3240'")
-        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -p tcp --dport 3240 -j ACCEPT'")
+        # 3. Port Forwarding (TCP/UDP 2000-65535 -> Host)
+        # TCP
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -p tcp --dport {FWD_PORT_RANGE} -j ACCEPT'")
+        # UDP
+        self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
+        self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -p udp --dport {FWD_PORT_RANGE} -j ACCEPT'")
 
         self.enable_aqm()
         self.run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
         self.run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
         self.run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
         self.run_command(f"{self.exec_cmd} 'avahi-daemon -D'")
-
         self.run_diagnostics()
 
     def cleanup(self):
@@ -444,6 +449,14 @@ network={{
         self.run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
+
+        # Cleanup Firewall ports
+        if shutil.which("firewall-cmd"):
+            try:
+                self.run_command(f"firewall-cmd --remove-port={FWD_PORT_RANGE}/udp", check=False)
+                self.run_command(f"firewall-cmd --remove-port={FWD_PORT_RANGE}/tcp", check=False)
+            except: pass
+
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         print("Restoring Interfaces to Host...")
@@ -533,7 +546,6 @@ def main():
             vpn.setup_client_mode_with_discovery(ssid, password, ctr_pid)
             print(f"\n[CONNECTED] IP: {vpn.get_container_ip()}")
         elif mode == 'ap':
-            # This will move Ethernet into container and set up Host as a client
             vpn.setup_ap_mode_router(ssid, password, channel, ctr_pid)
             print(f"\n[ROUTER ACTIVE] AP '{ssid}' Created.")
             print("Host is now connected to Container for Internet.")

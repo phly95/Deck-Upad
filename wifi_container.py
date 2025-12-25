@@ -46,7 +46,6 @@ class ContainerNetwork:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, input=input, timeout=timeout
             )
-            # Check return code manually if check=False
             if not check and result.returncode != 0:
                 return None
             return result.stdout.strip()
@@ -137,24 +136,24 @@ class ContainerNetwork:
 
         print("      [Performance] Applying Real-Time Priority Mode...")
 
-        # We rely on --privileged. We use chrt later to avoid OCI runtime errors on Bazzite.
+        # CRITICAL FIX: Re-added --sysctl net.ipv4.ip_forward=1
         podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
             "--net=none "
+            "--sysctl net.ipv4.ip_forward=1 "  # <--- THIS IS REQUIRED FOR ROUTING
             f"{use_image} sleep infinity"
         )
 
         self.run_command(podman_run)
 
-        # Apply Real-Time FIFO Scheduling to the container process
         try:
             ctr_pid = self.run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
-            # chrt -f 99: Set policy to FIFO with max priority (99)
+            # Real-Time FIFO Scheduler
             self.run_command(f"chrt -f -p 99 {ctr_pid}")
             print("      [Performance] Real-Time FIFO Scheduler: ENABLED")
         except:
-            print("      [Performance] Failed to set RT Scheduler (Is 'chrt' installed?)")
+            print("      [Performance] Failed to set RT Scheduler.")
 
         if use_image == BASE_IMAGE:
             print("[2/5] Installing tools (Includes Bridge, Avahi & TC)...")
@@ -214,7 +213,7 @@ class ContainerNetwork:
             print(f"      [ERROR] Failed to move Ethernet: {e}")
             return False
 
-        print("      [Router Mode] Clearing default routes to prevent conflict...")
+        print("      [Router Mode] Clearing default routes...")
         self.run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
 
         print(f"      [Router Mode] Bringing up WAN inside container...")
@@ -230,7 +229,6 @@ class ContainerNetwork:
         dhcp_cmd = f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"
 
         try:
-            # We allow a bit longer timeout for DHCP negotiation
             res = subprocess.run(shlex.split(dhcp_cmd), check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
         except subprocess.CalledProcessError as e:
             print(f"      [DHCP FAIL] Code: {e.returncode}")
@@ -241,11 +239,9 @@ class ContainerNetwork:
         wan_ip = self.get_container_ip(self.eth_interface)
         print(f"      [Router Mode] WAN IP Acquired: {wan_ip}")
 
-        # Verify Routing Table has a Gateway
         routes = self.run_command(f"{self.exec_cmd} 'ip route show default'", check=False)
         if not routes or "default" not in routes:
              print("      [CRITICAL WARNING] No Default Gateway obtained! Retrying DHCP...")
-             # Retry once
              self.run_command(f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 3'", check=False)
 
         return True
@@ -264,7 +260,6 @@ class ContainerNetwork:
         except: print("   [FAIL] Error executing ping.")
 
         print("2. Host <-> Container Link (Ping 192.168.50.1 or 10.13.13.1)...")
-        # Try both router IP and Client Gateway IP
         try:
             res1 = self.run_command(f"ping -c 2 -W 2 {ROUTER_LAN_IP}", check=False, timeout=5)
             res2 = self.run_command(f"ping -c 2 -W 2 {CLIENT_GATEWAY_IP}", check=False, timeout=5)
@@ -331,7 +326,6 @@ class ContainerNetwork:
 
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
 
-        # Priority Metric 20 to ensure host uses this route
         nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
                   f"ip4 {HOST_LAN_IP}/24 gw4 {ROUTER_LAN_IP} connection.zone trusted "
                   f"ipv4.route-metric 20 ipv4.dns '8.8.8.8' ipv4.ignore-auto-dns yes")
@@ -342,7 +336,6 @@ class ContainerNetwork:
         # 5. NAT
         if has_wan:
             print(f"      [Routing] Enabling NAT: br0 (LAN) -> {wan_iface} (WAN)...")
-            self.run_command(f"{self.exec_cmd} 'sysctl -w net.ipv4.ip_forward=1'")
             self.run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o {wan_iface} -j MASQUERADE'")
             self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i br0 -o {wan_iface} -j ACCEPT'")
             self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
@@ -399,21 +392,12 @@ dhcp-option=6,8.8.8.8"""
         self.run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self.run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self.run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
-
-        # Configure Internal Gateway IP for Host to talk to
         self.run_command(f"{self.exec_cmd} 'ip addr add {CLIENT_GATEWAY_IP}/24 dev {VETH_CTR}'")
 
-        # Configure Host side
         self.run_command(f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} ip4 {CLIENT_HOST_IP}/24 gw4 {CLIENT_GATEWAY_IP} connection.zone trusted")
         self.run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
         self.run_command(f"nmcli connection up {NM_CONN_NAME}")
 
-        upstream = self.eth_interface
-        # NOTE: In Client mode, we usually leave Eth on host and NAT via host.
-        # But if we wanted to route host traffic through client wifi, we would do it here.
-        # For now, standard Client Mode implies the container joins WiFi and we NAT traffic out of it.
-
-        # WPA Supplicant
         wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
 update_config=1
 country=US
@@ -439,14 +423,11 @@ network={{
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
         # 3. [NEW] Port Forwarding for USBIP (Incoming 3240 -> Host)
-        # Incoming traffic on wlan0 port 3240 -> Forward to Host IP (10.13.13.2) port 3240
         self.run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport 3240 -j DNAT --to-destination {CLIENT_HOST_IP}:3240'")
-        # Allow the forwarded traffic through the filter
         self.run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -p tcp --dport 3240 -j ACCEPT'")
 
         self.enable_aqm()
 
-        # Avahi for mDNS (Discovery)
         self.run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
         self.run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
         self.run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
@@ -464,20 +445,17 @@ network={{
         self.run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self.run_command(f"ip link delete {VETH_HOST}", check=False)
 
-        # Stop container - This effectively returns the hardware to the Host Network Namespace
         self.run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self.run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
         print("Restoring Interfaces to Host...")
         time.sleep(2)
         try:
-            # Restore WiFi
             iface = self.get_active_wifi_interface()
             self.run_command(f"nmcli device connect {iface}", check=False)
         except: pass
 
         try:
-            # Restore Ethernet
             eth = self.eth_interface if self.eth_interface else "eno1"
             self.run_command(f"nmcli device connect {eth}", check=False)
         except: pass

@@ -40,9 +40,10 @@ def dma_sync(fd, flags):
 
 # --- INPUT HANDLING ---
 class InputServer(threading.Thread):
-    def __init__(self):
+    def __init__(self, sender_instance):
         super().__init__()
         self.daemon = True
+        self.sender = sender_instance # Reference to access crop state
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 5001))
         cap = {
@@ -63,8 +64,46 @@ class InputServer(threading.Thread):
             try:
                 data, _ = self.sock.recvfrom(1024)
                 msg = json.loads(data.decode())
-                abs_x = int(msg['x'] * 65535)
-                abs_y = int(msg['y'] * 65535)
+
+                # --- COORDINATE MAPPING ---
+                # 1. Receiver sends 0.0-1.0 relative to the CROPPED window
+                rel_x = msg['x']
+                rel_y = msg['y']
+
+                # 2. Get current full dimensions and crop settings from Sender
+                full_w = self.sender.current_w
+                full_h = self.sender.current_h
+
+                # Default to full screen if no info yet
+                if full_w == 0 or full_h == 0:
+                    real_x = rel_x
+                    real_y = rel_y
+                else:
+                    # Apply Crop Offset
+                    # If we are cropping, we project the small window back onto the large canvas
+                    crop = self.sender.active_crop # (x, y, w, h) or None
+
+                    if crop:
+                        cx, cy, cw, ch = crop
+                        # Map 0-1 of crop to pixels
+                        px_x = cx + (rel_x * cw)
+                        px_y = cy + (rel_y * ch)
+
+                        # Normalize back to 0-1 of FULL screen
+                        real_x = px_x / full_w
+                        real_y = px_y / full_h
+                    else:
+                        real_x = rel_x
+                        real_y = rel_y
+
+                # 3. Scale to UInput range
+                abs_x = int(real_x * 65535)
+                abs_y = int(real_y * 65535)
+
+                # Clamp for safety
+                abs_x = max(0, min(65535, abs_x))
+                abs_y = max(0, min(65535, abs_y))
+
                 if msg['type'] == 'move':
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
@@ -81,9 +120,23 @@ class InputServer(threading.Thread):
 
 # --- GSTREAMER SENDER ---
 class VkCaptureSender:
-    def __init__(self, receiver_ip):
+    def __init__(self, receiver_ip, crop_arg=None):
         Gst.init(None)
         self.receiver_ip = receiver_ip
+
+        # Parse crop argument "x,y,w,h" into a tuple
+        self.user_crop = None
+        if crop_arg:
+            try:
+                self.user_crop = tuple(map(int, crop_arg.split(',')))
+                if len(self.user_crop) != 4: raise ValueError
+                print(f" [CONFIG] Crop Region Set: {self.user_crop}")
+            except:
+                print(" [ERROR] Invalid crop format. Use 'x,y,w,h' (e.g., '0,0,1280,720')")
+                sys.exit(1)
+
+        self.active_crop = None # Validated crop for current resolution
+
         self.pipeline = None
         self.appsrc = None
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -94,7 +147,9 @@ class VkCaptureSender:
             print("Socket bind failed (is capture already running?).")
             sys.exit(1)
         self.server.listen(1)
-        self.input_server = InputServer()
+
+        # Pass self to InputServer so it can access crop info
+        self.input_server = InputServer(self)
         self.input_server.start()
         self.ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -117,7 +172,12 @@ class VkCaptureSender:
     def send_resolution_packet(self):
         """Broadcasts current resolution to receiver (Heartbeat)."""
         try:
-            msg = json.dumps({"cmd": "resize", "w": self.current_w, "h": self.current_h}).encode()
+            # If cropping, tell receiver the CROPPED size, not full size
+            w, h = self.current_w, self.current_h
+            if self.active_crop:
+                _, _, w, h = self.active_crop
+
+            msg = json.dumps({"cmd": "resize", "w": w, "h": h}).encode()
             self.ctl_sock.sendto(msg, (self.receiver_ip, 5002))
         except: pass
 
@@ -125,25 +185,52 @@ class VkCaptureSender:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
 
-        print(f" [PIPELINE] Config: {width}x{height} (Stride: {stride})")
+        print(f" [PIPELINE] Input: {width}x{height} (Stride: {stride})")
 
         self.current_w = width
         self.current_h = height
         self.current_stride = stride
 
-        # Send immediate resize command
-        self.send_resolution_packet()
-
+        # --- CROP LOGIC ---
         bytes_per_pixel = 4
         padded_width = stride // bytes_per_pixel
-        crop_right = padded_width - width
+
+        # Default: No Crop
+        crop_left = 0
+        crop_top = 0
+        crop_right = padded_width - width # Stride padding removal
+        crop_bottom = 0
+
+        self.active_crop = None
+
+        if self.user_crop:
+            ux, uy, uw, uh = self.user_crop
+            # Validate bounds
+            if ux + uw <= width and uy + uh <= height:
+                self.active_crop = self.user_crop
+                print(f" [PIPELINE] Applying Crop: {self.active_crop}")
+
+                crop_left = ux
+                crop_top = uy
+                # videocrop 'right' removes pixels from the right edge of the BUFFER.
+                # Buffer Width = padded_width.
+                # We want to keep pixels from ux to ux+uw.
+                # Pixels to remove from right = (padded_width) - (ux + uw)
+                crop_right = padded_width - (ux + uw)
+                crop_bottom = height - (uy + uh)
+            else:
+                print(f" [WARNING] Crop {self.user_crop} out of bounds for {width}x{height}. Ignoring.")
+
+        # Send resize command immediately
+        self.send_resolution_packet()
 
         enc_str = self.get_encoder_str()
 
+        # Added crop properties
         launch_str = (
             f"appsrc name=src format=time is-live=true do-timestamp=false ! "
             f"video/x-raw,format={format_str},width={padded_width},height={height},framerate={TARGET_FPS}/1 ! "
-            f"videocrop right={crop_right} ! "
+            f"videocrop left={crop_left} right={crop_right} top={crop_top} bottom={crop_bottom} ! "
             "videoconvert ! "
             f"{enc_str} ! "
             "rtph264pay config-interval=1 pt=96 ! "
@@ -227,6 +314,10 @@ class VkCaptureSender:
                     if self.pipeline_running and mapped_buf and current_fd:
                         frame_len = self.current_h * self.current_stride
 
+                        # Ensure we don't read past buffer if stride/height calcs are slightly off
+                        if frame_len > mapped_buf.size():
+                             frame_len = mapped_buf.size()
+
                         dma_sync(current_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
                         mapped_buf.seek(0)
                         raw_bytes = mapped_buf.read(frame_len)
@@ -244,7 +335,9 @@ class VkCaptureSender:
 
                         frames_in_sec += 1
                         if time.time() - fps_timer > 1.0:
-                            print(f"Sending: {frames_in_sec} FPS | Res: {self.current_w}x{self.current_h}")
+                            disp_w = self.active_crop[2] if self.active_crop else self.current_w
+                            disp_h = self.active_crop[3] if self.active_crop else self.current_h
+                            print(f"Sending: {frames_in_sec} FPS | Res: {disp_w}x{disp_h} (Src: {self.current_w}x{self.current_h})")
 
                             # --- HEARTBEAT ---
                             # Re-send resolution for late joiners
@@ -272,13 +365,14 @@ class VkCaptureSender:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("receiver_ip", nargs="?", help="IP of the Steam Deck/Receiver")
+    parser.add_argument("--crop", help="Define crop region as 'x,y,w,h' (e.g. 100,100,1280,720)")
     args = parser.parse_args()
 
     target_ip = args.receiver_ip
     if not target_ip:
         target_ip = input("Enter Receiver IP: ").strip()
 
-    sender = VkCaptureSender(target_ip)
+    sender = VkCaptureSender(target_ip, args.crop)
     try:
         sender.loop()
     except KeyboardInterrupt:

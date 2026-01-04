@@ -11,7 +11,7 @@ Note: the ~ character means your home folder on Linux.
 f(){ d="$HOME/Games/Azahar"; t=$(mktemp -d); unzip -qo "$1" -d "$t"; chmod -R u+rwX "$t"; (cd "$t" && find . -type f -name '*\\*' -exec bash -c 'n="${1//\\//}"; mkdir -p "${n%/*}"; mv "$1" "$n"' _ {} \;); s=$(ls -1 "$t" | head -n 1); mkdir -p "${d%/*}"; rm -rf "$d"; mv "$t/$s" "$d"; rm -rf "$t"; echo "Success! Installed to $d"; }; f
 ```
 
-5. In the terminal, press the SPACE key. Then drag and drop zip file you downloaded.*
+5. In the terminal, press the SPACE key. Then drag and drop zip file you downloaded.\*
 6. Put the following files from this GitHub in your home folder: dynamic-resolution.sh, sender-vk.py
 7. Open Steam and Add a non-steam game and select the azahar.exe in the Games folder you made.
 8. Right Click the Azahar you added to steam, and change the launch options to `~/dynamic-resolution.sh 127.0.0.1 H+1600 obs-gamecapture %command%`

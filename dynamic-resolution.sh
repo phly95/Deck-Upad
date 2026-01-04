@@ -115,7 +115,29 @@ fi
 
 # --- CONFIGURE AZAHAR LAYOUT & LAUNCH SENDER ---
 # We rely on Steam setting STEAM_COMPAT_DATA_PATH when running under Proton
-AZAHAR_CONFIG="$STEAM_COMPAT_DATA_PATH/pfx/drive_c/users/steamuser/AppData/Roaming/AzaharPlus/config/qt-config.ini"
+ROAMING_BASE="$STEAM_COMPAT_DATA_PATH/pfx/drive_c/users/steamuser/AppData/Roaming"
+PATH_PLUS="$ROAMING_BASE/AzaharPlus/config/qt-config.ini"
+PATH_STD="$ROAMING_BASE/Azahar/config/qt-config.ini"
+
+AZAHAR_CONFIG=""
+
+# Check logic: Prioritize Plus, fallback to Standard
+if [ -f "$PATH_PLUS" ]; then
+    AZAHAR_CONFIG="$PATH_PLUS"
+elif [ -f "$PATH_STD" ]; then
+    AZAHAR_CONFIG="$PATH_STD"
+else
+    # Default to Plus just so we have a path to show in the error
+    AZAHAR_CONFIG="$PATH_PLUS"
+fi
+
+# --- DEBUG: POPUP PATH STATUS ---
+if [ -f "$AZAHAR_CONFIG" ]; then
+    show_message "Azahar Config Status" "SUCCESS: File Found!\n\nUsing Path:\n$AZAHAR_CONFIG"
+else
+    show_message "Azahar Config Status" "WARNING: File NOT Found.\n\nChecked locations:\n1. $PATH_PLUS\n2. $PATH_STD"
+fi
+# ----------------------------------------
 
 if [[ "$MODE" == "ENABLE" && -f "$AZAHAR_CONFIG" ]]; then
 

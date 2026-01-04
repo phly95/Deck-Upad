@@ -40,4 +40,4 @@ Note: touchscreen functionality has not yet been tested. That will be worked on.
 
 
 
-* This is needed due to Linux extraction tools not playing nicely with the Windows ZIP file directories.
+\* This is needed due to Linux extraction tools not playing nicely with the Windows ZIP file directories.

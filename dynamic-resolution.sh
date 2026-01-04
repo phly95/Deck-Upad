@@ -6,20 +6,34 @@ MODE="AUTO" # Default mode
 FINAL_RES_ARG="" # Store the resolution argument (e.g. H+1600)
 SENDER_IP="127.0.0.1" # Default IP
 TMP_REG="/tmp/proton_desktop_config.reg"
+VERBOSE=false # Default to silent (console only)
+
+# Internal Variables
+CALC_MODE="STANDARD" # Can be STANDARD or S_PLUS
+S_VAL=0
 
 # --- HELPER FUNCTION: SHOW MESSAGE ---
 show_message() {
     local title="$1"
     local text="$2"
 
-    if command -v kdialog &> /dev/null; then
-        kdialog --msgbox "$text" --title "$title"
-    elif command -v zenity &> /dev/null; then
-        zenity --warning --title="$title" --text="$text" --width=500
-    elif command -v xterm &> /dev/null; then
-        xterm -hold -e echo -e "$title\n\n$text"
+    if [[ "$VERBOSE" == "true" ]]; then
+        # GUI MODE
+        if command -v kdialog &> /dev/null; then
+            kdialog --msgbox "$text" --title "$title"
+        elif command -v zenity &> /dev/null; then
+            zenity --warning --title="$title" --text="$text" --width=500
+        elif command -v xterm &> /dev/null; then
+            xterm -hold -e echo -e "$title\n\n$text"
+        else
+            echo -e "[$title]\n$text"
+        fi
     else
-        echo -e "$title\n$text" > ~/Desktop/proton_error.txt
+        # CONSOLE MODE (Silent)
+        echo "---------------------------------------------------"
+        echo "[$title]"
+        echo -e "$text"
+        echo "---------------------------------------------------"
     fi
 }
 
@@ -30,14 +44,16 @@ show_help() {
 Usage: script.sh [OPTIONS] [IP_ADDRESS] %command%
 
 ARGUMENTS (Any Order):
+  verbose       Enable popup windows (Default: silent/console).
   192.168.1.50  Set Receiver IP (Default: 127.0.0.1)
   off           Disable Virtual Desktop.
   1920x1080     Force resolution.
-  H+1600        Auto-detect + add height.
+  H+1600        Auto-detect + add height (Standard Center).
   W+1920        Auto-detect + add width.
+  S+400         Split Mode: Adds 400px bottom screen + 408px top void.
 
 EXAMPLES:
-  script.sh H+1600 192.168.86.42 %command%
+  script.sh verbose S+400 192.168.86.42 %command%
 "
     show_message "Proton Resolution Help" "$HELP_TEXT"
     exit 0
@@ -50,6 +66,9 @@ while [[ $# -gt 0 ]]; do
 
     if [[ "${SANITIZED_ARG,,}" == "help" || "${SANITIZED_ARG,,}" == "-h" ]]; then
         show_help
+    elif [[ "${SANITIZED_ARG,,}" == "verbose" || "${SANITIZED_ARG,,}" == "-v" ]]; then
+        VERBOSE=true
+        shift
     elif [[ "${SANITIZED_ARG,,}" == "off" || "${SANITIZED_ARG,,}" == "disable" ]]; then
         MODE="DISABLE"
         shift
@@ -58,10 +77,17 @@ while [[ $# -gt 0 ]]; do
         shift
     elif [[ "$SANITIZED_ARG" =~ ^[0-9]+x[0-9]+$ ]]; then
         MODE="ENABLE"
+        CALC_MODE="MANUAL"
         FINAL_RES_ARG="$SANITIZED_ARG"
+        shift
+    elif [[ "$SANITIZED_ARG" =~ S\+([0-9]+) ]]; then
+        MODE="ENABLE"
+        CALC_MODE="S_PLUS"
+        S_VAL="${BASH_REMATCH[1]}"
         shift
     elif [[ "$SANITIZED_ARG" =~ [WH][+-][0-9]+ ]]; then
         MODE="ENABLE"
+        CALC_MODE="STANDARD"
         FINAL_RES_ARG="$SANITIZED_ARG"
         shift
     else
@@ -70,10 +96,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- SAFETY CHECK: DETECT PROTON/WINE ---
-# We scan the remaining arguments to find the runtime binary.
 PROTON_BIN=""
 for arg in "$@"; do
-    # Check for standard Proton paths or strict 'wine' command
     if [[ "$arg" == *"/proton" || "$arg" == *"wine" || "$arg" == *"wine64" ]]; then
         PROTON_BIN="$arg"
         break
@@ -81,23 +105,44 @@ for arg in "$@"; do
 done
 
 if [ -z "$PROTON_BIN" ]; then
-    show_message "Runtime Error" "CRITICAL ERROR:\n\nThis script detected that you are NOT running with Proton or Wine.\n\nTo use this script, you must enable a Compatibility Tool:\n1. Go to Steam -> Library -> Right Click Game -> Properties.\n2. Select 'Compatibility'.\n3. Check 'Force the use of a specific Steam Play compatibility tool'.\n4. Select a Proton version (e.g., GE-Proton or Proton Experimental)."
+    show_message "Runtime Error" "CRITICAL ERROR:\n\nThis script detected that you are NOT running with Proton or Wine.\n\nTo use this script, you must enable a Compatibility Tool in Steam Properties."
     exit 1
 fi
 
 # --- CALCULATE RESOLUTION ---
 FINAL_RES_STRING=""
-if [[ "$MODE" == "ENABLE" ]]; then
-    if [[ "$FINAL_RES_ARG" =~ ^[0-9]+x[0-9]+$ ]]; then
-        FINAL_RES_STRING="$FINAL_RES_ARG"
-    else
-        RAW_RES=$(xrandr --query | grep ' primary ' | grep -oP '\d+x\d+' | head -1)
-        if [ -z "$RAW_RES" ]; then
-            RAW_RES=$(xrandr --query | grep ' connected' | grep -oP '\d+x\d+' | head -1)
-        fi
 
-        WIDTH=$(echo "$RAW_RES" | cut -d'x' -f1)
-        HEIGHT=$(echo "$RAW_RES" | cut -d'x' -f2)
+if [[ "$MODE" == "ENABLE" ]]; then
+    # 1. Get Native Dimensions
+    RAW_RES=$(xrandr --query | grep ' primary ' | grep -oP '\d+x\d+' | head -1)
+    if [ -z "$RAW_RES" ]; then
+        RAW_RES=$(xrandr --query | grep ' connected' | grep -oP '\d+x\d+' | head -1)
+    fi
+    NATIVE_W=$(echo "$RAW_RES" | cut -d'x' -f1)
+    NATIVE_H=$(echo "$RAW_RES" | cut -d'x' -f2)
+
+    # 2. Branch Logic based on CALC_MODE
+    if [[ "$CALC_MODE" == "MANUAL" ]]; then
+        FINAL_RES_STRING="$FINAL_RES_ARG"
+
+    elif [[ "$CALC_MODE" == "S_PLUS" ]]; then
+        # S+ Logic:
+        # TopVoid = S + 8 (To balance the 20px top vs 28px bottom bars)
+        # VulkanHeight = TopVoid + NativeH + S
+        # RegistryHeight = VulkanHeight + 48 (Menu bars)
+
+        TOP_VOID=$((S_VAL + 8))
+        VULKAN_H=$((TOP_VOID + NATIVE_H + S_VAL))
+        REG_H=$((VULKAN_H + 48))
+
+        FINAL_RES_STRING="${NATIVE_W}x${REG_H}"
+
+        show_message "S+ Mode Calculated" "Native: ${NATIVE_W}x${NATIVE_H}\nS Value: $S_VAL\nTop Void: $TOP_VOID\n\nFinal Virtual Desktop: ${NATIVE_W}x${REG_H}"
+
+    else
+        # STANDARD (H+/W+) Logic
+        WIDTH=$NATIVE_W
+        HEIGHT=$NATIVE_H
 
         if [[ -n "$FINAL_RES_ARG" ]]; then
             if [[ "$FINAL_RES_ARG" =~ W([-+][0-9]+) ]]; then
@@ -114,7 +159,6 @@ if [[ "$MODE" == "ENABLE" ]]; then
 fi
 
 # --- CONFIGURE AZAHAR LAYOUT & LAUNCH SENDER ---
-# We rely on Steam setting STEAM_COMPAT_DATA_PATH when running under Proton
 ROAMING_BASE="$STEAM_COMPAT_DATA_PATH/pfx/drive_c/users/steamuser/AppData/Roaming"
 PATH_PLUS="$ROAMING_BASE/AzaharPlus/config/qt-config.ini"
 PATH_STD="$ROAMING_BASE/Azahar/config/qt-config.ini"
@@ -127,47 +171,71 @@ if [ -f "$PATH_PLUS" ]; then
 elif [ -f "$PATH_STD" ]; then
     AZAHAR_CONFIG="$PATH_STD"
 else
-    # Default to Plus just so we have a path to show in the error
     AZAHAR_CONFIG="$PATH_PLUS"
 fi
 
-# --- DEBUG: POPUP PATH STATUS ---
+# --- CONFIG STATUS CHECK ---
 if [ -f "$AZAHAR_CONFIG" ]; then
     show_message "Azahar Config Status" "SUCCESS: File Found!\n\nUsing Path:\n$AZAHAR_CONFIG"
 else
     show_message "Azahar Config Status" "WARNING: File NOT Found.\n\nChecked locations:\n1. $PATH_PLUS\n2. $PATH_STD"
 fi
-# ----------------------------------------
+# ---------------------------
 
 if [[ "$MODE" == "ENABLE" && -f "$AZAHAR_CONFIG" ]]; then
 
-    # 1. Get Dimensions
     TOTAL_WIDTH=$(echo "$FINAL_RES_STRING" | cut -d'x' -f1)
-    TOTAL_HEIGHT=$(echo "$FINAL_RES_STRING" | cut -d'x' -f2)
 
-    # Get Native Monitor Height
-    NATIVE_RES=$(xrandr --query | grep ' primary ' | grep -oP '\d+x\d+' | head -1)
-    if [ -z "$NATIVE_RES" ]; then
-        NATIVE_RES=$(xrandr --query | grep ' connected' | grep -oP '\d+x\d+' | head -1)
+    # Initialize variables
+    T_X=0; T_Y=0; T_W=0; T_H=0
+    B_X=0; B_Y=0; B_W=0; B_H=0
+
+    if [[ "$CALC_MODE" == "S_PLUS" ]]; then
+        # --- S+ COORDINATE MATH ---
+
+        # 1. Top Screen (Native Height, Centered vertically in Vulkan space via TopVoid)
+        T_H=$NATIVE_H
+        T_Y=$((S_VAL + 8)) # The calculated Top Void
+
+        # Top Width (Standard 5:3 Aspect Ratio logic relative to height)
+        T_W=$(awk -v h="$T_H" 'BEGIN {printf "%.0f", h * 5 / 3}')
+
+        # Center Top X
+        T_X=$(awk -v tw="$TOTAL_WIDTH" -v w="$T_W" 'BEGIN {printf "%.0f", (tw - w) / 2}')
+        if [ "$T_X" -lt 0 ]; then T_X=0; fi
+
+        # 2. Bottom Screen (Fills the 'S' void)
+        B_H=$S_VAL
+        B_Y=$((T_Y + T_H)) # Starts immediately after top screen
+
+        # Bottom Width (Standard 4:3 Aspect Ratio logic relative to height)
+        B_W=$(awk -v h="$B_H" 'BEGIN {printf "%.0f", h * 4 / 3}')
+        B_X=0
+
+    else
+        # --- STANDARD H+/W+ MATH ---
+        # Recalculate based on Final Resolution String
+        TOTAL_HEIGHT=$(echo "$FINAL_RES_STRING" | cut -d'x' -f2)
+
+        # Sanity check for Native Height if not set
+        if [ -z "$NATIVE_H" ]; then NATIVE_H=$TOTAL_HEIGHT; fi
+
+        # Top Screen
+        T_H=$NATIVE_H
+        if [ "$TOTAL_HEIGHT" -lt "$NATIVE_H" ]; then T_H=$TOTAL_HEIGHT; fi # Safety
+
+        T_Y=$(( (TOTAL_HEIGHT - NATIVE_H) / 2 ))
+        T_W=$(awk -v h="$T_H" 'BEGIN {printf "%.0f", h * 5 / 3}')
+        T_X=$(awk -v tw="$TOTAL_WIDTH" -v w="$T_W" 'BEGIN {printf "%.0f", (tw - w) / 2}')
+        if [ "$T_X" -lt 0 ]; then T_X=0; fi
+
+        # Bottom Screen
+        B_H=$(( TOTAL_HEIGHT - (T_Y + T_H) ))
+        if [ "$B_H" -le 0 ]; then B_H=100; fi
+        B_W=$(awk -v h="$B_H" 'BEGIN {printf "%.0f", h * 4 / 3}')
+        B_Y=$(( T_Y + T_H ))
+        B_X=0
     fi
-    NATIVE_H=$(echo "$NATIVE_RES" | cut -d'x' -f2)
-
-    if [ "$TOTAL_HEIGHT" -lt "$NATIVE_H" ]; then NATIVE_H=$TOTAL_HEIGHT; fi
-
-    # 2. Calculate Layout Coordinates
-    # --- TOP SCREEN ---
-    T_H=$NATIVE_H
-    T_Y=$(( (TOTAL_HEIGHT - NATIVE_H) / 2 ))
-    T_W=$(awk -v h="$T_H" 'BEGIN {printf "%.0f", h * 5 / 3}')
-    T_X=$(awk -v tw="$TOTAL_WIDTH" -v w="$T_W" 'BEGIN {printf "%.0f", (tw - w) / 2}')
-    if [ "$T_X" -lt 0 ]; then T_X=0; fi
-
-    # --- BOTTOM SCREEN ---
-    B_H=$(( TOTAL_HEIGHT - (T_Y + T_H) ))
-    if [ "$B_H" -le 0 ]; then B_H=100; fi
-    B_W=$(awk -v h="$B_H" 'BEGIN {printf "%.0f", h * 4 / 3}')
-    B_Y=$(( T_Y + T_H ))
-    B_X=0
 
     # 3. Update qt-config.ini
     update_ini() {

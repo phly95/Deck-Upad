@@ -74,7 +74,6 @@ class InputServer(threading.Thread):
         self.sock.bind(("0.0.0.0", 5001))
 
         # We keep the UInput definition as the full 0-65535 range.
-        # We will restrict the range logically in the loop.
         cap = {
             ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE, ecodes.BTN_TOUCH],
             ecodes.EV_ABS: [
@@ -90,16 +89,10 @@ class InputServer(threading.Thread):
             self.ui = None
 
     def calculate_input_box(self):
-        """
-        Calculates the active area of the game on the host monitor
-        based on aspect ratio differences.
-        Returns (x_offset, y_offset, width_scale, height_scale) normalized 0.0-1.0
-        """
         # If we haven't received video frames yet, default to full screen
         if self.sender.output_w == 0 or self.sender.output_h == 0:
             return (0.0, 0.0, 1.0, 1.0)
 
-        # 1. Get Host Monitor Resolution
         monitor = glfw.get_primary_monitor()
         if not monitor: return (0.0, 0.0, 1.0, 1.0)
 
@@ -108,35 +101,25 @@ class InputServer(threading.Thread):
 
         if host_w == 0 or host_h == 0: return (0.0, 0.0, 1.0, 1.0)
 
-        # 2. Get Stream Resolution
         stream_w = self.sender.output_w
         stream_h = self.sender.output_h
 
         host_aspect = host_w / host_h
         stream_aspect = stream_w / stream_h
 
-        # 3. Calculate "Fit" Rect (Pillarbox or Letterbox)
-        # We assume the game is centered on the host monitor.
-
         if host_aspect > stream_aspect:
-            # Host is wider than game (Pillarbox / Black bars on sides)
-            # The game fills the full height of the host.
+            # Pillarbox
             draw_h = host_h
             draw_w = host_h * stream_aspect
-
-            # Calculate black bar width (one side)
             off_x = (host_w - draw_w) / 2.0
             off_y = 0.0
         else:
-            # Host is taller than game (Letterbox / Black bars on top/bottom)
-            # The game fills the full width of the host.
+            # Letterbox
             draw_w = host_w
             draw_h = host_w / stream_aspect
-
             off_x = 0.0
             off_y = (host_h - draw_h) / 2.0
 
-        # Convert to Normalized Coordinates (0.0 to 1.0 relative to Host Screen)
         bx = off_x / host_w
         by = off_y / host_h
         bw = draw_w / host_w
@@ -151,12 +134,9 @@ class InputServer(threading.Thread):
                 data, _ = self.sock.recvfrom(1024)
                 msg = json.loads(data.decode())
 
-                # 1. Raw Normalized Coords from Receiver (0.0 - 1.0)
-                # This assumes 0,0 is Top-Left of the VIDEO STREAM.
                 rx = msg['x']
                 ry = msg['y']
 
-                # 2. Apply transformations (Rotation/Inversion)
                 if self.sender.input_swap_axes:
                     rx, ry = ry, rx
                 if self.sender.input_invert_x:
@@ -164,23 +144,14 @@ class InputServer(threading.Thread):
                 if self.sender.input_invert_y:
                     ry = 1.0 - ry
 
-                # 3. Map Stream Coords to Host Monitor Coords
-                # If stream is 4:3 and Host is 16:9, rx=0.0 (left of stream)
-                # needs to become roughly 0.125 (left of game window on host).
-
-                # Check flag: only do aspect ratio correction if requested?
-                # For now, we do it automatically if 'fit_screen' is implied or we just do it always.
-                # Assuming automatic is desired:
                 ib_x, ib_y, ib_w, ib_h = self.calculate_input_box()
 
                 final_x = ib_x + (rx * ib_w)
                 final_y = ib_y + (ry * ib_h)
 
-                # 4. Convert to UInput Integers
                 abs_x = int(final_x * 65535)
                 abs_y = int(final_y * 65535)
 
-                # Clamp safety
                 abs_x = max(0, min(65535, abs_x))
                 abs_y = max(0, min(65535, abs_y))
 
@@ -217,7 +188,6 @@ class VkCaptureSender:
         self.receiver_ip = args.receiver_ip
         self.fit_screen = args.fit_screen
 
-        # Input Configuration
         self.input_swap_axes = args.swap_input_axes
         self.input_invert_x = args.invert_input_x
         self.input_invert_y = args.invert_input_y
@@ -232,23 +202,28 @@ class VkCaptureSender:
             try: self.input_box = tuple(map(float, args.input_box.split(',')))
             except: pass
 
-        # Initialize output dims to 0 so InputServer waits for data
+        self.fixed_size = None
+        if args.fixed_size:
+            try: self.fixed_size = tuple(map(int, args.fixed_size.split(',')))
+            except: pass
+
         self.output_w = 0
         self.output_h = 0
 
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.setblocking(True)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         try:
             self.server.bind(SOCKET_PATH)
         except OSError:
-            print("Socket bind failed.")
+            print("Socket bind failed - Address in use?")
             sys.exit(1)
         self.server.listen(1)
 
         self.ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.is_rotated = False
 
-        # Start input server AFTER initializing variables it needs
         self.input_server = InputServer(self)
         self.input_server.start()
 
@@ -295,17 +270,31 @@ class VkCaptureSender:
     def setup_pipeline(self, width, height):
         if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
 
-        # UPDATE: Set these so InputServer can read them
         self.output_w = width
         self.output_h = height
 
         f = Gst.ElementFactory.find
-        if f("nvh265enc"): enc = "nvh265enc preset=low-latency-hq rc-mode=constqp qp-const=20 zerolatency=true"
-        elif f("vaapih265enc"): enc = "videoconvert ! vaapih265enc rate-control=cbr bitrate=10000 keyframe-period=60"
-        elif f("nvh264enc"): enc = "nvh264enc preset=low-latency-hq zerolatency=true bitrate=8000 rc-mode=cbr"
-        else: enc = "videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000"
 
-        payloader = "rtph265pay" if "265" in enc else "rtph264pay"
+        # --- H.264 ENCODER SELECTION ---
+        # Prioritize Nvidia (nvh264enc) first.
+        # If we check 'vaapih264enc' first on an Nvidia system with gstreamer-vaapi installed,
+        # it might try to use it and produce a black screen.
+
+        if f("nvh264enc"):
+            print(" [ENCODER] Using NVIDIA H.264")
+            enc = "nvh264enc preset=low-latency-hq zerolatency=true bitrate=10000 rc-mode=cbr"
+        elif f("vaapih264enc"):
+            print(" [ENCODER] Using VAAPI H.264 (Intel/AMD)")
+            enc = "videoconvert ! vaapih264enc rate-control=cbr bitrate=10000 keyframe-period=60"
+        elif f("x264enc"):
+            print(" [ENCODER] Using CPU H.264 (x264)")
+            enc = "videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000"
+        else:
+            print(" [ERROR] No H.264 encoder found!")
+            sys.exit(1)
+
+        # Force H.264 Payloader
+        payloader = "rtph264pay"
 
         pipeline_str = (
             f"appsrc name=src format=time is-live=true do-timestamp=false ! "
@@ -321,6 +310,7 @@ class VkCaptureSender:
         self.pipeline.set_state(Gst.State.PLAYING)
         self.frame_count = 0
         try:
+            # Send control msg. Note: Receiver might need to restart if it's running a different codec
             msg = json.dumps({"cmd": "resize", "w": width, "h": height}).encode()
             self.ctl_sock.sendto(msg, (self.receiver_ip, 5002))
         except: pass
@@ -360,148 +350,185 @@ class VkCaptureSender:
 
     def loop(self):
         print("--- WAITING FOR GAME ---")
-        while True:
-            conn, _ = self.server.accept()
-            print(" >> Connected")
-            try: conn.send(struct.pack(CTRL_FMT, 1, 0, 1, 1, b'\0'*16))
-            except: conn.close(); continue
-            conn.setblocking(False)
+        try:
+            while True:
+                try:
+                    conn, _ = self.server.accept()
+                except OSError:
+                    break
 
-            current_fd = -1
-            fps_timer = time.time()
-            frames = 0
+                print(" >> Connected")
+                try: conn.send(struct.pack(CTRL_FMT, 1, 0, 1, 1, b'\0'*16))
+                except: conn.close(); continue
+                conn.setblocking(False)
 
-            try:
-                while True:
-                    loop_start = time.time()
-                    glfw.poll_events()
+                current_fd = -1
+                fps_timer = time.time()
+                frames = 0
 
-                    readable, _, _ = select.select([conn], [], [], 0)
-                    if readable:
-                        try:
-                            data, ancdata, _, _ = conn.recvmsg(TEX_SIZE, socket.CMSG_LEN(struct.calcsize('i') * 4))
-                            if not data: break
-                            if data[0] == TYPE_TEXTURE_DATA:
-                                fields = struct.unpack(TEX_FMT, data)
-                                w, h, fmt, stride = fields[2], fields[3], fields[4], fields[5]
-                                mod = fields[13]
-                                fds = []
-                                for c, t, d in ancdata:
-                                    if c == socket.SOL_SOCKET and t == socket.SCM_RIGHTS:
-                                        fds.extend(struct.unpack('i'*(len(d)//4), d))
-                                if fds:
-                                    if current_fd != -1: os.close(current_fd)
-                                    current_fd = fds[0]
+                try:
+                    while True:
+                        loop_start = time.time()
+                        glfw.poll_events()
 
-                                    if self.egl_image:
-                                        self.eglDestroyImageKHR(self.egl_display, self.egl_image)
+                        readable, _, _ = select.select([conn], [], [], 0)
+                        if readable:
+                            try:
+                                data, ancdata, _, _ = conn.recvmsg(TEX_SIZE, socket.CMSG_LEN(struct.calcsize('i') * 4))
+                                if not data: break
+                                if data[0] == TYPE_TEXTURE_DATA:
+                                    fields = struct.unpack(TEX_FMT, data)
+                                    w, h, fmt, stride = fields[2], fields[3], fields[4], fields[5]
+                                    mod = fields[13]
+                                    fds = []
+                                    for c, t, d in ancdata:
+                                        if c == socket.SOL_SOCKET and t == socket.SCM_RIGHTS:
+                                            fds.extend(struct.unpack('i'*(len(d)//4), d))
+                                    if fds:
+                                        if current_fd != -1: os.close(current_fd)
+                                        current_fd = fds[0]
 
-                                    attribs = [
-                                        EGL_WIDTH, w, EGL_HEIGHT, h,
-                                        EGL_LINUX_DRM_FOURCC_EXT, fmt,
-                                        EGL_DMA_BUF_PLANE0_FD_EXT, current_fd,
-                                        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                                        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
-                                        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod & 0xFFFFFFFF,
-                                        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (mod >> 32) & 0xFFFFFFFF,
-                                        EGL_NONE
-                                    ]
-                                    attr = (ctypes.c_int * len(attribs))(*attribs)
-                                    self.egl_image = self.eglCreateImageKHR(self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attr)
+                                        if self.egl_image:
+                                            self.eglDestroyImageKHR(self.egl_display, self.egl_image)
 
-                                    glBindTexture(GL_TEXTURE_2D, self.import_tex)
-                                    self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
+                                        attribs = [
+                                            EGL_WIDTH, w, EGL_HEIGHT, h,
+                                            EGL_LINUX_DRM_FOURCC_EXT, fmt,
+                                            EGL_DMA_BUF_PLANE0_FD_EXT, current_fd,
+                                            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                                            EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+                                            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod & 0xFFFFFFFF,
+                                            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (mod >> 32) & 0xFFFFFFFF,
+                                            EGL_NONE
+                                        ]
+                                        attr = (ctypes.c_int * len(attribs))(*attribs)
+                                        self.egl_image = self.eglCreateImageKHR(self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attr)
 
-                                    target_w, target_h = w, h
-                                    self.is_rotated = False
+                                        glBindTexture(GL_TEXTURE_2D, self.import_tex)
+                                        self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
 
-                                    if w < h:
-                                        print(f" [AUTO] Rotating {w}x{h} -> {h}x{w}")
-                                        target_w, target_h = h, w
-                                        self.is_rotated = True
+                                        content_w, content_h = w, h
+                                        self.is_rotated = False
 
-                                    crop_rect = None
-                                    if self.user_crop:
-                                        ux, uy, uw, uh = self.user_crop
-                                        if ux+uw <= w and uy+uh <= h:
-                                            crop_rect = (ux, uy, uw, uh)
-                                            if not self.is_rotated:
-                                                target_w, target_h = uw, uh
+                                        if w < h:
+                                            print(f" [AUTO] Rotating {w}x{h} -> {h}x{w}")
+                                            content_w, content_h = h, w
+                                            self.is_rotated = True
+
+                                        crop_rect = None
+                                        if self.user_crop:
+                                            ux, uy, uw, uh = self.user_crop
+                                            if ux+uw <= w and uy+uh <= h:
+                                                crop_rect = (ux, uy, uw, uh)
+                                                if not self.is_rotated:
+                                                    content_w, content_h = uw, uh
+                                                else:
+                                                    content_w, content_h = uh, uw
+
+                                        final_w, final_h = content_w, content_h
+
+                                        if self.fixed_size:
+                                            max_w, max_h = self.fixed_size
+                                            aspect = content_w / content_h
+
+                                            if aspect > (max_w / max_h):
+                                                final_w = max_w
+                                                final_h = int(max_w / aspect)
                                             else:
-                                                target_w, target_h = uh, uw
+                                                final_h = max_h
+                                                final_w = int(max_h * aspect)
 
-                                    if self.output_w != target_w or self.output_h != target_h:
-                                        self.setup_fbo(target_w, target_h)
-                                        self.setup_pipeline(target_w, target_h)
+                                            if final_w % 2 != 0: final_w -= 1
+                                            if final_h % 2 != 0: final_h -= 1
 
-                                        q_arr = self.calculate_quad(w, h, crop_rect, rotate=self.is_rotated)
-                                        glBindVertexArray(self.vao)
-                                        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-                                        glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(q_arr), q_arr, GL_STATIC_DRAW)
-                                        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
-                                        glEnableVertexAttribArray(0)
-                                        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
-                                        glEnableVertexAttribArray(1)
+                                        if self.output_w != final_w or self.output_h != final_h:
+                                            print(f" [RESIZE] Output: {final_w}x{final_h} (Source: {content_w}x{content_h})")
+                                            self.setup_fbo(final_w, final_h)
+                                            self.setup_pipeline(final_w, final_h)
 
-                        except Exception as e:
-                            print(f"Socket Error: {e}")
-                            break
+                                            q_arr = self.calculate_quad(w, h, crop_rect, rotate=self.is_rotated)
+                                            glBindVertexArray(self.vao)
+                                            glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+                                            glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(q_arr), q_arr, GL_STATIC_DRAW)
+                                            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+                                            glEnableVertexAttribArray(0)
+                                            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
+                                            glEnableVertexAttribArray(1)
 
-                    if self.appsrc and current_fd != -1 and self.egl_image:
-                        glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
-                        glViewport(0, 0, self.output_w, self.output_h)
-                        glUseProgram(self.shader)
-                        glBindVertexArray(self.vao)
-                        glActiveTexture(GL_TEXTURE0)
-                        glBindTexture(GL_TEXTURE_2D, self.import_tex)
+                            except Exception as e:
+                                print(f"Socket Error: {e}")
+                                break
 
-                        glDrawArrays(GL_TRIANGLES, 0, 6)
-                        glFinish()
+                        if self.appsrc and current_fd != -1 and self.egl_image:
+                            glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
+                            glViewport(0, 0, self.output_w, self.output_h)
+                            glUseProgram(self.shader)
+                            glBindVertexArray(self.vao)
+                            glActiveTexture(GL_TEXTURE0)
+                            glBindTexture(GL_TEXTURE_2D, self.import_tex)
 
-                        glPixelStorei(GL_PACK_ALIGNMENT, 1)
-                        pixels = glReadPixels(0, 0, self.output_w, self.output_h, GL_RGBA, GL_UNSIGNED_BYTE)
-                        buf = Gst.Buffer.new_wrapped(pixels)
+                            glDrawArrays(GL_TRIANGLES, 0, 6)
+                            glFinish()
 
-                        GstVideo.buffer_add_video_meta_full(
-                            buf, GstVideo.VideoFrameFlags.NONE,
-                            GstVideo.VideoFormat.RGBA,
-                            self.output_w, self.output_h,
-                            1,
-                            [0, 0, 0, 0],
-                            [self.output_w * 4, 0, 0, 0]
-                        )
+                            glPixelStorei(GL_PACK_ALIGNMENT, 1)
+                            pixels = glReadPixels(0, 0, self.output_w, self.output_h, GL_RGBA, GL_UNSIGNED_BYTE)
+                            buf = Gst.Buffer.new_wrapped(pixels)
 
-                        pts = self.frame_count * self.duration
-                        buf.pts = pts; buf.dts = pts; buf.duration = self.duration
-                        self.frame_count += 1
+                            GstVideo.buffer_add_video_meta_full(
+                                buf, GstVideo.VideoFrameFlags.NONE,
+                                GstVideo.VideoFormat.RGBA,
+                                self.output_w, self.output_h,
+                                1,
+                                [0, 0, 0, 0],
+                                [self.output_w * 4, 0, 0, 0]
+                            )
 
-                        self.appsrc.emit("push-buffer", buf)
-                        glBindFramebuffer(GL_FRAMEBUFFER, 0)
-                        frames += 1
+                            pts = self.frame_count * self.duration
+                            buf.pts = pts; buf.dts = pts; buf.duration = self.duration
+                            self.frame_count += 1
 
-                    if time.time() - fps_timer > 1.0:
-                        print(f"Sending: {frames} FPS")
-                        frames = 0
-                        fps_timer = time.time()
+                            self.appsrc.emit("push-buffer", buf)
+                            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                            frames += 1
 
-                    elapsed = time.time() - loop_start
-                    if elapsed < FRAME_INTERVAL:
-                        time.sleep(FRAME_INTERVAL - elapsed)
+                        if time.time() - fps_timer > 1.0:
+                            print(f"Sending: {frames} FPS")
+                            frames = 0
+                            fps_timer = time.time()
 
-            finally:
-                if current_fd != -1: os.close(current_fd)
-                conn.close()
-                if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
-                print(" >> Disconnected")
+                        elapsed = time.time() - loop_start
+                        if elapsed < FRAME_INTERVAL:
+                            time.sleep(FRAME_INTERVAL - elapsed)
+
+                finally:
+                    if current_fd != -1: os.close(current_fd)
+                    conn.close()
+                    print(" >> Disconnected")
+
+        except KeyboardInterrupt:
+            print("\nExiting via KeyboardInterrupt...")
+
+        finally:
+            print("Cleaning up resources...")
+            self.server.close()
+
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+
+            if self.egl_image:
+                self.eglDestroyImageKHR(self.egl_display, self.egl_image)
+
+            glfw.terminate()
+            sys.exit(0)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("receiver_ip", nargs="?", help="IP")
     parser.add_argument("--crop", help="x,y,w,h")
     parser.add_argument("--input-box", help="x,y,w,h")
+    parser.add_argument("--fixed-size", help="W,H (e.g. 1280,800) - Fit video within these dims maintaining aspect")
     parser.add_argument("--fit-screen", action="store_true")
 
-    # NEW MANUAL INPUT FLAGS
     parser.add_argument("--swap-input-axes", action="store_true", help="Swap X/Y input axes")
     parser.add_argument("--invert-input-x", action="store_true", help="Invert X input")
     parser.add_argument("--invert-input-y", action="store_true", help="Invert Y input")

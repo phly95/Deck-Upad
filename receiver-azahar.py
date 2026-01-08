@@ -119,9 +119,11 @@ def run_gui_worker():
             self.listen_thread.start()
 
             Gst.init(None)
+
+            # --- UPDATED PIPELINE FOR H.264 ---
             self.pipeline = Gst.parse_launch(
-                f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H265, payload=96\" ! "
-                "rtpjitterbuffer latency=0 ! rtph265depay ! avdec_h265 ! videoconvert ! "
+                f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
+                "rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
                 "queue ! gtksink name=sink sync=false"
             )
 

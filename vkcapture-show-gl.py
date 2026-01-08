@@ -202,50 +202,38 @@ class VkCaptureViewer:
         self.release_buffer()
 
         if not self.fallback_mode and self.eglCreateImageKHR:
-            mod_hi = (modifier >> 32) & 0xFFFFFFFF
-            mod_lo = modifier & 0xFFFFFFFF
             attribs = [
                 EGL_WIDTH, width, EGL_HEIGHT, height,
                 EGL_LINUX_DRM_FOURCC_EXT, fmt,
-                EGL_DMA_BUF_PLANE0_FD_EXT, fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
                 EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
-                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod_lo,
-                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, mod_hi,
-                EGL_NONE
             ]
+
+            # ONLY add modifier if it is valid (not 0x00ffffffffffffff)
+            # DRM_FORMAT_MOD_INVALID is ((1ULL << 56) - 1)
+            if modifier != 0x00ffffffffffffff:
+                mod_hi = (modifier >> 32) & 0xFFFFFFFF
+                mod_lo = modifier & 0xFFFFFFFF
+                attribs.extend([
+                    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod_lo,
+                    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, mod_hi,
+                ])
+
+            attribs.append(EGL_NONE)
+
             attrib_array = (ctypes.c_int * len(attribs))(*attribs)
             self.egl_image = self.eglCreateImageKHR(
                 self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attrib_array
             )
+
             if self.egl_image:
                 glBindTexture(GL_TEXTURE_2D, self.texture_id)
                 self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
                 return
             else:
+                print("EGLImage creation failed. Modifiers might be incompatible.")
                 self.fallback_mode = True
-
-        try:
-            size = os.lseek(fd, 0, os.SEEK_END)
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                self.mapped_buf = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-                self.mapped_ptr = (ctypes.c_ubyte * size).from_buffer(self.mapped_buf)
-            except (OSError, ValueError):
-                self.mapped_buf = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
-                self.mapped_ptr = None
-
-            dma_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
-            glBindTexture(GL_TEXTURE_2D, self.texture_id)
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride // 4)
-
-            ptr = self.mapped_ptr if self.mapped_ptr else self.mapped_buf.read(size)
-            if not self.mapped_ptr: self.mapped_buf.seek(0)
-
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, ptr)
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0)
-            dma_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ)
-        except Exception as e:
-            print(f"Fallback setup error: {e}")
 
     def update_frame_software(self):
         if self.fallback_mode and self.mapped_buf and self.current_fd:

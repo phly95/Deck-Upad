@@ -17,7 +17,8 @@ from OpenGL.GL import shaders
 from OpenGL.EGL import *
 
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gst, GLib, GstVideo
 
 # --- CONFIGURATION ---
 SOCKET_PATH = '\0/com/obsproject/vkcapture'
@@ -29,11 +30,9 @@ TYPE_TEXTURE_DATA = 11
 TARGET_FPS = 60
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
-# FLIP SETTINGS
-# Enable this to fix "Backwards Text" (Horizontal Mirror)
-FLIP_X = True
-# Enable this if the image is Upside Down
-FLIP_Y = False
+# --- VISUAL CORRECTIONS ONLY ---
+FLIP_X = True   # Mirror Horizontal
+FLIP_Y = False  # Mirror Vertical
 
 # EGL Constants
 EGL_LINUX_DMA_BUF_EXT = 0x3270
@@ -73,15 +72,77 @@ class InputServer(threading.Thread):
         self.sender = sender_instance
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 5001))
+
+        # We keep the UInput definition as the full 0-65535 range.
+        # We will restrict the range logically in the loop.
         cap = {
-            ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+            ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE, ecodes.BTN_TOUCH],
             ecodes.EV_ABS: [
                 (ecodes.ABS_X, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)),
                 (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0))
             ]
         }
-        try: self.ui = UInput(cap, name="Stream-Vk-Mouse")
-        except: self.ui = None
+        try:
+            self.ui = UInput(cap, name="Stream-Vk-Touch")
+            print(" [INPUT] Virtual Touch Device Created via UInput")
+        except Exception as e:
+            print(f" [ERROR] UInput Init Failed (Need sudo?): {e}")
+            self.ui = None
+
+    def calculate_input_box(self):
+        """
+        Calculates the active area of the game on the host monitor
+        based on aspect ratio differences.
+        Returns (x_offset, y_offset, width_scale, height_scale) normalized 0.0-1.0
+        """
+        # If we haven't received video frames yet, default to full screen
+        if self.sender.output_w == 0 or self.sender.output_h == 0:
+            return (0.0, 0.0, 1.0, 1.0)
+
+        # 1. Get Host Monitor Resolution
+        monitor = glfw.get_primary_monitor()
+        if not monitor: return (0.0, 0.0, 1.0, 1.0)
+
+        mode = glfw.get_video_mode(monitor)
+        host_w, host_h = mode.size.width, mode.size.height
+
+        if host_w == 0 or host_h == 0: return (0.0, 0.0, 1.0, 1.0)
+
+        # 2. Get Stream Resolution
+        stream_w = self.sender.output_w
+        stream_h = self.sender.output_h
+
+        host_aspect = host_w / host_h
+        stream_aspect = stream_w / stream_h
+
+        # 3. Calculate "Fit" Rect (Pillarbox or Letterbox)
+        # We assume the game is centered on the host monitor.
+
+        if host_aspect > stream_aspect:
+            # Host is wider than game (Pillarbox / Black bars on sides)
+            # The game fills the full height of the host.
+            draw_h = host_h
+            draw_w = host_h * stream_aspect
+
+            # Calculate black bar width (one side)
+            off_x = (host_w - draw_w) / 2.0
+            off_y = 0.0
+        else:
+            # Host is taller than game (Letterbox / Black bars on top/bottom)
+            # The game fills the full width of the host.
+            draw_w = host_w
+            draw_h = host_w / stream_aspect
+
+            off_x = 0.0
+            off_y = (host_h - draw_h) / 2.0
+
+        # Convert to Normalized Coordinates (0.0 to 1.0 relative to Host Screen)
+        bx = off_x / host_w
+        by = off_y / host_h
+        bw = draw_w / host_w
+        bh = draw_h / host_h
+
+        return (bx, by, bw, bh)
 
     def run(self):
         if not self.ui: return
@@ -90,32 +151,56 @@ class InputServer(threading.Thread):
                 data, _ = self.sock.recvfrom(1024)
                 msg = json.loads(data.decode())
 
+                # 1. Raw Normalized Coords from Receiver (0.0 - 1.0)
+                # This assumes 0,0 is Top-Left of the VIDEO STREAM.
                 rx = msg['x']
                 ry = msg['y']
 
-                # Correct input mapping if we are flipping/rotating
-                # If we flip the video X, we must flip the Input X to match
-                if FLIP_X: rx = 1.0 - rx
-                if FLIP_Y: ry = 1.0 - ry
-
-                if self.sender.is_rotated:
-                    # Swap X/Y for Portrait->Landscape mapping
+                # 2. Apply transformations (Rotation/Inversion)
+                if self.sender.input_swap_axes:
                     rx, ry = ry, rx
+                if self.sender.input_invert_x:
+                    rx = 1.0 - rx
+                if self.sender.input_invert_y:
+                    ry = 1.0 - ry
+
+                # 3. Map Stream Coords to Host Monitor Coords
+                # If stream is 4:3 and Host is 16:9, rx=0.0 (left of stream)
+                # needs to become roughly 0.125 (left of game window on host).
+
+                # Check flag: only do aspect ratio correction if requested?
+                # For now, we do it automatically if 'fit_screen' is implied or we just do it always.
+                # Assuming automatic is desired:
+                ib_x, ib_y, ib_w, ib_h = self.calculate_input_box()
+
+                final_x = ib_x + (rx * ib_w)
+                final_y = ib_y + (ry * ib_h)
+
+                # 4. Convert to UInput Integers
+                abs_x = int(final_x * 65535)
+                abs_y = int(final_y * 65535)
+
+                # Clamp safety
+                abs_x = max(0, min(65535, abs_x))
+                abs_y = max(0, min(65535, abs_y))
 
                 if msg['type'] == 'move':
-                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, int(rx * 65535))
-                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, int(ry * 65535))
+                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
+                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
                     self.ui.syn()
                 elif msg['type'] in ['press', 'release']:
                     btn = ecodes.BTN_LEFT
-                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, int(rx * 65535))
-                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, int(ry * 65535))
-                    self.ui.write(ecodes.EV_KEY, btn, 1 if msg['type'] == 'press' else 0)
+                    val = 1 if msg['type'] == 'press' else 0
+                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
+                    self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
+                    self.ui.write(ecodes.EV_KEY, btn, val)
+                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, val)
                     self.ui.syn()
-            except: pass
+            except Exception as e:
+                pass
 
 class VkCaptureSender:
-    def __init__(self, receiver_ip, crop_arg=None):
+    def __init__(self, args):
         Gst.init(None)
         if not glfw.init(): raise Exception("GLFW init failed")
 
@@ -129,11 +214,27 @@ class VkCaptureSender:
         self.window = glfw.create_window(1, 1, "StreamHost", None, None)
         glfw.make_context_current(self.window)
 
-        self.receiver_ip = receiver_ip
+        self.receiver_ip = args.receiver_ip
+        self.fit_screen = args.fit_screen
+
+        # Input Configuration
+        self.input_swap_axes = args.swap_input_axes
+        self.input_invert_x = args.invert_input_x
+        self.input_invert_y = args.invert_input_y
+
         self.user_crop = None
-        if crop_arg:
-            try: self.user_crop = tuple(map(int, crop_arg.split(',')))
+        if args.crop:
+            try: self.user_crop = tuple(map(int, args.crop.split(',')))
             except: pass
+
+        self.input_box = (0.0, 0.0, 1.0, 1.0)
+        if args.input_box:
+            try: self.input_box = tuple(map(float, args.input_box.split(',')))
+            except: pass
+
+        # Initialize output dims to 0 so InputServer waits for data
+        self.output_w = 0
+        self.output_h = 0
 
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.setblocking(True)
@@ -145,6 +246,9 @@ class VkCaptureSender:
         self.server.listen(1)
 
         self.ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.is_rotated = False
+
+        # Start input server AFTER initializing variables it needs
         self.input_server = InputServer(self)
         self.input_server.start()
 
@@ -155,9 +259,6 @@ class VkCaptureSender:
         self.appsrc = None
         self.frame_count = 0
         self.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, TARGET_FPS)
-        self.output_w = 0
-        self.output_h = 0
-        self.is_rotated = False
         self.egl_image = None
 
     def init_gl(self):
@@ -193,46 +294,28 @@ class VkCaptureSender:
 
     def setup_pipeline(self, width, height):
         if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
+
+        # UPDATE: Set these so InputServer can read them
         self.output_w = width
         self.output_h = height
 
         f = Gst.ElementFactory.find
+        if f("nvh265enc"): enc = "nvh265enc preset=low-latency-hq rc-mode=constqp qp-const=20 zerolatency=true"
+        elif f("vaapih265enc"): enc = "videoconvert ! vaapih265enc rate-control=cbr bitrate=10000 keyframe-period=60"
+        elif f("nvh264enc"): enc = "nvh264enc preset=low-latency-hq zerolatency=true bitrate=8000 rc-mode=cbr"
+        else: enc = "videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000"
 
-        # --- ENCODER SELECTION ---
-        # We switch to Constant Quality (QP) mode for sharper images.
-        # Lower QP = Higher Quality (and higher bandwidth).
-        # QP 20 is a "Visually Lossless" sweet spot for gaming.
-
-        if f("nvh264enc"):
-            # NVIDIA GPU
-            # rc-mode=constqp: Constant Quantization Parameter
-            # qp-const=20: High quality
-            # preset=low-latency-hq: Better quality than just 'default'
-            enc = "nvh264enc preset=low-latency-hq rc-mode=constqp qp-const=20 zerolatency=true"
-
-        elif f("vaapih264enc"):
-            # INTEL / AMD GPU
-            # AMD VAAPI drivers sometimes struggle with CQP, so we fallback to a massive bitrate (15Mbps)
-            # If your driver supports it, you can try 'rate-control=cqp'
-            enc = "videoconvert ! vaapih264enc rate-control=cbr bitrate=15000 keyframe-period=60"
-
-        else:
-            # SOFTWARE (x264)
-            # pass=qual: Constant Quality mode
-            # quantizer=20: The quality target (lower is better)
-            # speed-preset=superfast: Slightly better than ultrafast, minimal latency cost
-            enc = "videoconvert ! x264enc tune=zerolatency speed-preset=superfast pass=qual quantizer=20 key-int-max=60"
-
-        # NOTE: We force 'videoconvert' for x264/vaapi to ensure colorspace compatibility (RGBA -> YUV420)
+        payloader = "rtph265pay" if "265" in enc else "rtph264pay"
 
         pipeline_str = (
             f"appsrc name=src format=time is-live=true do-timestamp=false ! "
             f"video/x-raw,format=RGBA,width={width},height={height},framerate={TARGET_FPS}/1 ! "
-            f"{enc} ! rtph264pay config-interval=1 pt=96 ! "
+            f"videoconvert ! video/x-raw,format=NV12 ! "
+            f"{enc} ! {payloader} config-interval=1 pt=96 ! "
             f"udpsink host={self.receiver_ip} port=5000 sync=false"
         )
 
-        print(f" [PIPELINE] Starting {width}x{height} RGBA")
+        print(f" [PIPELINE] Starting {width}x{height} RGBA->NV12 via {payloader}")
         self.pipeline = Gst.parse_launch(pipeline_str)
         self.appsrc = self.pipeline.get_by_name("src")
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -242,33 +325,29 @@ class VkCaptureSender:
             self.ctl_sock.sendto(msg, (self.receiver_ip, 5002))
         except: pass
 
-    def calculate_quad(self, tex_w, tex_h, crop, rotate=False):
-        cx, cy, cw, ch = crop
-        u0 = cx / tex_w; v0 = cy / tex_h
-        u1 = (cx + cw) / tex_w; v1 = (cy + ch) / tex_h
+    def calculate_quad(self, w, h, crop, rotate=False):
+        u0, v0 = 0.0, 0.0
+        u1, v1 = 1.0, 1.0
+
+        if crop:
+            cx, cy, cw, ch = crop
+            u0 = cx / w; v0 = cy / h
+            u1 = (cx + cw) / w; v1 = (cy + ch) / h
 
         if rotate:
-            # 90 Deg Rotation (Source V -> Output X, Source U -> Output Y)
-            # If Flipping X (Horizontal): Swap Source Vs
-            # If Flipping Y (Vertical):   Swap Source Us
             if FLIP_X: v0, v1 = v1, v0
             if FLIP_Y: u0, u1 = u1, u0
-
             data = [
-                -1.0, -1.0, u1, v1, # BL -> Source Bottom-Left (u1, v1)
-                 1.0, -1.0, u1, v0, # BR -> Source Top-Left    (u1, v0)
-                 1.0,  1.0, u0, v0, # TR -> Source Top-Right   (u0, v0)
+                -1.0, -1.0, u1, v1,
+                 1.0, -1.0, u1, v0,
+                 1.0,  1.0, u0, v0,
                 -1.0, -1.0, u1, v1,
                  1.0,  1.0, u0, v0,
-                -1.0,  1.0, u0, v1  # TL -> Source Bottom-Right(u0, v1)
+                -1.0,  1.0, u0, v1
             ]
         else:
-            # Standard (Source U -> Output X, Source V -> Output Y)
-            # If Flipping X: Swap Source Us
-            # If Flipping Y: Swap Source Vs
             if FLIP_X: u0, u1 = u1, u0
             if FLIP_Y: v0, v1 = v1, v0
-
             data = [
                 -1.0, -1.0, u0, v1,
                  1.0, -1.0, u1, v1,
@@ -289,8 +368,6 @@ class VkCaptureSender:
             conn.setblocking(False)
 
             current_fd = -1
-            tex_w = 0; tex_h = 0
-
             fps_timer = time.time()
             frames = 0
 
@@ -332,36 +409,32 @@ class VkCaptureSender:
                                     attr = (ctypes.c_int * len(attribs))(*attribs)
                                     self.egl_image = self.eglCreateImageKHR(self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attr)
 
-                                    if not self.egl_image:
-                                        print(" [GL] Failed to create EGL Image")
-                                        break
-
                                     glBindTexture(GL_TEXTURE_2D, self.import_tex)
                                     self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
 
-                                    aligned_w = stride // 4
+                                    target_w, target_h = w, h
+                                    self.is_rotated = False
 
-                                    fx=0; fy=0; fw=w; fh=h
+                                    if w < h:
+                                        print(f" [AUTO] Rotating {w}x{h} -> {h}x{w}")
+                                        target_w, target_h = h, w
+                                        self.is_rotated = True
+
+                                    crop_rect = None
                                     if self.user_crop:
                                         ux, uy, uw, uh = self.user_crop
                                         if ux+uw <= w and uy+uh <= h:
-                                            fx=ux; fy=uy; fw=uw; fh=uh
+                                            crop_rect = (ux, uy, uw, uh)
+                                            if not self.is_rotated:
+                                                target_w, target_h = uw, uh
+                                            else:
+                                                target_w, target_h = uh, uw
 
-                                    # AUTO-ROTATION LOGIC
-                                    target_w, target_h = fw, fh
-                                    self.is_rotated = False
-
-                                    if fw < fh:
-                                        print(f" [AUTO] Detected Portrait ({fw}x{fh}). Rotating to Landscape ({fh}x{fw}).")
-                                        target_w, target_h = fh, fw
-                                        self.is_rotated = True
-
-                                    if self.output_w != target_w or self.output_h != target_h or tex_w != aligned_w:
-                                        tex_w = aligned_w; tex_h = h
+                                    if self.output_w != target_w or self.output_h != target_h:
                                         self.setup_fbo(target_w, target_h)
                                         self.setup_pipeline(target_w, target_h)
 
-                                        q_arr = self.calculate_quad(tex_w, h, (fx, fy, fw, fh), rotate=self.is_rotated)
+                                        q_arr = self.calculate_quad(w, h, crop_rect, rotate=self.is_rotated)
                                         glBindVertexArray(self.vao)
                                         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
                                         glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(q_arr), q_arr, GL_STATIC_DRAW)
@@ -385,9 +458,19 @@ class VkCaptureSender:
                         glDrawArrays(GL_TRIANGLES, 0, 6)
                         glFinish()
 
+                        glPixelStorei(GL_PACK_ALIGNMENT, 1)
                         pixels = glReadPixels(0, 0, self.output_w, self.output_h, GL_RGBA, GL_UNSIGNED_BYTE)
-
                         buf = Gst.Buffer.new_wrapped(pixels)
+
+                        GstVideo.buffer_add_video_meta_full(
+                            buf, GstVideo.VideoFrameFlags.NONE,
+                            GstVideo.VideoFormat.RGBA,
+                            self.output_w, self.output_h,
+                            1,
+                            [0, 0, 0, 0],
+                            [self.output_w * 4, 0, 0, 0]
+                        )
+
                         pts = self.frame_count * self.duration
                         buf.pts = pts; buf.dts = pts; buf.duration = self.duration
                         self.frame_count += 1
@@ -415,6 +498,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("receiver_ip", nargs="?", help="IP")
     parser.add_argument("--crop", help="x,y,w,h")
+    parser.add_argument("--input-box", help="x,y,w,h")
+    parser.add_argument("--fit-screen", action="store_true")
+
+    # NEW MANUAL INPUT FLAGS
+    parser.add_argument("--swap-input-axes", action="store_true", help="Swap X/Y input axes")
+    parser.add_argument("--invert-input-x", action="store_true", help="Invert X input")
+    parser.add_argument("--invert-input-y", action="store_true", help="Invert Y input")
+
     args = parser.parse_args()
+
     target_ip = args.receiver_ip if args.receiver_ip else input("IP: ").strip()
-    VkCaptureSender(target_ip, args.crop).loop()
+    VkCaptureSender(args).loop()

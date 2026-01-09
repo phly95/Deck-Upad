@@ -14,7 +14,7 @@ from OpenGL.GL import shaders
 from OpenGL.EGL import *
 
 # --- Constants ---
-SOCKET_PATH = '\0/com/obsproject/vkcapture'
+SOCKET_PATH = '\0/com/DeckUpad/video'
 TEX_FMT = '<BBiii4i4iQIBI65x'
 TEX_SIZE = 128
 # Handshake: capturing(1), no_mods(0), linear(1), map_host(0)

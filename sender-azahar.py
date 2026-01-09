@@ -21,7 +21,7 @@ gi.require_version('GstVideo', '1.0')
 from gi.repository import Gst, GLib, GstVideo
 
 # --- CONFIGURATION ---
-SOCKET_PATH = '\0/com/obsproject/vkcapture'
+SOCKET_PATH = '\0/com/DeckUpad/video'
 TEX_FMT = '<BBiii4i4iQIBI65x'
 CTRL_FMT = '<BBBB16s12x'
 TEX_SIZE = 128

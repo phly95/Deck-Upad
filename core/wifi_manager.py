@@ -32,6 +32,11 @@ class WifiManager:
     def __init__(self):
         self.wifi_interface = self._get_active_wifi_interface()
         self.eth_interface = self._get_host_upstream_interface()
+
+        # Ensure we don't try to use the WiFi card as the Ethernet WAN
+        if self.eth_interface == self.wifi_interface:
+            self.eth_interface = None
+
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
         self.moved_eth = False
         self.check_root()
@@ -47,7 +52,7 @@ class WifiManager:
         Sets up the device as a Router (AP).
         Moves Ethernet to container for WAN (if available).
         """
-        print(f"[WifiManager] Starting HOST mode (AP: {ssid})...")
+        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Channel: {channel})...")
         self._initialize_container()
 
         # 1. Move WiFi Card to Container
@@ -80,7 +85,6 @@ class WifiManager:
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self._run_command(f"ip link delete {VETH_HOST}", check=False)
 
-        # Remove Firewall ports
         if shutil.which("firewall-cmd"):
             try:
                 self._run_command(f"firewall-cmd --remove-port={FWD_PORT_RANGE}/udp", check=False)
@@ -125,8 +129,10 @@ class WifiManager:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
-                # Re-raise with clearer context if needed
-                print(f"Command failed: {cmd}\nStderr: {e.stderr}")
+                # IMPROVED ERROR LOGGING: Print stdout as well
+                print(f"Command failed: {cmd}")
+                print(f"Stdout: {e.stdout}")
+                print(f"Stderr: {e.stderr}")
                 raise e
             return None
 
@@ -141,12 +147,10 @@ class WifiManager:
 
     def _get_active_wifi_interface(self):
         try:
-            # Try nmcli first
             output = self._run_command("nmcli -t -f DEVICE,TYPE,STATE device", check=False)
             if output:
                 for line in output.split('\n'):
                     if ":wifi:" in line: return line.split(':')[0]
-            # Fallback to iw
             output = self._run_command("iw dev | grep Interface", shell=True, check=False)
             if output: return output.split()[-1]
         except: pass
@@ -155,30 +159,43 @@ class WifiManager:
     def _initialize_container(self):
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # Check if custom image exists
-        use_image = CUSTOM_IMAGE if self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False) else BASE_IMAGE
+        # 1. Build Image if missing (Requires Internet)
+        if not self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
+            print(f"[WifiManager] Image '{CUSTOM_IMAGE}' not found. Building from '{BASE_IMAGE}'...")
+            builder_name = f"{CONTAINER_NAME}-builder"
+            self._run_command(f"podman rm -f {builder_name}", check=False)
+            self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
 
+            try:
+                # CHANGED: Replaced 'rfkill' with 'util-linux' which contains the tool
+                pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
+                print("   Installing dependencies (this may take a moment)...")
+                self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
+
+                print(f"   Committing to {CUSTOM_IMAGE}...")
+                self._run_command(f"podman commit {builder_name} {CUSTOM_IMAGE}")
+            except Exception as e:
+                print(f"[ERROR] Build failed: {e}")
+                self._run_command(f"podman stop {builder_name}", check=False)
+                raise e
+            finally:
+                self._run_command(f"podman rm -f {builder_name}", check=False)
+
+        # 2. Start Runtime Container (Isolated Network)
+        print(f"[WifiManager] Starting container '{CONTAINER_NAME}'...")
         podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
             "--net=none "
             "--sysctl net.ipv4.ip_forward=1 "
-            f"{use_image} sleep infinity"
+            f"{CUSTOM_IMAGE} sleep infinity"
         )
         self._run_command(podman_run)
 
-        # Performance tuning (Real-Time)
         try:
             ctr_pid = self._run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
             self._run_command(f"chrt -f -p 99 {ctr_pid}", check=False)
         except: pass
-
-        # Install tools if using base image
-        if use_image == BASE_IMAGE:
-            print("[WifiManager] Building tools image...")
-            pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd"
-            self._run_command(f"podman exec {CONTAINER_NAME} apk add --no-cache {pkgs}")
-            self._run_command(f"podman commit {CONTAINER_NAME} {CUSTOM_IMAGE}")
 
     def _move_wifi_card(self):
         phy = "phy0"
@@ -198,7 +215,6 @@ class WifiManager:
             raise Exception(f"Failed to move {phy} to container. Is wpa_supplicant holding it? {e}")
 
         time.sleep(1)
-        # Rename inside container to wlan0 for consistency
         try:
             iw_out = self._run_command(f"{self.exec_cmd} 'iw dev'", check=False)
             found_iface = None
@@ -224,7 +240,7 @@ class WifiManager:
     # --- Mode Specific Logic ---
 
     def _setup_ap_logic(self, ssid, password, channel, ctr_pid):
-        # 1. Handle WAN (Ethernet)
+        # 1. Handle WAN (Ethernet/USB Tether)
         has_wan = self._move_ethernet_card(ctr_pid)
         wan_iface = self.eth_interface if has_wan else "eth0"
 
@@ -257,25 +273,37 @@ class WifiManager:
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
         # 5. Start Hostapd
+        # Config tailored based on channel (2.4GHz vs 5GHz)
+        hw_mode = "a" if int(channel) > 14 else "g"
+
         hostapd_conf = f"""interface=wlan0
 bridge=br0
 ssid={ssid}
 country_code=US
-hw_mode=a
+hw_mode={hw_mode}
 channel={channel}
 wmm_enabled=1
 ieee80211n=1
 ieee80211ac=1
-ieee80211ax=1
 wpa=2
 wpa_passphrase={password}
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
+
+        # Only add AX (WiFi 6) and VHT (AC) if 5GHz
+        if hw_mode == "a":
+             hostapd_conf += "\nieee80211ax=1"
+
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
+        # FIX: Enforce Regulatory Domain to unlock 5GHz channels
+        self._run_command(f"{self.exec_cmd} 'iw reg set US'", check=False)
+        time.sleep(1) # Give the driver a moment to update
+
+        # FIX: Unblock Radio
+        self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
 
-        # AQM / Optimization
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
         self._run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
@@ -289,7 +317,6 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
     def _setup_client_logic(self, ssid, password, ctr_pid):
-        # 1. Setup Link to Host
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self._run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
@@ -299,7 +326,6 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
         self._run_command(f"nmcli connection up {NM_CONN_NAME}")
 
-        # 2. Connect to WiFi
         wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
 update_config=1
 country=US
@@ -309,33 +335,29 @@ network={{
 }}
 """
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=wpa_conf)
+        # FIX: Unblock Radio
+        self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
 
         self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
 
-        # Wait for connection
         for _ in range(15):
             status = self._run_command(f"{self.exec_cmd} 'wpa_cli status'", check=False)
             if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
 
-        # 3. DHCP on wlan0
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
         try: self._run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
         except: pass
 
-        # 4. Port Forwarding (Sledgehammer)
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
-        # Forward everything from Container LAN -> WiFi
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
-        # DNAT: Send all traffic hitting WiFi IP on ports 2000+ to the Host IP
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
 
-        # 5. Avahi/DBus
         self._run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
         self._run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
         self._run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
@@ -355,7 +377,6 @@ network={{
         self._run_command(f"{self.exec_cmd} 'ip link set {self.eth_interface} up'")
         time.sleep(2)
 
-        # DHCP on Ethernet inside container
         try:
             subprocess.run(shlex.split(f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"),
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)

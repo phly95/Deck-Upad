@@ -10,10 +10,12 @@ class HostService:
         self.running = True
         self.server_socket = None
 
-    def start(self, ssid, password):
-        print(f"[HostService] Initializing WiFi Bridge (SSID: {ssid})...")
+    # UPDATED: Added channel argument
+    def start(self, ssid, password, channel=165):
+        print(f"[HostService] Initializing WiFi Bridge (SSID: {ssid}, Channel: {channel})...")
         try:
-            self.wifi.start_host_mode(ssid=ssid, password=password)
+            # UPDATED: Passing channel to wifi manager
+            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel)
         except Exception as e:
             print(f"[CRITICAL] Failed to start WiFi: {e}")
             self.stop()
@@ -24,7 +26,6 @@ class HostService:
         self.run_server()
 
     def run_server(self):
-        # We listen on the internal bridge IP (192.168.50.2)
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -40,7 +41,6 @@ class HostService:
                 conn, addr = self.server_socket.accept()
                 print(f"\n[>>> CONNECTION DETECTED] From: {addr}")
 
-                # Receive Handshake
                 data = conn.recv(1024).decode().strip()
                 print(f"      Payload: {data}")
 

@@ -10,12 +10,12 @@ class HostService:
         self.running = True
         self.server_socket = None
 
-    # UPDATED: Added channel argument
-    def start(self, ssid, password, channel=165):
-        print(f"[HostService] Initializing WiFi Bridge (SSID: {ssid}, Channel: {channel})...")
+    # UPDATED: Accept wifi_mode
+    def start(self, ssid, password, channel=165, wifi_mode="ax"):
+        print(f"[HostService] Initializing WiFi Bridge (SSID: {ssid}, Ch: {channel}, Mode: {wifi_mode})...")
         try:
-            # UPDATED: Passing channel to wifi manager
-            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel)
+            # Pass it along
+            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode)
         except Exception as e:
             print(f"[CRITICAL] Failed to start WiFi: {e}")
             self.stop()

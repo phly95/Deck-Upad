@@ -3,7 +3,6 @@ import argparse
 import sys
 import signal
 
-# Import our new services
 from services.host_daemon import HostService
 from services.client_agent import ClientService
 
@@ -12,8 +11,11 @@ def main():
     parser.add_argument("--role", choices=["host", "client"], required=True, help="Run as Host (PC) or Client (Deck)")
     parser.add_argument("--ssid", default="DeckUpad", help="SSID for P2P connection")
     parser.add_argument("--password", default="DeckUpad123", help="Password for P2P connection")
-    # UPDATED: Added channel argument
     parser.add_argument("--channel", default=165, type=int, help="WiFi Channel (Default: 165)")
+
+    # NEW ARGUMENT: WiFi Mode
+    parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax",
+                        help="WiFi Standard: n (Legacy), ac (WiFi 5), ax (WiFi 6/Default)")
 
     args = parser.parse_args()
 
@@ -30,8 +32,8 @@ def main():
     if args.role == "host":
         print("--- LAUNCHING HOST DAEMON ---")
         service = HostService()
-        # UPDATED: Passing channel arg
-        service.start(ssid=args.ssid, password=args.password, channel=args.channel)
+        # Pass the new argument
+        service.start(ssid=args.ssid, password=args.password, channel=args.channel, wifi_mode=args.wifi_mode)
     else:
         print("--- LAUNCHING CLIENT AGENT ---")
         service = ClientService()

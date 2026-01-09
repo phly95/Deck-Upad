@@ -47,19 +47,18 @@ class WifiManager:
 
     # --- Public API ---
 
-    def start_host_mode(self, ssid, password, channel=165):
+    def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax"):
         """
         Sets up the device as a Router (AP).
-        Moves Ethernet to container for WAN (if available).
         """
-        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Channel: {channel})...")
+        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Channel: {channel}, Mode: {wifi_mode})...")
         self._initialize_container()
 
         # 1. Move WiFi Card to Container
         ctr_pid = self._move_wifi_card()
 
         # 2. Setup AP Logic
-        self._setup_ap_logic(ssid, password, channel, ctr_pid)
+        self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode)
         print("[WifiManager] Host Mode Ready.")
 
     def start_client_mode(self, ssid, password):
@@ -239,7 +238,7 @@ class WifiManager:
 
     # --- Mode Specific Logic ---
 
-    def _setup_ap_logic(self, ssid, password, channel, ctr_pid):
+    def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode="ax"):
         # 1. Handle WAN (Ethernet/USB Tether)
         has_wan = self._move_ethernet_card(ctr_pid)
         wan_iface = self.eth_interface if has_wan else "eth0"
@@ -273,8 +272,19 @@ class WifiManager:
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
         # 5. Start Hostapd
-        # Config tailored based on channel (2.4GHz vs 5GHz)
-        hw_mode = "a" if int(channel) > 14 else "g"
+        is_5ghz = int(channel) > 14
+        hw_mode = "a" if is_5ghz else "g"
+
+        # Determine capabilities based on mode and frequency
+        # Note: ac/ax are only valid in 5GHz (hw_mode=a)
+        enable_ac = 0
+        enable_ax = 0
+
+        if is_5ghz:
+            if wifi_mode in ["ac", "ax"]:
+                enable_ac = 1
+            if wifi_mode == "ax":
+                enable_ax = 1
 
         hostapd_conf = f"""interface=wlan0
 bridge=br0
@@ -284,16 +294,13 @@ hw_mode={hw_mode}
 channel={channel}
 wmm_enabled=1
 ieee80211n=1
-ieee80211ac=1
+ieee80211ac={enable_ac}
+ieee80211ax={enable_ax}
 wpa=2
 wpa_passphrase={password}
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
-
-        # Only add AX (WiFi 6) and VHT (AC) if 5GHz
-        if hw_mode == "a":
-             hostapd_conf += "\nieee80211ax=1"
 
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
         # FIX: Enforce Regulatory Domain to unlock 5GHz channels

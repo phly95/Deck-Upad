@@ -12,8 +12,6 @@ def main():
     parser.add_argument("--ssid", default="DeckUpad", help="SSID for P2P connection")
     parser.add_argument("--password", default="DeckUpad123", help="Password for P2P connection")
     parser.add_argument("--channel", default=165, type=int, help="WiFi Channel (Default: 165)")
-
-    # NEW ARGUMENT: WiFi Mode
     parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax",
                         help="WiFi Standard: n (Legacy), ac (WiFi 5), ax (WiFi 6/Default)")
 
@@ -32,7 +30,6 @@ def main():
     if args.role == "host":
         print("--- LAUNCHING HOST DAEMON ---")
         service = HostService()
-        # Pass the new argument
         service.start(ssid=args.ssid, password=args.password, channel=args.channel, wifi_mode=args.wifi_mode)
     else:
         print("--- LAUNCHING CLIENT AGENT ---")

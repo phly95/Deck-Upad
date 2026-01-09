@@ -3,26 +3,34 @@ import time
 import sys
 import threading
 from core.wifi_manager import WifiManager, HOST_LAN_IP
+from core.usbip_manager import UsbIpManager
 
 class HostService:
     def __init__(self):
         self.wifi = WifiManager()
+        self.usbip = UsbIpManager()
         self.running = True
         self.server_socket = None
 
-    # UPDATED: Accept wifi_mode
     def start(self, ssid, password, channel=165, wifi_mode="ax"):
-        print(f"[HostService] Initializing WiFi Bridge (SSID: {ssid}, Ch: {channel}, Mode: {wifi_mode})...")
+        # 1. Start WiFi
+        print(f"[HostService] Initializing WiFi Bridge...")
         try:
-            # Pass it along
             self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode)
         except Exception as e:
-            print(f"[CRITICAL] Failed to start WiFi: {e}")
+            print(f"[CRITICAL] WiFi Failed: {e}")
             self.stop()
             sys.exit(1)
 
-        print(f"[HostService] Network Ready. Host IP: {HOST_LAN_IP}")
-        print("[HostService] Waiting for Deck connection...")
+        # 2. Start USBIP Receiver
+        try:
+            self.usbip.start_receiver_mode()
+        except Exception as e:
+            print(f"[CRITICAL] USBIP Receiver Failed: {e}")
+            self.stop()
+            sys.exit(1)
+
+        print(f"[HostService] Ready. Host IP: {HOST_LAN_IP}")
         self.run_server()
 
     def run_server(self):
@@ -32,28 +40,36 @@ class HostService:
             self.server_socket.bind((HOST_LAN_IP, 5555))
             self.server_socket.listen(1)
         except OSError as e:
-            print(f"[Error] Could not bind to {HOST_LAN_IP}:5555. {e}")
+            print(f"[Error] Bind failed: {e}")
             self.stop()
             return
 
         while self.running:
             try:
                 conn, addr = self.server_socket.accept()
-                print(f"\n[>>> CONNECTION DETECTED] From: {addr}")
+                client_ip = addr[0]
+                print(f"\n[>>> CONNECTION] From: {client_ip}")
 
                 data = conn.recv(1024).decode().strip()
                 print(f"      Payload: {data}")
 
-                if data == "HELLO_FROM_DECK":
+                response = "ACK_UNKNOWN"
+
+                if data.startswith("HELLO_FROM_DECK"):
                     response = "ACK_AUTHORIZED"
-                    print("      Status: Authorized. Sending ACK.")
-                else:
-                    response = "ACK_UNKNOWN"
-                    print("      Status: Unknown Client.")
+
+                    # Parse USB Bus ID
+                    if "|BUS_ID:" in data:
+                        bus_id = data.split("|BUS_ID:")[1]
+                        print(f"      Deck requested input attach: Bus {bus_id}")
+
+                        # Run attach in background so we don't block the socket reply
+                        threading.Thread(target=self.usbip.connect_device, args=(client_ip, bus_id)).start()
+                    else:
+                        print("      No controller info provided.")
 
                 conn.send(response.encode())
                 conn.close()
-                print("[HostService] Connection closed. Listening for next...")
 
             except KeyboardInterrupt:
                 self.stop()
@@ -63,7 +79,7 @@ class HostService:
 
     def stop(self):
         self.running = False
-        if self.server_socket:
-            self.server_socket.close()
+        if self.server_socket: self.server_socket.close()
+        self.usbip.cleanup()
         self.wifi.cleanup()
         print("[HostService] Stopped.")

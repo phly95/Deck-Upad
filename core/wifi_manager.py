@@ -50,8 +50,9 @@ class WifiManager:
     def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax"):
         """
         Sets up the device as a Router (AP).
+        wifi_mode: 'n' (Legacy), 'ac' (WiFi 5), 'ax' (WiFi 6)
         """
-        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Channel: {channel}, Mode: {wifi_mode})...")
+        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Ch: {channel}, Mode: {wifi_mode})...")
         self._initialize_container()
 
         # 1. Move WiFi Card to Container
@@ -76,9 +77,6 @@ class WifiManager:
         print("[WifiManager] Client Mode Ready.")
 
     def cleanup(self):
-        """
-        Destroys container and restores network interfaces.
-        """
         print("[WifiManager] Cleaning up...")
         self._run_command(f"nmcli connection down {NM_CONN_NAME}", check=False)
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
@@ -105,15 +103,6 @@ class WifiManager:
                 self._run_command(f"nmcli device connect {self.eth_interface}", check=False)
             except: pass
 
-    def get_container_ip(self, iface="wlan0"):
-        try:
-            out = self._run_command(f"{self.exec_cmd} 'ip -4 addr show {iface}'", check=False)
-            if out:
-                match = re.search(r"inet\s+([0-9.]+)/", out)
-                if match: return match.group(1)
-        except: pass
-        return None
-
     # --- Internal Helpers ---
 
     def _run_command(self, cmd, shell=False, check=True, input=None, timeout=None):
@@ -128,10 +117,7 @@ class WifiManager:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
-                # IMPROVED ERROR LOGGING: Print stdout as well
-                print(f"Command failed: {cmd}")
-                print(f"Stdout: {e.stdout}")
-                print(f"Stderr: {e.stderr}")
+                print(f"Command failed: {cmd}\nStdout: {e.stdout}\nStderr: {e.stderr}")
                 raise e
             return None
 
@@ -166,7 +152,7 @@ class WifiManager:
             self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
 
             try:
-                # CHANGED: Replaced 'rfkill' with 'util-linux' which contains the tool
+                # util-linux contains rfkill
                 pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
                 print("   Installing dependencies (this may take a moment)...")
                 self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
@@ -224,22 +210,31 @@ class WifiManager:
             if found_iface and found_iface != "wlan0":
                 self._run_command(f"{self.exec_cmd} 'ip link set {found_iface} name wlan0'")
         except: pass
-
         return ctr_pid
 
     def _open_host_ports(self):
+        # 1. Fedora / RHEL / Bazzite (Firewalld)
         if shutil.which("firewall-cmd"):
             try:
+                self._run_command(f"firewall-cmd --zone=trusted --add-interface={VETH_HOST}", check=False)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/udp", check=False)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/tcp", check=False)
                 self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/udp", check=False)
                 self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/tcp", check=False)
             except: pass
 
+        # 2. Ubuntu / Debian / Tuxedo (UFW)
+        elif shutil.which("ufw"):
+            try:
+                self._run_command(f"ufw allow in on {VETH_HOST}", check=False)
+                self._run_command(f"ufw allow out on {VETH_HOST}", check=False)
+                self._run_command(f"ufw allow from 192.168.50.0/24", check=False)
+                self._run_command(f"ufw allow from 10.13.13.0/24", check=False)
+            except: pass
+
     # --- Mode Specific Logic ---
 
     def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode="ax"):
-        # 1. Handle WAN (Ethernet/USB Tether)
         has_wan = self._move_ethernet_card(ctr_pid)
         wan_iface = self.eth_interface if has_wan else "eth0"
 
@@ -253,14 +248,18 @@ class WifiManager:
         self._run_command(f"{self.exec_cmd} 'brctl addif br0 {VETH_CTR}'")
         self._run_command(f"{self.exec_cmd} 'ip addr add {ROUTER_LAN_IP}/24 dev br0'")
 
-        # 3. Connect Host to Bridge
+        # 3. Connect Host to Bridge (Manual IP Config to bypass NetworkManager issues)
         self._run_command(f"ip link set {VETH_HOST} up")
+        self._run_command(f"nmcli device set {VETH_HOST} managed no", check=False)
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
-        nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
-                  f"ip4 {HOST_LAN_IP}/24 gw4 {ROUTER_LAN_IP} connection.zone trusted "
-                  f"ipv4.route-metric 20 ipv4.dns '8.8.8.8' ipv4.ignore-auto-dns yes")
-        self._run_command(nm_cmd)
-        self._run_command(f"nmcli connection up {NM_CONN_NAME}")
+
+        self._run_command(f"ip addr flush dev {VETH_HOST}")
+        self._run_command(f"ip addr add {HOST_LAN_IP}/24 dev {VETH_HOST}")
+        self._run_command(f"ip route add 192.168.50.0/24 dev {VETH_HOST} src {HOST_LAN_IP}", check=False)
+
+        # Disable Reverse Path Filter to allow bridging
+        self._run_command(f"sysctl -w net.ipv4.conf.{VETH_HOST}.rp_filter=0", check=False)
+        self._run_command(f"sysctl -w net.ipv4.conf.all.rp_filter=0", check=False)
 
         self._open_host_ports()
 
@@ -271,20 +270,19 @@ class WifiManager:
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i br0 -o {wan_iface} -j ACCEPT'")
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
+        # Open Container Floodgates
+        self._run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'", check=False)
+
         # 5. Start Hostapd
         is_5ghz = int(channel) > 14
         hw_mode = "a" if is_5ghz else "g"
 
-        # Determine capabilities based on mode and frequency
-        # Note: ac/ax are only valid in 5GHz (hw_mode=a)
         enable_ac = 0
         enable_ax = 0
 
         if is_5ghz:
-            if wifi_mode in ["ac", "ax"]:
-                enable_ac = 1
-            if wifi_mode == "ax":
-                enable_ax = 1
+            if wifi_mode in ["ac", "ax"]: enable_ac = 1
+            if wifi_mode == "ax": enable_ax = 1
 
         hostapd_conf = f"""interface=wlan0
 bridge=br0
@@ -303,14 +301,11 @@ wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
 
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
-        # FIX: Enforce Regulatory Domain to unlock 5GHz channels
-        self._run_command(f"{self.exec_cmd} 'iw reg set US'", check=False)
-        time.sleep(1) # Give the driver a moment to update
 
-        # FIX: Unblock Radio
+        self._run_command(f"{self.exec_cmd} 'iw reg set US'", check=False)
+        time.sleep(1)
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
-
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
         self._run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
@@ -342,7 +337,6 @@ network={{
 }}
 """
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=wpa_conf)
-        # FIX: Unblock Radio
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
@@ -361,6 +355,7 @@ network={{
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i wlan0 -o {VETH_CTR} -m state --state RELATED,ESTABLISHED -j ACCEPT'")
+        self._run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'", check=False)
 
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
@@ -383,7 +378,6 @@ network={{
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set {self.eth_interface} up'")
         time.sleep(2)
-
         try:
             subprocess.run(shlex.split(f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"),
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)

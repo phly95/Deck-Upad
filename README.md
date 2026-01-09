@@ -1,6 +1,6 @@
 # Deck-Upad
 
-Note: This project is currently undergoing some architectural shifts. For the time being, the core scripts are placed in a folder called WIP_archive.
+**Note:** This project is currently undergoing some architectural shifts. For the time being, the core scripts are placed in a folder called WIP_archive.
 This will allow me to focus on building a proper communications protocol to enable the Host PC and the Deck to identify eachother properly and
 orchestrate a seamless pairing process. Significant milestones have been reached such as creating a specialized fork of the Azahar 3DS Emulator
 that streams a specific emulated 3DS display to an external device, like the Steam Deck. (The preview video is from when this project used pipewire to

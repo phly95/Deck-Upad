@@ -13,6 +13,14 @@ class HostService:
         self.server_socket = None
 
     def start(self, ssid, password, channel=165, wifi_mode="ax"):
+        # --- PRE-FLIGHT CHECK ---
+        print("[HostService] Performing Pre-Flight Checks...")
+        try:
+            self.wifi.ensure_image_exists()
+            self.usbip.ensure_image_exists()
+        except Exception as e:
+            print(f"[CRITICAL] Pre-flight build failed: {e}")
+            sys.exit(1)
         # 1. Start WiFi
         print(f"[HostService] Initializing WiFi Bridge...")
         try:

@@ -45,6 +45,26 @@ class WifiManager:
         if os.geteuid() != 0:
             raise PermissionError("WifiManager must be run as root (sudo).")
 
+    def ensure_image_exists(self):
+        """
+        Ensures the Alpine image with wifi tools exists.
+        """
+        if self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
+            return
+
+        print(f"[WifiManager] Image '{CUSTOM_IMAGE}' not found. Building from '{BASE_IMAGE}'...")
+        builder_name = f"{CONTAINER_NAME}-builder"
+        self._run_command(f"podman rm -f {builder_name}", check=False)
+        self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
+
+        try:
+            pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
+            print("   Installing dependencies...")
+            self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
+            self._run_command(f"podman commit {builder_name} {CUSTOM_IMAGE}")
+        finally:
+            self._run_command(f"podman rm -f {builder_name}", check=False)
+
     # --- Public API ---
 
     def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax"):
@@ -144,27 +164,8 @@ class WifiManager:
     def _initialize_container(self):
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # 1. Build Image if missing (Requires Internet)
-        if not self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
-            print(f"[WifiManager] Image '{CUSTOM_IMAGE}' not found. Building from '{BASE_IMAGE}'...")
-            builder_name = f"{CONTAINER_NAME}-builder"
-            self._run_command(f"podman rm -f {builder_name}", check=False)
-            self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
-
-            try:
-                # util-linux contains rfkill
-                pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
-                print("   Installing dependencies (this may take a moment)...")
-                self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
-
-                print(f"   Committing to {CUSTOM_IMAGE}...")
-                self._run_command(f"podman commit {builder_name} {CUSTOM_IMAGE}")
-            except Exception as e:
-                print(f"[ERROR] Build failed: {e}")
-                self._run_command(f"podman stop {builder_name}", check=False)
-                raise e
-            finally:
-                self._run_command(f"podman rm -f {builder_name}", check=False)
+        # Reuse the logic we just wrote
+        self.ensure_image_exists()
 
         # 2. Start Runtime Container (Isolated Network)
         print(f"[WifiManager] Starting container '{CONTAINER_NAME}'...")

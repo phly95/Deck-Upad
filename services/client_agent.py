@@ -14,7 +14,18 @@ class ClientService:
         self.bus_id = None
 
     def start(self, ssid, password):
-        # 1. WiFi Setup
+        # --- PRE-FLIGHT CHECK ---
+        print("[ClientService] Performing Pre-Flight Checks...")
+        try:
+            # Build images while we still have Host Internet
+            self.wifi.ensure_image_exists()
+            self.usbip.ensure_image_exists()
+        except Exception as e:
+            print(f"[CRITICAL] Pre-flight build failed: {e}")
+            print("Ensure you have an active internet connection before starting.")
+            sys.exit(1)
+
+        # 1. WiFi Setup (Host Internet Dies Here)
         print(f"[ClientService] Configuring WiFi Container for {ssid}...")
         try:
             self.wifi.start_client_mode(ssid=ssid, password=password)

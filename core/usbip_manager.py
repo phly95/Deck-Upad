@@ -24,42 +24,58 @@ class UsbIpManager:
         if os.geteuid() != 0:
             raise PermissionError("UsbIpManager must be run as root.")
 
+    # --- NEW: Explicit Build Step ---
+    def ensure_image_exists(self):
+        """
+        Checks if the image exists. If not, builds it.
+        MUST BE RUN while Host still has Internet access.
+        """
+        if self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
+            return # Image exists
+
+        print(f"[UsbIpManager] Building image '{CUSTOM_IMAGE}' (Internet Required)...")
+        self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+        self._run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
+
+        try:
+            # Install tools
+            install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
+            print("   Installing dependencies (this may take a minute)...")
+            self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
+
+            print(f"   Committing to {CUSTOM_IMAGE}...")
+            self._run_command(f"podman commit {BUILDER_NAME} {CUSTOM_IMAGE}")
+        except Exception as e:
+            print(f"[CRITICAL] Build failed: {e}")
+            raise e
+        finally:
+            self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
+
     # --- Public API ---
 
     def start_sender_mode(self):
-        """
-        [Deck Side] Starts container, finds controller, binds it.
-        Returns the Bus ID (e.g., '1-3') if successful, or None.
-        """
         print("[UsbIpManager] Initializing Sender (Deck)...")
-        self._ensure_container_running()
+        # Removed image build check from here to avoid race condition
+        self._start_container()
 
-        # 1. Load Host Modules
         print("   Loading kernel modules...")
         self._run_command(f"{self.exec_cmd} 'modprobe usbip-host'", check=False)
-
-        # 2. Start Daemon
         print("   Starting usbipd...")
         self._run_command(f"{self.exec_cmd} 'usbipd -D'", check=False)
 
-        # 3. Find and Bind
         bus_id = self._find_valve_controller_bus()
         if not bus_id:
             print("[UsbIpManager] No Steam Deck Controller found!")
             return None
 
         print(f"   Binding Controller at Bus {bus_id}...")
-        # Unbind first just in case
         self._run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
         self._run_command(f"{self.exec_cmd} 'usbip bind -b {bus_id}'")
         return bus_id
 
     def start_receiver_mode(self):
-        """
-        [Host Side] Starts container, loads vhci-hcd.
-        """
         print("[UsbIpManager] Initializing Receiver (Host)...")
-        self._ensure_container_running()
+        self._start_container()
         print("   Loading vhci-hcd...")
         self._run_command(f"{self.exec_cmd} 'modprobe vhci-hcd'", check=False)
 
@@ -103,6 +119,27 @@ class UsbIpManager:
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
     # --- Internal Helpers ---
+
+    def _start_container(self):
+        if self._is_container_running(): return
+
+        # Safety check: if image missing, we can't build because we might have lost net.
+        # But we try anyway just in case user is on Ethernet.
+        if not self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
+             print("[WARNING] Image missing. Attempting build (might fail if WiFi is already down)...")
+             self.ensure_image_exists()
+
+        print(f"[UsbIpManager] Starting {CONTAINER_NAME}...")
+        self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
+        self._run_command(
+            f"podman run -d --name {CONTAINER_NAME} --replace "
+            "--privileged "
+            "--net=host "
+            "-v /dev:/dev "
+            "-v /lib/modules:/lib/modules:ro "
+            "-v /sys:/sys "
+            f"{CUSTOM_IMAGE} sleep infinity"
+        )
 
     def _run_command(self, cmd, shell=False, check=True):
         if not shell and isinstance(cmd, str):

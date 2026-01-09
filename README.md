@@ -1,5 +1,15 @@
 # Deck-Upad
 
+Note: This project is currently undergoing some architectural shifts. For the time being, the core scripts are placed in a folder called WIP_archive.
+This will allow me to focus on building a proper communications protocol to enable the Host PC and the Deck to identify eachother properly and
+orchestrate a seamless pairing process. Significant milestones have been reached such as creating a specialized fork of the Azahar 3DS Emulator
+that streams a specific emulated 3DS display to an external device, like the Steam Deck.
+
+But now the challenge is creating the protocol, and I think this will require reworking the isolated scripts into importable libraries.
+It is for this reason that existing files are in the WIP_archive folder, as this process will likely involve significant refactoring.
+
+## Description
+
 The goal of this project is to enable turning your Steam Deck into a Steam Controller 2 (yes, touchpads, gyro and haptics work) you can also use as a wireless second touchscreen. It has wired-like latency (ping times of 2-5ms have been observed when using the wifi container), making intense games like Celeste playable.
 
 To make low latency gameplay possible, the project leverages USB/IP as well as removing smart features normally performed by Network Manager, without making permanent changes to the system. To make the necessary WiFi and controller tweaks without the system intervening, it uses containers to perform these changes temporarily. This enables using USB/IP and iw (an alternative lightweight WiFi network manager) on read-only OSs like SteamOS. In over-simplified terms, think of the wifi container as a tool to overclock your WiFi card and make it easy to make a P2P hotspot. Think of usbip_container as a preconfigued script to redirect inputs from the Steam Deck's built-in controller to another PC over that WiFi connection. USB/IP relies on a wired-like network connection due to its use of the TCP protocol and the time-sensitivity of the application, and that is why it relies on the tweaks made by WiFi container to introduce that stability.

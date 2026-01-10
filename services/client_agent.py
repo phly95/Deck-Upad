@@ -12,12 +12,12 @@ class ClientService:
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
         self.bus_id = None
+        self.host_socket = None
 
     def start(self, ssid, password):
         # --- PRE-FLIGHT CHECK ---
         print("[ClientService] Performing Pre-Flight Checks...")
         try:
-            # Build images while we still have Host Internet
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
         except Exception as e:
@@ -25,7 +25,7 @@ class ClientService:
             print("Ensure you have an active internet connection before starting.")
             sys.exit(1)
 
-        # 1. WiFi Setup (Host Internet Dies Here)
+        # 1. WiFi Setup
         print(f"[ClientService] Configuring WiFi Container for {ssid}...")
         try:
             self.wifi.start_client_mode(ssid=ssid, password=password)
@@ -45,22 +45,24 @@ class ClientService:
         except Exception as e:
             print(f"[ERROR] USBIP Init Failed: {e}")
 
-        # 3. Handshake
-        self._handshake_loop()
+        # 3. Handshake & Monitor
+        self.host_socket = self._establish_handshake()
 
-    def _handshake_loop(self):
+        if self.host_socket:
+            self._monitor_lifecycle()
+
+    def _establish_handshake(self):
         print(f"[ClientService] Connecting to Host ({TARGET_HOST_IP})...")
-        connected = False
         attempts = 0
 
         payload = "HELLO_FROM_DECK"
         if self.bus_id:
             payload += f"|BUS_ID:{self.bus_id}"
 
-        while not connected:
+        while True:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
+                s.settimeout(10) # Longer timeout for active connection
                 s.connect((TARGET_HOST_IP, TARGET_PORT))
 
                 print(f"   >> Sending: {payload}")
@@ -71,22 +73,47 @@ class ClientService:
 
                 if "ACK_AUTHORIZED" in resp:
                     print("   >> Session Established! Input should be active.")
-                    connected = True
-
-                s.close()
+                    # Return the open socket to keep alive
+                    return s
+                else:
+                    s.close()
 
             except (socket.timeout, ConnectionRefusedError, OSError):
                 time.sleep(2)
                 attempts += 1
                 if attempts % 5 == 0: print("   .. waiting for Host ..")
+            except KeyboardInterrupt:
+                self.stop()
+                return None
 
-        # Keep alive
+    def _monitor_lifecycle(self):
+        print("[ClientService] Monitoring Host connection... (Ctrl+C to stop)")
         try:
-            while True: time.sleep(1)
+            while True:
+                # Blocking read waiting for Shutdown signal or disconnect
+                data = self.host_socket.recv(1024)
+
+                if not data:
+                    print("\n[DISCONNECT] Host closed connection unexpectedly.")
+                    break
+
+                msg = data.decode().strip()
+                if msg == "CMD_SHUTDOWN":
+                    print("\n[STOP] Received Shutdown Command from Host.")
+                    break
+
+        except (ConnectionResetError, OSError):
+            print("\n[DISCONNECT] Connection lost.")
         except KeyboardInterrupt:
+            pass
+        finally:
             self.stop()
 
     def stop(self):
         print("\n[ClientService] Stopping...")
+        if self.host_socket:
+            try: self.host_socket.close()
+            except: pass
         self.usbip.cleanup()
         self.wifi.cleanup()
+        sys.exit(0)

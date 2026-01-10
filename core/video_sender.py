@@ -1,12 +1,12 @@
+#!/usr/bin/env python3
 import sys
 import socket
 import struct
 import os
 import time
-import json
-import threading
-import select
+import argparse
 import ctypes
+import select
 import glfw
 from OpenGL.GL import *
 from OpenGL.GL import shaders
@@ -18,7 +18,10 @@ gi.require_version('GstVideo', '1.0')
 from gi.repository import Gst, GstVideo, GLib
 
 # --- CONFIGURATION ---
+# The abstract socket path used by Azahar/Citra for IPC
 SOCKET_PATH = '\0/com/DeckUpad/video'
+
+# Binary struct format for the texture metadata packet
 TEX_FMT = '<BBiii4i4iQIBI65x'
 TEX_SIZE = 128
 TYPE_TEXTURE_DATA = 11
@@ -27,10 +30,10 @@ TARGET_FPS = 60
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 # Visual Corrections
-FLIP_X = True   # Mirror Horizontal
-FLIP_Y = False  # Mirror Vertical
+FLIP_X = True   # Mirror Horizontal (often needed for front-facing camera logic or specific emulators)
+FLIP_Y = False  # Mirror Vertical (OpenGL vs GStreamer coordinate systems)
 
-# EGL Constants
+# --- EGL EXTENSION CONSTANTS ---
 EGL_LINUX_DMA_BUF_EXT = 0x3270
 EGL_LINUX_DRM_FOURCC_EXT = 0x3271
 EGL_DMA_BUF_PLANE0_FD_EXT = 0x3272
@@ -39,6 +42,7 @@ EGL_DMA_BUF_PLANE0_PITCH_EXT = 0x3274
 EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT = 0x3443
 EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT = 0x3444
 
+# --- SHADERS ---
 VERTEX_SHADER = """
 #version 330 core
 layout(location = 0) in vec2 position;
@@ -62,43 +66,19 @@ void main() {
 """
 
 class VideoSender:
-    def __init__(self, target_ip, status_queue=None):
+    def __init__(self, target_ip):
         self.target_ip = target_ip
-        self.status_queue = status_queue
         self.running = True
 
-        self.window = None
-        self.egl_display = None
-        self.pipeline = None
-        self.appsrc = None
-        self.egl_image = None
-        self.frame_count = 0
-        self.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, TARGET_FPS)
+        # Initialize GStreamer
+        Gst.init(None)
 
-        # OpenGL Objects
-        self.vao = None
-        self.vbo = None
-        self.fbo = None
-        self.shader = None
-        self.import_tex = None
-
-        # Dimensions
-        self.output_w = 0
-        self.output_h = 0
-        self.user_crop = None
-        self.is_rotated = False
-
-    def notify(self, msg):
-        if self.status_queue:
-            self.status_queue.put(msg)
-        print(f"[VideoSender] {msg}", flush=True)
-
-    def init_gl(self):
-        # Initialize GLFW
+        # Initialize GLFW for Headless OpenGL Context
         if not glfw.init():
-            raise Exception("GLFW init failed")
+            self.notify("CRASH: GLFW init failed")
+            sys.exit(1)
 
-        glfw.window_hint(glfw.VISIBLE, False) # Headless
+        glfw.window_hint(glfw.VISIBLE, False)
         glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
         glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
@@ -107,19 +87,61 @@ class VideoSender:
         self.window = glfw.create_window(1, 1, "DeckUpadSender", None, None)
         if not self.window:
             glfw.terminate()
-            raise Exception("Failed to create GLFW window")
+            self.notify("CRASH: Failed to create Window/Context")
+            sys.exit(1)
 
         glfw.make_context_current(self.window)
         self.egl_display = eglGetCurrentDisplay()
 
-        # Helper to load EGL Extensions
+        # Load GL extensions and compile shaders
+        self.init_gl()
+
+        # Setup Unix Socket for Azahar
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Attempt to clean up socket if it exists (not applicable for abstract namespace, but good practice)
+        try: os.unlink(SOCKET_PATH)
+        except OSError: pass
+
+        try:
+            self.server.bind(SOCKET_PATH)
+        except OSError:
+            self.notify("CRASH: Socket address in use (is Azahar already running or another sender active?)")
+            sys.exit(1)
+
+        self.server.listen(1)
+
+        # GStreamer State
+        self.pipeline = None
+        self.appsrc = None
+        self.frame_count = 0
+        self.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, TARGET_FPS)
+
+        # State Tracking
+        self.output_w = 0
+        self.output_h = 0
+        self.egl_image = None
+        self.is_rotated = False
+
+    def notify(self, msg):
+        """Prints to stdout so the parent daemon process can read the status."""
+        print(msg, flush=True)
+
+    def init_gl(self):
+        # Helper to load EGL functions
         def get_proc(name, args, res):
             addr = glfw.get_proc_address(name)
             return ctypes.CFUNCTYPE(res, *args)(addr) if addr else None
 
+        # Load required EGL extensions for DMA-BUF import
         self.glEGLImageTargetTexture2DOES = get_proc("glEGLImageTargetTexture2DOES", [ctypes.c_uint, ctypes.c_void_p], None)
         self.eglCreateImageKHR = get_proc("eglCreateImageKHR", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)], ctypes.c_void_p)
         self.eglDestroyImageKHR = get_proc("eglDestroyImageKHR", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int)
+
+        if not self.eglCreateImageKHR:
+            self.notify("CRASH: EGL Extensions missing. Driver issue?")
+            sys.exit(1)
 
         # Compile Shaders
         self.shader = shaders.compileProgram(
@@ -127,7 +149,7 @@ class VideoSender:
             shaders.compileShader(FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
         )
 
-        # Generate Objects
+        # Generate Buffers
         self.vao = glGenVertexArrays(1)
         self.vbo = glGenBuffers(1)
         self.fbo = glGenFramebuffers(1)
@@ -144,7 +166,6 @@ class VideoSender:
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0)
         glBindFramebuffer(GL_FRAMEBUFFER, 0)
-        # cleanup temp tex (the FBO keeps reference)
         glDeleteTextures(1, [tex])
 
     def setup_pipeline(self, width, height):
@@ -155,21 +176,23 @@ class VideoSender:
         self.output_w = width
         self.output_h = height
 
-        self.notify(f"Setting up pipeline: {width}x{height} -> {self.target_ip}")
+        self.notify(f"Configuring GStreamer for {width}x{height} -> {self.target_ip}")
 
         f = Gst.ElementFactory.find
         enc = ""
-        # Priority: NVIDIA -> VAAPI -> CPU
+
+        # Hardware Encoder Selection Logic
         if f("nvh264enc"):
-            print(" [ENCODER] Using NVIDIA H.264")
+            self.notify("Using NVIDIA NVENC")
             enc = "nvh264enc preset=low-latency-hq zerolatency=true bitrate=10000 rc-mode=cbr"
         elif f("vaapih264enc"):
-            print(" [ENCODER] Using VAAPI H.264 (Intel/AMD)")
+            self.notify("Using VAAPI (Intel/AMD)")
             enc = "videoconvert ! vaapih264enc rate-control=cbr bitrate=10000 keyframe-period=60"
         else:
-            print(" [ENCODER] Using CPU H.264 (x264) - Warning: High Latency")
+            self.notify("Using Software x264 (Warning: Higher Latency)")
             enc = "videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000"
 
+        # Construct Pipeline
         pipeline_str = (
             f"appsrc name=src format=time is-live=true do-timestamp=false ! "
             f"video/x-raw,format=RGBA,width={width},height={height},framerate={TARGET_FPS}/1 ! "
@@ -187,17 +210,13 @@ class VideoSender:
         except Exception as e:
             self.notify(f"Pipeline Error: {e}")
 
-    def calculate_quad(self, w, h, crop, rotate=False):
+    def calculate_quad(self, w, h, rotate=False):
+        # Standard UVs
         u0, v0 = 0.0, 0.0
         u1, v1 = 1.0, 1.0
 
-        if crop:
-            cx, cy, cw, ch = crop
-            u0 = cx / w; v0 = cy / h
-            u1 = (cx + cw) / w; v1 = (cy + ch) / h
-
         if rotate:
-            # Handle Citra/Azahar rotation weirdness
+            # Handle swap for rotated screens
             if FLIP_X: v0, v1 = v1, v0
             if FLIP_Y: u0, u1 = u1, u0
             data = [
@@ -209,6 +228,7 @@ class VideoSender:
                 -1.0,  1.0, u0, v1
             ]
         else:
+            # Standard logic
             if FLIP_X: u0, u1 = u1, u0
             if FLIP_Y: v0, v1 = v1, v0
             data = [
@@ -222,58 +242,33 @@ class VideoSender:
         return (ctypes.c_float * len(data))(*data)
 
     def run(self):
-        Gst.init(None)
-        self.init_gl()
-
-        # Setup Server Socket
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.setblocking(True)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Unlink if exists
-        try: os.unlink(SOCKET_PATH)
-        except OSError: pass # Might be abstract namespace
-
-        try:
-            server.bind(SOCKET_PATH)
-        except OSError:
-            # If abstract namespace '\0...', bind might fail if in use.
-            self.notify("Socket bind failed - Address in use?")
-            return
-
-        server.listen(1)
-        self.notify("VIDEO_READY_WAITING_FOR_APP")
-
+        self.notify("VIDEO_READY")
         try:
             while self.running:
-                # Wait for App (Azahar) connection
+                # 1. Wait for App (Azahar) connection
                 try:
-                    conn, _ = server.accept()
-                except OSError:
-                    break
+                    conn, _ = self.server.accept()
+                except OSError: break
 
                 self.notify("APP_CONNECTED")
 
-                # Handshake required by Citra/Azahar protocol
-                # 1=Capturing, 0=Mods, 1=Linear, 1=MapHost
+                # 2. Handshake (Required by Citra/Azahar protocol)
                 try: conn.send(struct.pack('<BBBB16s12x', 1, 0, 1, 1, b'\0'*16))
                 except: conn.close(); continue
 
                 conn.setblocking(False)
-
                 current_fd = -1
 
-                # Render Loop
                 try:
                     while True:
                         loop_start = time.time()
-                        glfw.poll_events() # Keep window responsive
+                        glfw.poll_events()
 
-                        # Non-blocking receive
+                        # 3. Check for new Frame Data (Non-blocking)
                         readable, _, _ = select.select([conn], [], [], 0)
                         if readable:
                             try:
-                                # Receive Texture Packet + FD via Ancillary Data
+                                # Receive Texture Meta + FD
                                 data, ancdata, _, _ = conn.recvmsg(TEX_SIZE, socket.CMSG_LEN(struct.calcsize('i') * 4))
                                 if not data: break
 
@@ -282,6 +277,7 @@ class VideoSender:
                                     w, h, fmt, stride = fields[2], fields[3], fields[4], fields[5]
                                     mod = fields[13]
 
+                                    # Extract FD
                                     fds = []
                                     for c, t, d in ancdata:
                                         if c == socket.SOL_SOCKET and t == socket.SCM_RIGHTS:
@@ -291,9 +287,8 @@ class VideoSender:
                                         if current_fd != -1: os.close(current_fd)
                                         current_fd = fds[0]
 
-                                        # Import DMA-BUF as EGLImage
-                                        if self.egl_image:
-                                            self.eglDestroyImageKHR(self.egl_display, self.egl_image)
+                                        # Import DMA-BUF -> EGLImage
+                                        if self.egl_image: self.eglDestroyImageKHR(self.egl_display, self.egl_image)
 
                                         attribs = [
                                             EGL_WIDTH, w, EGL_HEIGHT, h,
@@ -308,26 +303,24 @@ class VideoSender:
                                         attr = (ctypes.c_int * len(attribs))(*attribs)
                                         self.egl_image = self.eglCreateImageKHR(self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attr)
 
-                                        # Bind to Texture
+                                        # Bind to GL Texture
                                         glBindTexture(GL_TEXTURE_2D, self.import_tex)
                                         self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
 
-                                        # Logic to handle rotation (Azahar screens are often rotated)
+                                        # Determine Rotation (Heuristic: Width < Height usually means it's rotated)
                                         content_w, content_h = w, h
                                         self.is_rotated = False
-
-                                        # Heuristic: If Width < Height, likely rotated
                                         if w < h:
                                             content_w, content_h = h, w
                                             self.is_rotated = True
 
-                                        # Check if Pipeline Resize needed
+                                        # Check if Pipeline needs creation or resize
                                         if self.output_w != content_w or self.output_h != content_h:
                                             self.setup_fbo(content_w, content_h)
                                             self.setup_pipeline(content_w, content_h)
 
-                                            # Update Quad Geometry
-                                            q_arr = self.calculate_quad(w, h, None, rotate=self.is_rotated)
+                                            # Update Geometry
+                                            q_arr = self.calculate_quad(w, h, rotate=self.is_rotated)
                                             glBindVertexArray(self.vao)
                                             glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
                                             glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(q_arr), q_arr, GL_STATIC_DRAW)
@@ -337,10 +330,10 @@ class VideoSender:
                                             glEnableVertexAttribArray(1)
 
                             except Exception as e:
-                                print(f"Recv Error: {e}")
+                                self.notify(f"Recv Error: {e}")
                                 break
 
-                        # Draw & Push if we have a valid image and pipeline
+                        # 4. Draw & Push (If we have valid data)
                         if self.appsrc and current_fd != -1 and self.egl_image:
                             glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
                             glViewport(0, 0, self.output_w, self.output_h)
@@ -349,18 +342,16 @@ class VideoSender:
                             glActiveTexture(GL_TEXTURE0)
                             glBindTexture(GL_TEXTURE_2D, self.import_tex)
 
+                            # Draw Quad
                             glDrawArrays(GL_TRIANGLES, 0, 6)
                             glFinish()
 
-                            # Read Pixels (GPU -> CPU)
-                            # NOTE: PBOs would be faster, but glReadPixels is standard for simple setups
+                            # Read Pixels
                             glPixelStorei(GL_PACK_ALIGNMENT, 1)
                             pixels = glReadPixels(0, 0, self.output_w, self.output_h, GL_RGBA, GL_UNSIGNED_BYTE)
 
-                            # Wrap in GStreamer Buffer
+                            # Push to GStreamer
                             buf = Gst.Buffer.new_wrapped(pixels)
-
-                            # Add Video Meta
                             GstVideo.buffer_add_video_meta_full(
                                 buf, GstVideo.VideoFrameFlags.NONE,
                                 GstVideo.VideoFormat.RGBA,
@@ -369,47 +360,34 @@ class VideoSender:
                                 [0, 0, 0, 0],
                                 [self.output_w * 4, 0, 0, 0]
                             )
-
                             pts = self.frame_count * self.duration
                             buf.pts = pts; buf.dts = pts; buf.duration = self.duration
                             self.frame_count += 1
-
                             self.appsrc.emit("push-buffer", buf)
                             glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
-                        # Frame Limiter
+                        # Frame Pacing
                         elapsed = time.time() - loop_start
-                        if elapsed < FRAME_INTERVAL:
-                            time.sleep(FRAME_INTERVAL - elapsed)
+                        if elapsed < FRAME_INTERVAL: time.sleep(FRAME_INTERVAL - elapsed)
 
                 finally:
-                    # Cleanup when App disconnects
+                    # Cleanup loop state when App disconnects
                     if current_fd != -1: os.close(current_fd)
                     conn.close()
                     self.notify("VIDEO_STOPPED")
                     if self.pipeline:
                         self.pipeline.set_state(Gst.State.NULL)
                         self.pipeline = None
-
-        except KeyboardInterrupt:
-            pass
         finally:
-            server.close()
+            self.server.close()
             if self.egl_image:
                 self.eglDestroyImageKHR(self.egl_display, self.egl_image)
             glfw.terminate()
 
-def run_sender_process(target_ip, queue):
-    """
-    Wrapper to run VideoSender in a separate process.
-    """
-    try:
-        sender = VideoSender(target_ip, queue)
-        sender.run()
-    except Exception as e:
-        if queue: queue.put(f"CRASH: {e}")
-        print(f"[VideoSender CRASH] {e}")
-
 if __name__ == "__main__":
-    # Test Mode
-    run_sender_process("127.0.0.1", None)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target_ip", help="IP address of the Deck")
+    args = parser.parse_args()
+
+    sender = VideoSender(args.target_ip)
+    sender.run()

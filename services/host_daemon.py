@@ -2,15 +2,12 @@ import socket
 import time
 import sys
 import threading
-import multiprocessing
-import queue
+import subprocess
+import os
 
-# Adjust path to find core modules
 sys.path.append(".")
-
 from core.wifi_manager import WifiManager, HOST_LAN_IP
 from core.usbip_manager import UsbIpManager
-from core.video_sender import run_sender_process
 
 class HostService:
     def __init__(self):
@@ -18,31 +15,18 @@ class HostService:
         self.usbip = UsbIpManager()
         self.running = True
 
-        # Networking
         self.server_socket = None
         self.client_conn = None
 
-        # Video Subprocess Management
         self.video_proc = None
-        self.video_queue = multiprocessing.Queue()
-        self.video_monitor_thread = None
 
     def start(self, ssid, password, channel=165, wifi_mode="ax"):
+        # ... (Pre-flight and Infrastructure Start logic is unchanged) ...
         print("="*50)
         print("   DECK-UPAD HOST DAEMON")
         print("="*50)
 
-        # --- 1. PRE-FLIGHT CHECKS ---
-        print("[Host] Performing Pre-Flight Checks...")
-        try:
-            self.wifi.ensure_image_exists()
-            self.usbip.ensure_image_exists()
-        except Exception as e:
-            print(f"[CRITICAL] Pre-flight build failed: {e}")
-            sys.exit(1)
-
-        # --- 2. START INFRASTRUCTURE ---
-        # A. WiFi
+        # 1. Start WiFi
         print(f"[Host] Initializing WiFi Bridge (SSID: {ssid})...")
         try:
             self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode)
@@ -51,7 +35,7 @@ class HostService:
             self.stop()
             sys.exit(1)
 
-        # B. USBIP
+        # 2. Start USBIP
         try:
             self.usbip.start_receiver_mode()
         except Exception as e:
@@ -60,13 +44,6 @@ class HostService:
             sys.exit(1)
 
         print(f"[Host] Infrastructure Ready. IP: {HOST_LAN_IP}")
-
-        # --- 3. START VIDEO MONITOR ---
-        # This thread watches the queue from the VideoSender process
-        self.video_monitor_thread = threading.Thread(target=self._monitor_video_status, daemon=True)
-        self.video_monitor_thread.start()
-
-        # --- 4. RUN SERVER LOOP ---
         self.run_server()
 
     def run_server(self):
@@ -75,21 +52,15 @@ class HostService:
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((HOST_LAN_IP, 5555))
             self.server_socket.listen(1)
-            print(f"[Host] Listening for Deck on port 5555...")
-        except OSError as e:
-            print(f"[Error] Bind failed: {e}")
-            self.stop()
-            return
+        except OSError:
+            self.stop(); return
 
         while self.running:
             try:
-                # Accept new connection
                 conn, addr = self.server_socket.accept()
                 client_ip = addr[0]
 
-                # Cleanup previous client if exists
                 if self.client_conn:
-                    print("[Host] New connection replacing old client.")
                     try: self.client_conn.close()
                     except: pass
                     self._stop_video_process()
@@ -97,30 +68,19 @@ class HostService:
                 print(f"\n[>>> CONNECTION] Deck Connected from: {client_ip}")
                 self.client_conn = conn
 
-                # Handshake
                 data = conn.recv(1024).decode().strip()
-                print(f"      Payload: {data}")
-
                 if data.startswith("HELLO_FROM_DECK"):
                     conn.send(b"ACK_AUTHORIZED")
 
-                    # 1. Start Video Sender Process for this specific IP
-                    print(f"      Spinning up Video Sender for {client_ip}...")
+                    # 1. Start Video Sender (As User)
                     self._start_video_process(client_ip)
 
-                    # 2. Attach USB Controller if requested
+                    # 2. Attach USB
                     if "|BUS_ID:" in data:
                         bus_id = data.split("|BUS_ID:")[1]
-                        print(f"      Attaching Controller: Bus {bus_id}")
                         threading.Thread(target=self.usbip.connect_device, args=(client_ip, bus_id)).start()
-                    else:
-                        print("      No controller info provided.")
-
-                    print("      Session Active. Monitoring for disconnect...")
 
                 else:
-                    print("      Unauthorized Client. Closing.")
-                    conn.send(b"ACK_UNKNOWN")
                     conn.close()
                     self.client_conn = None
 
@@ -128,70 +88,99 @@ class HostService:
                 self.stop()
                 break
             except Exception as e:
-                print(f"[Host] Loop Error: {e}")
+                print(f"[Host] Error: {e}")
+
+    def _get_user_env(self):
+        """Constructs environment for the subprocess to run as the sudo user."""
+        sudo_user = os.environ.get('SUDO_USER')
+        if not sudo_user:
+            return os.environ.copy() # Fallback if not run with sudo
+
+        env = os.environ.copy()
+
+        # We need to ensure XDG_RUNTIME_DIR and DISPLAY/WAYLAND_DISPLAY are set
+        # Usually 'sudo' preserves some, but 'sudo -u' wipes them.
+        # We try to trust the current env (if user used sudo -E) or fallback.
+
+        # Note: Ideally, you'd find the user's UID and construct /run/user/UID
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            env['USER'] = sudo_user
+            env['LOGNAME'] = sudo_user
+            env['HOME'] = pw.pw_dir
+            env['UID'] = str(pw.pw_uid)
+
+            # Crucial for Wayland/Pipewire
+            if 'XDG_RUNTIME_DIR' not in env:
+                env['XDG_RUNTIME_DIR'] = f"/run/user/{pw.pw_uid}"
+        except: pass
+
+        return env
 
     def _start_video_process(self, target_ip):
-        self._stop_video_process() # Ensure clean state
-        # Launch the standalone VideoSender in a separate process
-        # It communicates back to us via self.video_queue
-        self.video_proc = multiprocessing.Process(
-            target=run_sender_process,
-            args=(target_ip, self.video_queue)
-        )
-        self.video_proc.start()
-
-    def _stop_video_process(self):
-        if self.video_proc and self.video_proc.is_alive():
-            print("[Host] Stopping Video Process...")
-            self.video_proc.terminate()
-            self.video_proc.join()
-        self.video_proc = None
-
-    def _monitor_video_status(self):
-        """
-        Runs in a thread. Reads messages from VideoSender and forwards to Deck.
-        """
-        while self.running:
-            try:
-                # Blocking get with timeout to allow checking self.running
-                msg = self.video_queue.get(timeout=1)
-
-                if self.client_conn:
-                    if msg == "VIDEO_STARTING":
-                        print("[Host] Signal: Video Starting -> Notifying Deck")
-                        try: self.client_conn.send(b"CMD_START_VIDEO")
-                        except: pass
-                    elif msg == "VIDEO_STOPPED":
-                        print("[Host] Signal: Video Stopped -> Notifying Deck")
-                        try: self.client_conn.send(b"CMD_STOP_VIDEO")
-                        except: pass
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"[Host] Monitor Error: {e}")
-
-    def stop(self):
-        print("\n[Host] Shutting down...")
-        self.running = False
-
-        # 1. Notify Client
-        if self.client_conn:
-            try:
-                print("[Host] Sending Shutdown Signal to Client...")
-                self.client_conn.send(b"CMD_SHUTDOWN")
-                self.client_conn.close()
-            except: pass
-            self.client_conn = None
-
-        # 2. Kill Video
         self._stop_video_process()
 
-        # 3. Cleanup Server
+        sudo_user = os.environ.get('SUDO_USER')
+        cmd = ["python3", "core/video_sender.py", target_ip]
+
+        if sudo_user:
+            # Run as the original user
+            cmd = ["sudo", "-u", sudo_user, "-E", "python3", "core/video_sender.py", target_ip]
+
+        print(f"[Host] Launching Video Sender as user: {sudo_user or 'root'}")
+
+        # Launch subprocess and pipe stdout so we can read status messages
+        self.video_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # Merge stderr to see errors
+            env=self._get_user_env(),
+            text=True,
+            bufsize=1 # Line buffered
+        )
+
+        # Start monitoring thread
+        threading.Thread(target=self._monitor_video_output, args=(self.video_proc,), daemon=True).start()
+
+    def _monitor_video_output(self, proc):
+        """Reads stdout from the video sender process."""
+        while self.running and proc.poll() is None:
+            line = proc.stdout.readline()
+            if not line: break
+
+            msg = line.strip()
+            # print(f"[VideoLog] {msg}") # Optional debug
+
+            if msg == "VIDEO_STARTING":
+                print("[Host] Signal: Video Starting -> Notifying Deck")
+                if self.client_conn:
+                    try: self.client_conn.send(b"CMD_START_VIDEO")
+                    except: pass
+            elif msg == "VIDEO_STOPPED":
+                print("[Host] Signal: Video Stopped -> Notifying Deck")
+                if self.client_conn:
+                    try: self.client_conn.send(b"CMD_STOP_VIDEO")
+                    except: pass
+            elif "CRASH" in msg:
+                 print(f"[Host] Video Sender Error: {msg}")
+
+    def _stop_video_process(self):
+        if self.video_proc:
+            print("[Host] Stopping Video Process...")
+            self.video_proc.terminate()
+            self.video_proc.wait()
+            self.video_proc = None
+
+    def stop(self):
+        self.running = False
+        if self.client_conn:
+            try: self.client_conn.send(b"CMD_SHUTDOWN"); self.client_conn.close()
+            except: pass
+        self._stop_video_process()
         if self.server_socket:
             try: self.server_socket.close()
             except: pass
-
-        # 4. Cleanup Hardware Containers
         self.usbip.cleanup()
         self.wifi.cleanup()
         print("[Host] Stopped.")

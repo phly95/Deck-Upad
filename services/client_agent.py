@@ -5,9 +5,7 @@ import subprocess
 import os
 import shlex
 
-# Adjust path to find core modules
 sys.path.append(".")
-
 from core.wifi_manager import WifiManager
 from core.usbip_manager import UsbIpManager
 
@@ -15,13 +13,62 @@ TARGET_HOST_IP = "192.168.50.2"
 TARGET_PORT = 5555
 GUI_CONTROL_PORT = 5003
 
+# Image Config
+REC_CONTAINER = "stream-receiver"
+REC_IMAGE = "localhost/stream-receiver-final"
+REC_BASE = "registry.fedoraproject.org/fedora:39"
+
 class ClientService:
     def __init__(self):
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
         self.bus_id = None
         self.host_socket = None
-        self.gui_container_name = "stream-receiver"
+
+    def ensure_receiver_image_exists(self):
+        """
+        Ensures the GStreamer Receiver image is built.
+        MUST run before WiFi is moved to container.
+        """
+        # Check if exists
+        res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
+        if res.stdout.strip():
+            return
+
+        print(f"[Client] Building Receiver Image '{REC_IMAGE}' (Internet Required)...")
+        builder = f"{REC_CONTAINER}-builder"
+
+        try:
+            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+            subprocess.run(["podman", "run", "-d", "--name", builder, REC_BASE, "sleep", "infinity"], check=True)
+
+            # Install GStreamer Deps
+            print("   Installing GStreamer dependencies...")
+
+            # 1. RPM Fusion (For H.264)
+            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y", "--nogpgcheck",
+                "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-39.noarch.rpm"], check=True)
+
+            # 2. Packages
+            pkgs = [
+                "python3-gobject", "gtk3", "gstreamer1", "gstreamer1-plugins-base",
+                "gstreamer1-plugins-good", "gstreamer1-plugins-good-gtk",
+                "gstreamer1-libav", "gstreamer1-plugins-bad-free",
+                "mesa-dri-drivers", "libwayland-client", "python3"
+            ]
+            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y"] + pkgs, check=True)
+
+            # 3. Commit
+            print(f"   Committing to {REC_IMAGE}...")
+            subprocess.run(["podman", "commit", builder, REC_IMAGE], check=True)
+
+        except subprocess.CalledProcessError as e:
+            print(f"[CRITICAL] Failed to build receiver image: {e}")
+            subprocess.run(["podman", "stop", builder], stderr=subprocess.DEVNULL)
+            raise e
+        finally:
+            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+
 
     def start(self, ssid, password):
         print("="*50)
@@ -33,7 +80,7 @@ class ClientService:
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
-            # We assume the receiver image is built/pulled separately or exists locally
+            self.ensure_receiver_image_exists() # <--- NEW: Build this while online
         except Exception as e:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
             print("Ensure you have an active internet connection before starting.")
@@ -76,31 +123,23 @@ class ClientService:
         # Map the local script into the container
         script_path = os.path.abspath("core/video_receiver.py")
 
-        # We assume 'localhost/stream-receiver-final' exists.
-        # If not, you might need a build step here similar to wifi/usbip.
-        # For now, we assume standard Fedora image + python dependencies installed.
-        # A simple fallback is using the 'usbip-ready-v9' image if it has python-gobject/gtk installed.
-
         cmd = (
             f"podman run -d --replace --name {self.gui_container_name} "
-            f"--net=host "  # Critical: Must share net to receive UDP video
+            f"--net=host "
             f"--privileged "
             f"-v /tmp/.X11-unix:/tmp/.X11-unix "
-            f"-v /run/user/{os.getuid()}:/run/user/{os.getuid()} " # Wayland/PulseAudio sockets
+            f"-v /run/user/{os.getuid()}:/run/user/{os.getuid()} "
             f"-e DISPLAY={os.environ.get('DISPLAY', ':0')} "
             f"-v {script_path}:/app/main.py "
-            f"localhost/stream-receiver-final "
+            f"{REC_IMAGE} "
             f"python3 /app/main.py"
         )
 
-        # Note: If image is missing, this will fail silently in background.
-        # Ideally, we'd check `podman images` here too.
         subprocess.run(shlex.split(cmd), stdout=subprocess.DEVNULL)
-        time.sleep(2) # Give GUI time to appear
+        time.sleep(2)
 
     def _establish_handshake(self):
         print(f"[Client] Connecting to Host ({TARGET_HOST_IP})...")
-
         payload = "HELLO_FROM_DECK"
         if self.bus_id:
             payload += f"|BUS_ID:{self.bus_id}"
@@ -110,21 +149,13 @@ class ClientService:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(10)
                 s.connect((TARGET_HOST_IP, TARGET_PORT))
-
-                print(f"   >> Sending Hello...")
                 s.send(payload.encode())
-
                 resp = s.recv(1024).decode()
-                print(f"   >> Host Replied: {resp}")
-
                 if "ACK_AUTHORIZED" in resp:
                     print("   >> Session Established!")
-                    # Send initial status to GUI
                     self._send_gui_command("STATUS:Connected. Ready.")
                     return s
-                else:
-                    s.close()
-
+                else: s.close()
             except (socket.timeout, ConnectionRefusedError, OSError):
                 time.sleep(2)
             except KeyboardInterrupt:
@@ -136,51 +167,27 @@ class ClientService:
         try:
             while True:
                 data = self.host_socket.recv(1024)
-                if not data:
-                    print("\n[DISCONNECT] Host closed connection.")
-                    self._send_gui_command("STATUS:Host Disconnected.")
-                    break
-
-                # Handle Commands (Joined by null/newline if multiple arrive at once)
+                if not data: break
                 msgs = data.decode().strip().split('\n')
                 for msg in msgs:
-                    if not msg: continue
-                    print(f"[Client] Recv Command: {msg}")
-
-                    if msg == "CMD_SHUTDOWN":
-                        print("\n[STOP] Received Shutdown Command.")
-                        return
-                    elif msg == "CMD_START_VIDEO":
-                        self._send_gui_command("START_VIDEO")
-                    elif msg == "CMD_STOP_VIDEO":
-                        self._send_gui_command("STOP_VIDEO")
-
-        except (ConnectionResetError, OSError):
-            print("\n[DISCONNECT] Connection lost.")
-            self._send_gui_command("STATUS:Connection Lost.")
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stop()
+                    if msg == "CMD_SHUTDOWN": return
+                    elif msg == "CMD_START_VIDEO": self._send_gui_command("START_VIDEO")
+                    elif msg == "CMD_STOP_VIDEO": self._send_gui_command("STOP_VIDEO")
+        except: pass
+        finally: self.stop()
 
     def _send_gui_command(self, cmd):
-        """Sends UDP command to the local GUI container"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.sendto(cmd.encode(), ("127.0.0.1", GUI_CONTROL_PORT))
-        except Exception as e:
-            print(f"[Client] Failed to contact GUI: {e}")
+        except: pass
 
     def stop(self):
         print("\n[Client] Stopping...")
         if self.host_socket:
             try: self.host_socket.close()
             except: pass
-
-        # Kill GUI
-        subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name],
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+        subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name], stderr=subprocess.DEVNULL)
         self.usbip.cleanup()
         self.wifi.cleanup()
         sys.exit(0)

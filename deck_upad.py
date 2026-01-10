@@ -6,76 +6,83 @@ import os
 import subprocess
 import time
 import shutil
+import socket
 
 from services.host_daemon import HostService
 from services.client_agent import ClientService
 
-# Path to store the PID of the active instance
 PID_FILE = "/tmp/deck_upad.pid"
 
 def run_cmd(cmd):
-    """Helper to run shell commands silently"""
     subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-def perform_aggressive_cleanup():
-    """
-    Forcefully cleans up ALL lingering state from previous runs.
-    This ensures a clean slate for networking and containers.
-    """
-    print("[Startup] Scrubbing previous session state...")
+def check_internet():
+    """Returns True if we can reach Google DNS."""
+    try:
+        # Connect to 8.8.8.8 on port 53 (DNS) - fast and reliable
+        socket.create_connection(("8.8.8.8", 53), timeout=2)
+        return True
+    except OSError:
+        return False
 
-    # 1. Kill the specific stale PID if it exists
+def wait_for_network_restore(timeout=15):
+    """Blocks until internet is restored or timeout expires."""
+    print("[Startup] Verifying Internet Connectivity...")
+    start = time.time()
+    while time.time() - start < timeout:
+        if check_internet():
+            return True
+        time.sleep(1)
+    print("[Startup] Warning: Internet not detected. Image builds may fail.")
+    return False
+
+def perform_aggressive_cleanup(force=False):
+    """
+    Cleans up state.
+    If 'force' is False, we only cleanup if a stale PID file exists (crash detected).
+    """
+    # If no PID file and not forced, assume clean exit and skip to save time/net
+    if not force and not os.path.exists(PID_FILE):
+        return
+
+    print("[Startup] Cleaning up previous session state...")
+
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, 'r') as f:
                 old_pid = int(f.read().strip())
-
-            # Don't kill ourselves
             if old_pid != os.getpid():
-                try:
-                    os.kill(old_pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+                try: os.kill(old_pid, signal.SIGKILL)
+                except: pass
         except: pass
-
         try: os.remove(PID_FILE)
         except: pass
 
-    # 2. Stop and Remove ALL Deck-Upad Containers
-    # We stop them all at once to free up hardware (WiFi card, USB)
     containers = "wifi-bridge usbip-sidecar stream-receiver"
     run_cmd(f"podman stop -t 0 {containers}")
     run_cmd(f"podman rm -f {containers}")
 
-    # 3. Clean up Network Interfaces and Connections
-    # This frees the IP 192.168.50.2 and removes the bridge
     run_cmd("nmcli connection down veth-host-conn")
     run_cmd("nmcli connection delete veth-host-conn")
     run_cmd("ip link delete veth-host")
 
-    # 4. Reset Firewall Rules (Broad sweep)
     if shutil.which("firewall-cmd"):
-        ports = "2000:65535" # The range used in wifi_manager
+        ports = "2000:65535"
         run_cmd(f"firewall-cmd --remove-port={ports}/udp")
         run_cmd(f"firewall-cmd --remove-port={ports}/tcp")
-        run_cmd(f"firewall-cmd --zone=trusted --remove-port={ports}/udp")
-        run_cmd(f"firewall-cmd --zone=trusted --remove-port={ports}/tcp")
 
-    # 5. Restore WiFi Interface to Host
-    # If the container crashed while holding the card, we nudge NetworkManager to take it back
+    # Restore WiFi
     run_cmd("nmcli device set wlan0 managed yes")
     run_cmd("nmcli device connect wlan0")
 
-    # 6. Wait for Kernel to cleanup network namespaces
-    time.sleep(1)
+    # Wait for the OS to grab an IP
+    wait_for_network_restore()
 
 def write_pid_file():
-    """Writes the current PID to the lock file."""
     try:
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
-    except IOError:
-        pass
+    except: pass
 
 def remove_pid_file():
     if os.path.exists(PID_FILE):
@@ -83,21 +90,21 @@ def remove_pid_file():
         except: pass
 
 def main():
-    # 1. Clean the slate (Fixes "Network in wrong state" issues)
-    perform_aggressive_cleanup()
-
-    # 2. Mark this run
-    write_pid_file()
-
     parser = argparse.ArgumentParser(description="Deck-Upad Service Runner")
-    parser.add_argument("--role", choices=["host", "client"], required=True, help="Run as Host (PC) or Client (Deck)")
-    parser.add_argument("--ssid", default="DeckUpad", help="SSID for P2P connection")
-    parser.add_argument("--password", default="DeckUpad123", help="Password for P2P connection")
-    parser.add_argument("--channel", default=165, type=int, help="WiFi Channel (Default: 165)")
-    parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax",
-                        help="WiFi Standard: n (Legacy), ac (WiFi 5), ax (WiFi 6/Default)")
+    parser.add_argument("--role", choices=["host", "client"], required=True)
+    parser.add_argument("--ssid", default="DeckUpad")
+    parser.add_argument("--password", default="DeckUpad123")
+    parser.add_argument("--channel", default=165, type=int)
+    parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax")
+    parser.add_argument("--force-clean", action="store_true", help="Force cleanup even if no crash detected")
 
     args = parser.parse_args()
+
+    # 1. Intelligent Cleanup
+    perform_aggressive_cleanup(force=args.force_clean)
+
+    # 2. Mark run
+    write_pid_file()
 
     service = None
 

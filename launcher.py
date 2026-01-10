@@ -6,7 +6,6 @@ import subprocess
 import threading
 import json
 import signal
-import fcntl
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
@@ -60,14 +59,13 @@ class DeckUpadLauncher(Gtk.Window):
         self.entry_ssid.set_text(self.config.get("ssid", "DeckUpad"))
         grid.attach(self.entry_ssid, 1, 1, 2, 1)
 
-        # Row 3: Password (VISIBLE)
+        # Row 3: WiFi Password
         grid.attach(Gtk.Label(label="WiFi Password:"), 0, 2, 1, 1)
         self.entry_pass = Gtk.Entry()
         self.entry_pass.set_text(self.config.get("password", "DeckUpad123"))
-        # Removed set_visibility(False) so it shows plain text
         grid.attach(self.entry_pass, 1, 2, 2, 1)
 
-        # Row 4: WiFi Mode (For Host)
+        # Row 4: WiFi Mode
         grid.attach(Gtk.Label(label="WiFi Standard:"), 0, 3, 1, 1)
         self.combo_mode = Gtk.ComboBoxText()
         self.combo_mode.append("ax", "AX (WiFi 6 - Recommended)")
@@ -75,6 +73,19 @@ class DeckUpadLauncher(Gtk.Window):
         self.combo_mode.append("n", "N (Legacy)")
         self.combo_mode.set_active_id(self.config.get("wifi_mode", "ax"))
         grid.attach(self.combo_mode, 1, 3, 2, 1)
+
+        # Row 5: Sudo Password (NEW)
+        grid.attach(Gtk.Label(label="Sudo Password:"), 0, 4, 1, 1)
+        self.entry_sudo = Gtk.Entry()
+        self.entry_sudo.set_visibility(False) # Hide dots
+        self.entry_sudo.set_invisible_char("•")
+        self.entry_sudo.set_text(self.config.get("sudo_pass", ""))
+        grid.attach(self.entry_sudo, 1, 4, 1, 1)
+
+        # Checkbox for Saving Sudo
+        self.chk_save_sudo = Gtk.CheckButton(label="Save Sudo Password")
+        self.chk_save_sudo.set_active(bool(self.config.get("sudo_pass", "")))
+        grid.attach(self.chk_save_sudo, 2, 4, 1, 1)
 
         # Restore Role Selection
         if self.config.get("role") == "host":
@@ -86,13 +97,13 @@ class DeckUpadLauncher(Gtk.Window):
         main_vbox.pack_start(btn_box, False, False, 10)
 
         self.btn_start = Gtk.Button(label="Start Service")
-        self.btn_start.get_style_context().add_class("suggested-action") # Green-ish
+        self.btn_start.get_style_context().add_class("suggested-action")
         self.btn_start.set_size_request(150, 50)
         self.btn_start.connect("clicked", self.on_start)
         btn_box.pack_start(self.btn_start, False, False, 0)
 
         self.btn_stop = Gtk.Button(label="Stop Service")
-        self.btn_stop.get_style_context().add_class("destructive-action") # Red-ish
+        self.btn_stop.get_style_context().add_class("destructive-action")
         self.btn_stop.set_size_request(150, 50)
         self.btn_stop.set_sensitive(False)
         self.btn_stop.connect("clicked", self.on_stop)
@@ -110,7 +121,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_view.set_editable(False)
         self.log_view.set_cursor_visible(False)
         self.log_view.set_monospace(True)
-        # Set text color to green terminal style
         self.log_view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.1, 0.1, 0.1, 1))
         self.log_view.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0.9, 0, 1))
         scrolled.add(self.log_view)
@@ -118,7 +128,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer = self.log_view.get_buffer()
         self.log_mark = self.log_buffer.create_mark("end", self.log_buffer.get_end_iter(), False)
 
-        # Cleanup on close
         self.connect("destroy", self.on_close)
         self.show_all()
 
@@ -132,11 +141,14 @@ class DeckUpadLauncher(Gtk.Window):
 
     def save_config(self):
         role = "host" if self.rb_host.get_active() else "client"
+        sudo_pass = self.entry_sudo.get_text() if self.chk_save_sudo.get_active() else ""
+
         data = {
             "role": role,
             "ssid": self.entry_ssid.get_text(),
             "password": self.entry_pass.get_text(),
-            "wifi_mode": self.combo_mode.get_active_id()
+            "wifi_mode": self.combo_mode.get_active_id(),
+            "sudo_pass": sudo_pass
         }
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -159,13 +171,14 @@ class DeckUpadLauncher(Gtk.Window):
         ssid = self.entry_ssid.get_text()
         pw = self.entry_pass.get_text()
         wifi_mode = self.combo_mode.get_active_id()
+        sudo_pw = self.entry_sudo.get_text()
 
         script_path = os.path.abspath("deck_upad.py")
 
-        # Construct Command using pkexec for graphical sudo prompt
+        # Use sudo -S to read password from stdin
         cmd = [
-            "pkexec",
-            "python3", "-u", script_path, # -u for unbuffered output
+            "sudo", "-S",
+            "python3", "-u", script_path,
             "--role", role,
             "--ssid", ssid,
             "--password", pw,
@@ -174,17 +187,24 @@ class DeckUpadLauncher(Gtk.Window):
 
         self.append_log(f"--- STARTING {role.upper()} MODE ---\n")
 
-        # Start Process
         try:
+            # Create process with PIPE for stdin (to write password)
             self.process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1  # Line buffered
+                bufsize=1
             )
 
-            # Start thread to read stdout
+            # Send password + newline
+            if sudo_pw:
+                try:
+                    self.process.stdin.write(sudo_pw + "\n")
+                    self.process.stdin.flush()
+                except OSError: pass # Process might have exited if pw wrong or not needed
+
             t = threading.Thread(target=self.monitor_process, daemon=True)
             t.start()
 
@@ -193,7 +213,6 @@ class DeckUpadLauncher(Gtk.Window):
             self.on_stop(None)
 
     def monitor_process(self):
-        # Read lines until process exits
         while True:
             line = self.process.stdout.readline()
             if not line and self.process.poll() is not None:
@@ -214,19 +233,16 @@ class DeckUpadLauncher(Gtk.Window):
     def on_stop(self, widget):
         if self.process:
             self.append_log("\nStopping...\n")
-
-            # 1. Try polite termination (SIGTERM)
             try:
                 self.process.terminate()
             except: pass
 
-            # 2. Wait a moment, if it's still running, force kill the underlying script
-            # because pkexec sometimes swallows the signal.
+            # Force cleanup of root process
             def force_kill_if_needed():
                 import time
                 time.sleep(1)
                 if self.process and self.process.poll() is None:
-                    # Find any root process running deck_upad.py and kill it
+                    # We need sudo to kill the sudo process
                     subprocess.run(["sudo", "pkill", "-f", "deck_upad.py"],
                                  stderr=subprocess.DEVNULL)
 

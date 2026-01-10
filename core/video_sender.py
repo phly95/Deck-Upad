@@ -7,6 +7,7 @@ import time
 import argparse
 import ctypes
 import select
+import math
 import glfw
 from OpenGL.GL import *
 from OpenGL.GL import shaders
@@ -65,6 +66,20 @@ void main() {
 }
 """
 
+# Simple Test Shader for Test Mode (Generating pulsing colors)
+TEST_FRAGMENT_SHADER = """
+#version 330 core
+in vec2 TexCoord;
+out vec4 color;
+uniform float time;
+void main() {
+    float r = 0.5 + 0.5 * sin(time + TexCoord.x * 5.0);
+    float g = 0.5 + 0.5 * cos(time + TexCoord.y * 5.0);
+    // Green/Teal pattern to verify color space
+    color = vec4(r, g, 0.5, 1.0);
+}
+"""
+
 class VideoSender:
     def __init__(self, target_ip):
         self.target_ip = target_ip
@@ -96,22 +111,6 @@ class VideoSender:
         # Load GL extensions and compile shaders
         self.init_gl()
 
-        # Setup Unix Socket for Azahar
-        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Attempt to clean up socket if it exists (not applicable for abstract namespace, but good practice)
-        try: os.unlink(SOCKET_PATH)
-        except OSError: pass
-
-        try:
-            self.server.bind(SOCKET_PATH)
-        except OSError:
-            self.notify("CRASH: Socket address in use (is Azahar already running or another sender active?)")
-            sys.exit(1)
-
-        self.server.listen(1)
-
         # GStreamer State
         self.pipeline = None
         self.appsrc = None
@@ -123,9 +122,10 @@ class VideoSender:
         self.output_h = 0
         self.egl_image = None
         self.is_rotated = False
+        self.server = None
 
     def notify(self, msg):
-        """Prints to stdout so the parent daemon process can read the status."""
+        """Prints to stdout so the parent daemon/launcher can read the status."""
         print(msg, flush=True)
 
     def init_gl(self):
@@ -139,14 +139,16 @@ class VideoSender:
         self.eglCreateImageKHR = get_proc("eglCreateImageKHR", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)], ctypes.c_void_p)
         self.eglDestroyImageKHR = get_proc("eglDestroyImageKHR", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int)
 
-        if not self.eglCreateImageKHR:
-            self.notify("CRASH: EGL Extensions missing. Driver issue?")
-            sys.exit(1)
-
         # Compile Shaders
         self.shader = shaders.compileProgram(
             shaders.compileShader(VERTEX_SHADER, GL_VERTEX_SHADER),
             shaders.compileShader(FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
+        )
+
+        # Compile Test Shader
+        self.test_shader = shaders.compileProgram(
+            shaders.compileShader(VERTEX_SHADER, GL_VERTEX_SHADER),
+            shaders.compileShader(TEST_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
         )
 
         # Generate Buffers
@@ -216,7 +218,7 @@ class VideoSender:
         u1, v1 = 1.0, 1.0
 
         if rotate:
-            # Handle swap for rotated screens
+            # Handle swap for rotated screens (Common in 3DS emulation)
             if FLIP_X: v0, v1 = v1, v0
             if FLIP_Y: u0, u1 = u1, u0
             data = [
@@ -241,18 +243,97 @@ class VideoSender:
             ]
         return (ctypes.c_float * len(data))(*data)
 
-    def run(self):
-        self.notify("VIDEO_READY")
+    def run_test_mode(self):
+        """
+        Simulates a game connection by generating a test pattern locally via OpenGL shaders.
+        Does not require the Emulator to be running.
+        """
+        self.notify("TEST_MODE_ACTIVE")
+        W, H = 1280, 800 # Deck Resolution
+
+        self.setup_fbo(W, H)
+        self.setup_pipeline(W, H)
+
+        # Setup Geometry (No rotation for test)
+        q_arr = self.calculate_quad(W, H, rotate=False)
+        glBindVertexArray(self.vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(q_arr), q_arr, GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
+        glEnableVertexAttribArray(1)
+
+        sim_time = 0.0
+
         try:
             while self.running:
-                # 1. Wait for App (Azahar) connection
+                loop_start = time.time()
+                glfw.poll_events()
+                sim_time += 0.05
+
+                if self.appsrc:
+                    glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
+                    glViewport(0, 0, W, H)
+
+                    # Use Test Shader
+                    glUseProgram(self.test_shader)
+
+                    # Pass time uniform for animation
+                    loc = glGetUniformLocation(self.test_shader, "time")
+                    glUniform1f(loc, sim_time)
+
+                    glBindVertexArray(self.vao)
+                    glDrawArrays(GL_TRIANGLES, 0, 6)
+                    glFinish()
+
+                    # Read Pixels (GPU -> CPU)
+                    glPixelStorei(GL_PACK_ALIGNMENT, 1)
+                    pixels = glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE)
+
+                    # Push to GStreamer
+                    buf = Gst.Buffer.new_wrapped(pixels)
+                    GstVideo.buffer_add_video_meta_full(buf, GstVideo.VideoFrameFlags.NONE, GstVideo.VideoFormat.RGBA, W, H, 1, [0, 0, 0, 0], [W * 4, 0, 0, 0])
+                    pts = self.frame_count * self.duration
+                    buf.pts = pts; buf.dts = pts; buf.duration = self.duration
+                    self.frame_count += 1
+                    self.appsrc.emit("push-buffer", buf)
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+                elapsed = time.time() - loop_start
+                if elapsed < FRAME_INTERVAL: time.sleep(FRAME_INTERVAL - elapsed)
+        finally:
+            if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
+            glfw.terminate()
+
+    def run(self):
+        # 1. Setup Unix Socket
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Cleanup if exists
+        try: os.unlink(SOCKET_PATH)
+        except OSError: pass
+
+        try:
+            self.server.bind(SOCKET_PATH)
+        except OSError:
+            self.notify("CRASH: Socket address in use")
+            sys.exit(1)
+
+        self.server.listen(1)
+        self.notify("VIDEO_READY")
+
+        try:
+            while self.running:
+                # 2. Wait for App (Azahar) connection
                 try:
                     conn, _ = self.server.accept()
                 except OSError: break
 
                 self.notify("APP_CONNECTED")
 
-                # 2. Handshake (Required by Citra/Azahar protocol)
+                # 3. Handshake (Required by Citra/Azahar protocol)
                 try: conn.send(struct.pack('<BBBB16s12x', 1, 0, 1, 1, b'\0'*16))
                 except: conn.close(); continue
 
@@ -264,7 +345,7 @@ class VideoSender:
                         loop_start = time.time()
                         glfw.poll_events()
 
-                        # 3. Check for new Frame Data (Non-blocking)
+                        # 4. Check for new Frame Data (Non-blocking)
                         readable, _, _ = select.select([conn], [], [], 0)
                         if readable:
                             try:
@@ -333,7 +414,7 @@ class VideoSender:
                                 self.notify(f"Recv Error: {e}")
                                 break
 
-                        # 4. Draw & Push (If we have valid data)
+                        # 5. Draw & Push (If we have valid data)
                         if self.appsrc and current_fd != -1 and self.egl_image:
                             glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
                             glViewport(0, 0, self.output_w, self.output_h)
@@ -379,7 +460,7 @@ class VideoSender:
                         self.pipeline.set_state(Gst.State.NULL)
                         self.pipeline = None
         finally:
-            self.server.close()
+            if self.server: self.server.close()
             if self.egl_image:
                 self.eglDestroyImageKHR(self.egl_display, self.egl_image)
             glfw.terminate()
@@ -387,7 +468,12 @@ class VideoSender:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("target_ip", help="IP address of the Deck")
+    parser.add_argument("--test-mode", action="store_true", help="Generate test pattern instead of reading socket")
     args = parser.parse_args()
 
     sender = VideoSender(args.target_ip)
-    sender.run()
+
+    if args.test_mode:
+        sender.run_test_mode()
+    else:
+        sender.run()

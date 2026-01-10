@@ -6,6 +6,8 @@ import subprocess
 import threading
 import json
 import signal
+import socket
+import time
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
@@ -14,17 +16,22 @@ from gi.repository import Gtk, GLib, Pango, Gdk
 # Configuration File to save user preferences
 CONFIG_FILE = os.path.expanduser("~/.deck_upad_config.json")
 
+# Image Config (Must match client_agent.py)
+REC_IMAGE = "localhost/stream-receiver-final"
+
 class DeckUpadLauncher(Gtk.Window):
     def __init__(self):
         super().__init__(title="Deck-Upad Control Panel")
-        self.set_default_size(900, 700)
+        self.set_default_size(900, 750)
         self.set_border_width(10)
 
-        # Dark Theme Hint
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-application-prefer-dark-theme", True)
 
         self.process = None
+        self.test_receiver_proc = None
+        self.test_sender_proc = None
+        self.test_container_name = "deck-upad-test-rec"
         self.config = self.load_config()
 
         # --- UI LAYOUT ---
@@ -118,7 +125,13 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_start.connect("clicked", self.on_start)
         btn_box.pack_start(self.btn_start, False, False, 0)
 
-        # New Cleanup Button
+        # Test Button
+        self.btn_test = Gtk.Button(label="Test Video\n(Simulation)")
+        self.btn_test.set_size_request(150, 50)
+        self.btn_test.connect("clicked", self.on_test_video)
+        btn_box.pack_start(self.btn_test, False, False, 0)
+
+        # Cleanup Button
         self.btn_clean = Gtk.Button(label="Force Cleanup")
         self.btn_clean.set_size_request(150, 50)
         self.btn_clean.connect("clicked", self.on_cleanup)
@@ -183,14 +196,85 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
+    def on_test_video(self, widget):
+        self.save_config()
+        self.append_log("\n--- STARTING VIDEO SIMULATION (CONTAINER) ---\n")
+        self.btn_test.set_sensitive(False)
+        self.btn_start.set_sensitive(False)
+        self.btn_stop.set_sensitive(True)
+
+        try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
+        except: pass
+
+        uid = os.getuid()
+        script_path = os.path.abspath("core/video_receiver.py")
+        display = os.environ.get('DISPLAY', ':0')
+
+        subprocess.run(["podman", "rm", "-f", self.test_container_name], stderr=subprocess.DEVNULL)
+
+        cmd = [
+            "podman", "run", "--rm", "--name", self.test_container_name,
+            "--net=host",
+            "--privileged",
+            "-v", "/tmp/.X11-unix:/tmp/.X11-unix",
+            "-v", f"/run/user/{uid}:/run/user/{uid}",
+            "-e", f"DISPLAY={display}",
+            "-e", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            "-e", "GDK_BACKEND=x11,wayland",
+            "-v", f"{script_path}:/app/main.py",
+            REC_IMAGE,
+            "python3", "/app/main.py"
+        ]
+
+        GLib.idle_add(self.append_log, f"Launching Receiver Container: {self.test_container_name}...\n")
+
+        try:
+            self.test_receiver_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            threading.Thread(target=self._monitor_pipe, args=(self.test_receiver_proc, "[RX]"), daemon=True).start()
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"Container launch failed: {e}\n")
+            return
+
+        threading.Timer(3.0, self._start_test_sender).start()
+
+    def _start_test_sender(self):
+        GLib.idle_add(self.append_log, "Launching Sender (Host Simulation)...\n")
+        try:
+            self.test_sender_proc = subprocess.Popen(
+                ["python3", "core/video_sender.py", "127.0.0.1", "--test-mode"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            threading.Thread(target=self._monitor_pipe, args=(self.test_sender_proc, "[TX]"), daemon=True).start()
+
+            time.sleep(1)
+            GLib.idle_add(self.append_log, "Sending START_VIDEO signal...\n")
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(b"START_VIDEO", ("127.0.0.1", 5003))
+
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"Sender failed: {e}\n")
+
+    def _monitor_pipe(self, proc, prefix):
+        while True:
+            line = proc.stdout.readline()
+            if not line and proc.poll() is not None: break
+            if line: GLib.idle_add(self.append_log, f"{prefix} {line}")
+
     def on_start(self, widget):
-        # 1. Allow containers to access X11 Display
         try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
         except: pass
 
         self.save_config()
         self.btn_start.set_sensitive(False)
-        self.btn_clean.set_sensitive(False) # Disable cleanup while running
+        self.btn_test.set_sensitive(False)
+        self.btn_clean.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
         # Lock inputs
         self.entry_ssid.set_sensitive(False)
@@ -225,8 +309,8 @@ class DeckUpadLauncher(Gtk.Window):
 
     def on_cleanup(self, widget):
         self.save_config()
-        # Disable buttons temporarily
         self.btn_start.set_sensitive(False)
+        self.btn_test.set_sensitive(False)
         self.btn_clean.set_sensitive(False)
 
         sudo_pw = self.entry_sudo.get_text()
@@ -275,6 +359,7 @@ class DeckUpadLauncher(Gtk.Window):
     def process_finished(self):
         self.append_log("\n--- PROCESS FINISHED ---\n")
         self.btn_start.set_sensitive(True)
+        self.btn_test.set_sensitive(True)
         self.btn_clean.set_sensitive(True)
         self.btn_stop.set_sensitive(False)
         # Unlock inputs
@@ -286,8 +371,26 @@ class DeckUpadLauncher(Gtk.Window):
         self.process = None
 
     def on_stop(self, widget):
+        # Stop Test Simulation
+        if self.test_receiver_proc:
+            self.append_log("Stopping Test Receiver...\n")
+            subprocess.run(["podman", "stop", "-t", "0", self.test_container_name], stderr=subprocess.DEVNULL)
+            self.test_receiver_proc = None
+
+        if self.test_sender_proc:
+            self.append_log("Stopping Test Sender...\n")
+            # --- FIX: FORCE KILL IF STUCK ---
+            try:
+                self.test_sender_proc.terminate()
+                self.test_sender_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.append_log("Force killing Test Sender...\n")
+                self.test_sender_proc.kill()
+            self.test_sender_proc = None
+
+        # Stop Main Service
         if self.process:
-            self.append_log("\nStopping...\n")
+            self.append_log("\nStopping Service...\n")
             try: self.process.terminate()
             except: pass
 

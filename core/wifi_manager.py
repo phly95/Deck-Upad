@@ -58,10 +58,17 @@ class WifiManager:
         self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
 
         try:
+            # util-linux contains rfkill
             pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
-            print("   Installing dependencies...")
+            print("   Installing dependencies (this may take a moment)...")
             self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
+
+            print(f"   Committing to {CUSTOM_IMAGE}...")
             self._run_command(f"podman commit {builder_name} {CUSTOM_IMAGE}")
+        except Exception as e:
+            print(f"[ERROR] Build failed: {e}")
+            self._run_command(f"podman stop {builder_name}", check=False)
+            raise e
         finally:
             self._run_command(f"podman rm -f {builder_name}", check=False)
 
@@ -164,7 +171,7 @@ class WifiManager:
     def _initialize_container(self):
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # Reuse the logic we just wrote
+        # 1. Build Image if missing (Requires Internet)
         self.ensure_image_exists()
 
         # 2. Start Runtime Container (Isolated Network)
@@ -249,18 +256,20 @@ class WifiManager:
         self._run_command(f"{self.exec_cmd} 'brctl addif br0 {VETH_CTR}'")
         self._run_command(f"{self.exec_cmd} 'ip addr add {ROUTER_LAN_IP}/24 dev br0'")
 
-        # 3. Connect Host to Bridge (Manual IP Config to bypass NetworkManager issues)
+        # 3. Connect Host to Bridge (Use NM to ensure Routes/DNS work)
         self._run_command(f"ip link set {VETH_HOST} up")
-        self._run_command(f"nmcli device set {VETH_HOST} managed no", check=False)
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
 
-        self._run_command(f"ip addr flush dev {VETH_HOST}")
-        self._run_command(f"ip addr add {HOST_LAN_IP}/24 dev {VETH_HOST}")
-        self._run_command(f"ip route add 192.168.50.0/24 dev {VETH_HOST} src {HOST_LAN_IP}", check=False)
+        # Only set default gateway if we have a WAN connection to forward
+        gw_arg = f"gw4 {ROUTER_LAN_IP}" if has_wan else ""
+        dns_arg = "ipv4.dns '8.8.8.8'" if has_wan else ""
 
-        # Disable Reverse Path Filter to allow bridging
-        self._run_command(f"sysctl -w net.ipv4.conf.{VETH_HOST}.rp_filter=0", check=False)
-        self._run_command(f"sysctl -w net.ipv4.conf.all.rp_filter=0", check=False)
+        nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
+                  f"ip4 {HOST_LAN_IP}/24 {gw_arg} connection.zone trusted "
+                  f"ipv4.route-metric 20 {dns_arg} ipv4.ignore-auto-dns yes")
+
+        self._run_command(nm_cmd)
+        self._run_command(f"nmcli connection up {NM_CONN_NAME}")
 
         self._open_host_ports()
 

@@ -20,6 +20,7 @@ from gi.repository import Gst, GstVideo, GLib
 
 # --- CONFIGURATION ---
 # The abstract socket path used by Azahar/Citra for IPC
+# Note: The leading null byte '\0' indicates the Abstract Namespace
 SOCKET_PATH = '\0/com/DeckUpad/video'
 
 # Binary struct format for the texture metadata packet
@@ -311,9 +312,10 @@ class VideoSender:
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # Cleanup if exists
-        try: os.unlink(SOCKET_PATH)
-        except OSError: pass
+        # Cleanup if exists (Only for filesystem sockets, skip for abstract namespace starting with \0)
+        if not SOCKET_PATH.startswith('\0'):
+            try: os.unlink(SOCKET_PATH)
+            except OSError: pass
 
         try:
             self.server.bind(SOCKET_PATH)

@@ -125,11 +125,22 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_start.connect("clicked", self.on_start)
         btn_box.pack_start(self.btn_start, False, False, 0)
 
-        # Test Button
-        self.btn_test = Gtk.Button(label="Test Video\n(Simulation)")
-        self.btn_test.set_size_request(150, 50)
-        self.btn_test.connect("clicked", self.on_test_video)
-        btn_box.pack_start(self.btn_test, False, False, 0)
+        # Test Box
+        test_box = Gtk.Box(spacing=10)
+
+        # Simulation (Generated)
+        self.btn_test_sim = Gtk.Button(label="Test Video\n(Simulation)")
+        self.btn_test_sim.set_size_request(120, 50)
+        self.btn_test_sim.connect("clicked", lambda w: self.on_test_video(simulated=True))
+        test_box.pack_start(self.btn_test_sim, False, False, 0)
+
+        # Emulator (Real)
+        self.btn_test_emu = Gtk.Button(label="Test Video\n(Emulator)")
+        self.btn_test_emu.set_size_request(120, 50)
+        self.btn_test_emu.connect("clicked", lambda w: self.on_test_video(simulated=False))
+        test_box.pack_start(self.btn_test_emu, False, False, 0)
+
+        btn_box.pack_start(test_box, False, False, 0)
 
         # Cleanup Button
         self.btn_clean = Gtk.Button(label="Force Cleanup")
@@ -196,10 +207,13 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
-    def on_test_video(self, widget):
+    def on_test_video(self, simulated=True):
         self.save_config()
-        self.append_log("\n--- STARTING VIDEO SIMULATION (CONTAINER) ---\n")
-        self.btn_test.set_sensitive(False)
+        mode_str = "SIMULATION" if simulated else "EMULATOR INTEGRATION"
+        self.append_log(f"\n--- STARTING VIDEO TEST ({mode_str}) ---\n")
+
+        self.btn_test_sim.set_sensitive(False)
+        self.btn_test_emu.set_sensitive(False)
         self.btn_start.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
 
@@ -212,6 +226,7 @@ class DeckUpadLauncher(Gtk.Window):
 
         subprocess.run(["podman", "rm", "-f", self.test_container_name], stderr=subprocess.DEVNULL)
 
+        # Launch Receiver in Windowed Mode
         cmd = [
             "podman", "run", "--rm", "--name", self.test_container_name,
             "--net=host",
@@ -223,10 +238,10 @@ class DeckUpadLauncher(Gtk.Window):
             "-e", "GDK_BACKEND=x11,wayland",
             "-v", f"{script_path}:/app/main.py",
             REC_IMAGE,
-            "python3", "/app/main.py"
+            "python3", "/app/main.py", "--windowed" # <--- Added windowed flag
         ]
 
-        GLib.idle_add(self.append_log, f"Launching Receiver Container: {self.test_container_name}...\n")
+        GLib.idle_add(self.append_log, f"Launching Receiver Container (Windowed)...\n")
 
         try:
             self.test_receiver_proc = subprocess.Popen(
@@ -240,26 +255,42 @@ class DeckUpadLauncher(Gtk.Window):
             GLib.idle_add(self.append_log, f"Container launch failed: {e}\n")
             return
 
-        threading.Timer(3.0, self._start_test_sender).start()
+        # Launch Sender
+        threading.Timer(3.0, lambda: self._start_test_sender(simulated)).start()
 
-    def _start_test_sender(self):
-        GLib.idle_add(self.append_log, "Launching Sender (Host Simulation)...\n")
+    def _start_test_sender(self, simulated):
+        args = ["python3", "core/video_sender.py", "127.0.0.1"]
+        if simulated:
+            args.append("--test-mode")
+            GLib.idle_add(self.append_log, "Launching Sender (Generated Pattern)...\n")
+        else:
+            GLib.idle_add(self.append_log, "Launching Sender (Waiting for Azahar)...\n")
+            GLib.idle_add(self.append_log, ">>> PLEASE LAUNCH AZAHAR NOW <<<\n")
+
         try:
             self.test_sender_proc = subprocess.Popen(
-                ["python3", "core/video_sender.py", "127.0.0.1", "--test-mode"],
+                args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True
             )
-            threading.Thread(target=self._monitor_pipe, args=(self.test_sender_proc, "[TX]"), daemon=True).start()
+            # Monitor output - looking for VIDEO_STARTING triggers
+            threading.Thread(target=self._monitor_sender_output, args=(self.test_sender_proc,), daemon=True).start()
 
-            time.sleep(1)
-            GLib.idle_add(self.append_log, "Sending START_VIDEO signal...\n")
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.sendto(b"START_VIDEO", ("127.0.0.1", 5003))
+            # If simulated, we need to force the start signal after a moment
+            if simulated:
+                time.sleep(1)
+                self._send_udp_signal()
 
         except Exception as e:
             GLib.idle_add(self.append_log, f"Sender failed: {e}\n")
+
+    def _send_udp_signal(self):
+        GLib.idle_add(self.append_log, "Sending START_VIDEO signal...\n")
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(b"START_VIDEO", ("127.0.0.1", 5003))
+        except: pass
 
     def _monitor_pipe(self, proc, prefix):
         while True:
@@ -267,13 +298,34 @@ class DeckUpadLauncher(Gtk.Window):
             if not line and proc.poll() is not None: break
             if line: GLib.idle_add(self.append_log, f"{prefix} {line}")
 
+    def _monitor_sender_output(self, proc):
+        """Monitors sender specifically to trigger the receiver window."""
+        while True:
+            line = proc.stdout.readline()
+            if not line and proc.poll() is not None: break
+
+            msg = line.strip()
+            if msg:
+                GLib.idle_add(self.append_log, f"[TX] {msg}\n")
+
+                # Auto-trigger receiver when sender is ready
+                if msg == "VIDEO_STARTING":
+                    self._send_udp_signal()
+                elif msg == "VIDEO_STOPPED":
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.sendto(b"STOP_VIDEO", ("127.0.0.1", 5003))
+                    except: pass
+
     def on_start(self, widget):
+        # ... (Same as before) ...
         try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
         except: pass
 
         self.save_config()
         self.btn_start.set_sensitive(False)
-        self.btn_test.set_sensitive(False)
+        self.btn_test_sim.set_sensitive(False)
+        self.btn_test_emu.set_sensitive(False)
         self.btn_clean.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
         # Lock inputs
@@ -310,7 +362,8 @@ class DeckUpadLauncher(Gtk.Window):
     def on_cleanup(self, widget):
         self.save_config()
         self.btn_start.set_sensitive(False)
-        self.btn_test.set_sensitive(False)
+        self.btn_test_sim.set_sensitive(False)
+        self.btn_test_emu.set_sensitive(False)
         self.btn_clean.set_sensitive(False)
 
         sudo_pw = self.entry_sudo.get_text()
@@ -359,7 +412,8 @@ class DeckUpadLauncher(Gtk.Window):
     def process_finished(self):
         self.append_log("\n--- PROCESS FINISHED ---\n")
         self.btn_start.set_sensitive(True)
-        self.btn_test.set_sensitive(True)
+        self.btn_test_sim.set_sensitive(True)
+        self.btn_test_emu.set_sensitive(True)
         self.btn_clean.set_sensitive(True)
         self.btn_stop.set_sensitive(False)
         # Unlock inputs
@@ -379,12 +433,10 @@ class DeckUpadLauncher(Gtk.Window):
 
         if self.test_sender_proc:
             self.append_log("Stopping Test Sender...\n")
-            # --- FIX: FORCE KILL IF STUCK ---
             try:
                 self.test_sender_proc.terminate()
                 self.test_sender_proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                self.append_log("Force killing Test Sender...\n")
                 self.test_sender_proc.kill()
             self.test_sender_proc = None
 

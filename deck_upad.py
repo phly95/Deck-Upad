@@ -17,40 +17,28 @@ def run_cmd(cmd):
     subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
 def check_internet():
-    """Returns True if we can reach Google DNS."""
     try:
-        # Connect to 8.8.8.8 on port 53 (DNS) - fast and reliable
         socket.create_connection(("8.8.8.8", 53), timeout=2)
         return True
     except OSError:
         return False
 
 def wait_for_network_restore(timeout=15):
-    """Blocks until internet is restored or timeout expires."""
     print("[Startup] Verifying Internet Connectivity...")
     start = time.time()
     while time.time() - start < timeout:
-        if check_internet():
-            return True
+        if check_internet(): return True
         time.sleep(1)
-    print("[Startup] Warning: Internet not detected. Image builds may fail.")
+    print("[Startup] Warning: Internet not detected.")
     return False
 
 def perform_aggressive_cleanup(force=False):
-    """
-    Cleans up state.
-    If 'force' is False, we only cleanup if a stale PID file exists (crash detected).
-    """
-    # If no PID file and not forced, assume clean exit and skip to save time/net
-    if not force and not os.path.exists(PID_FILE):
-        return
+    if not force and not os.path.exists(PID_FILE): return
 
     print("[Startup] Cleaning up previous session state...")
-
     if os.path.exists(PID_FILE):
         try:
-            with open(PID_FILE, 'r') as f:
-                old_pid = int(f.read().strip())
+            with open(PID_FILE, 'r') as f: old_pid = int(f.read().strip())
             if old_pid != os.getpid():
                 try: os.kill(old_pid, signal.SIGKILL)
                 except: pass
@@ -71,17 +59,13 @@ def perform_aggressive_cleanup(force=False):
         run_cmd(f"firewall-cmd --remove-port={ports}/udp")
         run_cmd(f"firewall-cmd --remove-port={ports}/tcp")
 
-    # Restore WiFi
     run_cmd("nmcli device set wlan0 managed yes")
     run_cmd("nmcli device connect wlan0")
-
-    # Wait for the OS to grab an IP
     wait_for_network_restore()
 
 def write_pid_file():
     try:
-        with open(PID_FILE, 'w') as f:
-            f.write(str(os.getpid()))
+        with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
     except: pass
 
 def remove_pid_file():
@@ -96,11 +80,11 @@ def main():
     parser.add_argument("--password", default="DeckUpad123")
     parser.add_argument("--channel", default=165, type=int)
     parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax")
+    parser.add_argument("--country", default="US")
     parser.add_argument("--force-clean", action="store_true")
 
     args = parser.parse_args()
 
-    # 1. Startup Cleanup
     perform_aggressive_cleanup(force=args.force_clean)
     write_pid_file()
 
@@ -108,8 +92,7 @@ def main():
 
     def signal_handler(sig, frame):
         print("\n[Main] Signal received. Shutting down...")
-        if service:
-            service.stop()
+        if service: service.stop()
         remove_pid_file()
         sys.exit(0)
 
@@ -120,21 +103,20 @@ def main():
         if args.role == "host":
             print("--- LAUNCHING HOST DAEMON ---")
             service = HostService()
-            service.start(ssid=args.ssid, password=args.password, channel=args.channel, wifi_mode=args.wifi_mode)
+            service.start(ssid=args.ssid, password=args.password,
+                          channel=args.channel, wifi_mode=args.wifi_mode,
+                          country=args.country)
         else:
             print("--- LAUNCHING CLIENT AGENT ---")
             service = ClientService()
-            service.start(ssid=args.ssid, password=args.password)
-
+            service.start(ssid=args.ssid, password=args.password, country=args.country)
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Script crashed: {e}")
-        # --- FIX: Ensure cleanup runs if we crash ---
         if service:
             try: service.stop()
             except: pass
         perform_aggressive_cleanup(force=True)
         sys.exit(1)
-
     finally:
         remove_pid_file()
 

@@ -24,7 +24,6 @@ class ClientService:
         self.usbip = UsbIpManager()
         self.bus_id = None
         self.host_socket = None
-        # --- FIX: Define this here ---
         self.gui_container_name = "stream-receiver"
 
     def ensure_receiver_image_exists(self):
@@ -65,8 +64,7 @@ class ClientService:
         finally:
             subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
 
-
-    def start(self, ssid, password):
+    def start(self, ssid, password, country="US"):
         print("="*50)
         print("   DECK-UPAD CLIENT AGENT")
         print("="*50)
@@ -79,15 +77,15 @@ class ClientService:
             self.ensure_receiver_image_exists()
         except Exception as e:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
+            print("Ensure you have an active internet connection before starting.")
             sys.exit(1)
 
         # 2. START HARDWARE
         print(f"[Client] Configuring WiFi Container for {ssid}...")
         try:
-            self.wifi.start_client_mode(ssid=ssid, password=password)
+            self.wifi.start_client_mode(ssid=ssid, password=password, country=country)
         except Exception as e:
             print(f"[CRITICAL] WiFi Setup Failed: {e}")
-            # Ensure cleanup happens if wifi fails
             self.stop()
             sys.exit(1)
 
@@ -148,6 +146,7 @@ class ClientService:
                 if "ACK_AUTHORIZED" in resp:
                     print("   >> Session Established!")
                     self._send_gui_command("STATUS:Connected. Ready.")
+                    s.settimeout(None) # Disable timeout for persistent connection
                     return s
                 else: s.close()
             except (socket.timeout, ConnectionRefusedError, OSError):
@@ -184,6 +183,10 @@ class ClientService:
 
         subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Restore Controls
+        if self.bus_id:
+            self.usbip.release_device(self.bus_id)
 
         self.usbip.cleanup()
         self.wifi.cleanup()

@@ -14,13 +14,11 @@ class HostService:
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
         self.running = True
-
         self.server_socket = None
         self.client_conn = None
-
         self.video_proc = None
 
-    def start(self, ssid, password, channel=165, wifi_mode="ax"):
+    def start(self, ssid, password, channel=165, wifi_mode="ax", country="US"):
         print("="*50)
         print("   DECK-UPAD HOST DAEMON")
         print("="*50)
@@ -37,7 +35,7 @@ class HostService:
         # 2. START INFRASTRUCTURE
         print(f"[Host] Initializing WiFi Bridge (SSID: {ssid})...")
         try:
-            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode)
+            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode, country=country)
         except Exception as e:
             print(f"[CRITICAL] WiFi Failed: {e}")
             self.stop()
@@ -54,7 +52,6 @@ class HostService:
         self.run_server()
 
     def run_server(self):
-        # Retry loop to wait for IP assignment
         attempts = 0
         bound = False
 
@@ -72,9 +69,7 @@ class HostService:
                 attempts += 1
 
         if not bound:
-            print("[CRITICAL] Could not bind to network interface. Is veth-host active?")
-            # Debug: List IPs to help troubleshoot
-            os.system("ip addr show veth-host")
+            print("[CRITICAL] Could not bind to network interface.")
             self.stop()
             return
 
@@ -94,13 +89,11 @@ class HostService:
                 data = conn.recv(1024).decode().strip()
                 if data.startswith("HELLO_FROM_DECK"):
                     conn.send(b"ACK_AUTHORIZED")
-
                     self._start_video_process(client_ip)
 
                     if "|BUS_ID:" in data:
                         bus_id = data.split("|BUS_ID:")[1]
                         threading.Thread(target=self.usbip.connect_device, args=(client_ip, bus_id)).start()
-
                 else:
                     conn.close()
                     self.client_conn = None
@@ -112,10 +105,8 @@ class HostService:
                 print(f"[Host] Loop Error: {e}")
 
     def _get_user_env(self):
-        """Constructs environment for the subprocess to run as the sudo user."""
         sudo_user = os.environ.get('SUDO_USER')
-        if not sudo_user:
-            return os.environ.copy()
+        if not sudo_user: return os.environ.copy()
 
         env = os.environ.copy()
         try:

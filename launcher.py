@@ -17,14 +17,13 @@ CONFIG_FILE = os.path.expanduser("~/.deck_upad_config.json")
 class DeckUpadLauncher(Gtk.Window):
     def __init__(self):
         super().__init__(title="Deck-Upad Control Panel")
-        self.set_default_size(900, 600)
+        self.set_default_size(900, 700)
         self.set_border_width(10)
 
         # Dark Theme Hint
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-application-prefer-dark-theme", True)
 
-        # State
         self.process = None
         self.config = self.load_config()
 
@@ -44,7 +43,7 @@ class DeckUpadLauncher(Gtk.Window):
         grid.set_halign(Gtk.Align.CENTER)
         main_vbox.pack_start(grid, False, False, 10)
 
-        # Row 1: Role Selection
+        # Row 0: Role Selection
         grid.attach(Gtk.Label(label="Device Role:"), 0, 0, 1, 1)
         role_box = Gtk.Box(spacing=10)
         self.rb_client = Gtk.RadioButton.new_with_label_from_widget(None, "Client (Steam Deck)")
@@ -53,19 +52,19 @@ class DeckUpadLauncher(Gtk.Window):
         role_box.pack_start(self.rb_host, False, False, 0)
         grid.attach(role_box, 1, 0, 2, 1)
 
-        # Row 2: SSID
+        # Row 1: SSID
         grid.attach(Gtk.Label(label="WiFi SSID:"), 0, 1, 1, 1)
         self.entry_ssid = Gtk.Entry()
         self.entry_ssid.set_text(self.config.get("ssid", "DeckUpad"))
         grid.attach(self.entry_ssid, 1, 1, 2, 1)
 
-        # Row 3: WiFi Password
+        # Row 2: WiFi Password
         grid.attach(Gtk.Label(label="WiFi Password:"), 0, 2, 1, 1)
         self.entry_pass = Gtk.Entry()
         self.entry_pass.set_text(self.config.get("password", "DeckUpad123"))
         grid.attach(self.entry_pass, 1, 2, 2, 1)
 
-        # Row 4: WiFi Mode
+        # Row 3: WiFi Mode
         grid.attach(Gtk.Label(label="WiFi Standard:"), 0, 3, 1, 1)
         self.combo_mode = Gtk.ComboBoxText()
         self.combo_mode.append("ax", "AX (WiFi 6 - Recommended)")
@@ -74,22 +73,39 @@ class DeckUpadLauncher(Gtk.Window):
         self.combo_mode.set_active_id(self.config.get("wifi_mode", "ax"))
         grid.attach(self.combo_mode, 1, 3, 2, 1)
 
-        # Row 5: Sudo Password (NEW)
-        grid.attach(Gtk.Label(label="Sudo Password:"), 0, 4, 1, 1)
+        # Row 4: WiFi Channel
+        grid.attach(Gtk.Label(label="WiFi Channel:"), 0, 4, 1, 1)
+        adj = Gtk.Adjustment(value=165, lower=1, upper=177, step_increment=1, page_increment=10, page_size=0)
+        self.spin_channel = Gtk.SpinButton(adjustment=adj)
+        self.spin_channel.set_numeric(True)
+        self.spin_channel.set_value(int(self.config.get("channel", 165)))
+        grid.attach(self.spin_channel, 1, 4, 2, 1)
+
+        # Row 5: WiFi Country
+        grid.attach(Gtk.Label(label="WiFi Country:"), 0, 5, 1, 1)
+        self.combo_country = Gtk.ComboBoxText()
+        self.combo_country.set_entry_text_column(0)
+        countries = [("US", "United States"), ("GB", "United Kingdom"), ("DE", "Germany"), ("JP", "Japan"), ("CA", "Canada"), ("AU", "Australia"), ("FR", "France"), ("KR", "South Korea"), ("CN", "China"), ("BR", "Brazil")]
+        for code, name in countries:
+            self.combo_country.append(code, f"{code} - {name}")
+
+        default_country = self.config.get("country", "US")
+        self.combo_country.set_active_id(default_country)
+        grid.attach(self.combo_country, 1, 5, 2, 1)
+
+        # Row 6: Sudo Password
+        grid.attach(Gtk.Label(label="Sudo Password:"), 0, 6, 1, 1)
         self.entry_sudo = Gtk.Entry()
-        self.entry_sudo.set_visibility(False) # Hide dots
+        self.entry_sudo.set_visibility(False)
         self.entry_sudo.set_invisible_char("•")
         self.entry_sudo.set_text(self.config.get("sudo_pass", ""))
-        grid.attach(self.entry_sudo, 1, 4, 1, 1)
+        grid.attach(self.entry_sudo, 1, 6, 1, 1)
 
-        # Checkbox for Saving Sudo
         self.chk_save_sudo = Gtk.CheckButton(label="Save Sudo Password")
         self.chk_save_sudo.set_active(bool(self.config.get("sudo_pass", "")))
-        grid.attach(self.chk_save_sudo, 2, 4, 1, 1)
+        grid.attach(self.chk_save_sudo, 2, 6, 1, 1)
 
-        # Restore Role Selection
-        if self.config.get("role") == "host":
-            self.rb_host.set_active(True)
+        if self.config.get("role") == "host": self.rb_host.set_active(True)
 
         # 3. Action Buttons
         btn_box = Gtk.Box(spacing=20)
@@ -134,25 +150,26 @@ class DeckUpadLauncher(Gtk.Window):
     def load_config(self):
         try:
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r') as f:
-                    return json.load(f)
+                with open(CONFIG_FILE, 'r') as f: return json.load(f)
         except: pass
         return {}
 
     def save_config(self):
         role = "host" if self.rb_host.get_active() else "client"
         sudo_pass = self.entry_sudo.get_text() if self.chk_save_sudo.get_active() else ""
+        country = self.combo_country.get_active_id() or "US"
 
         data = {
             "role": role,
             "ssid": self.entry_ssid.get_text(),
             "password": self.entry_pass.get_text(),
             "wifi_mode": self.combo_mode.get_active_id(),
+            "channel": int(self.spin_channel.get_value()),
+            "country": country,
             "sudo_pass": sudo_pass
         }
         try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(data, f)
+            with open(CONFIG_FILE, 'w') as f: json.dump(data, f)
         except: pass
 
     def append_log(self, text):
@@ -166,29 +183,34 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.set_sensitive(True)
         self.entry_ssid.set_sensitive(False)
         self.entry_pass.set_sensitive(False)
+        self.spin_channel.set_sensitive(False)
+        self.combo_mode.set_sensitive(False)
+        self.combo_country.set_sensitive(False)
 
         role = "host" if self.rb_host.get_active() else "client"
         ssid = self.entry_ssid.get_text()
         pw = self.entry_pass.get_text()
         wifi_mode = self.combo_mode.get_active_id()
+        channel = str(int(self.spin_channel.get_value()))
+        country = self.combo_country.get_active_id() or "US"
         sudo_pw = self.entry_sudo.get_text()
 
         script_path = os.path.abspath("deck_upad.py")
 
-        # Use sudo -S to read password from stdin
         cmd = [
             "sudo", "-S",
             "python3", "-u", script_path,
             "--role", role,
             "--ssid", ssid,
             "--password", pw,
-            "--wifi-mode", wifi_mode
+            "--wifi-mode", wifi_mode,
+            "--channel", channel,
+            "--country", country
         ]
 
         self.append_log(f"--- STARTING {role.upper()} MODE ---\n")
 
         try:
-            # Create process with PIPE for stdin (to write password)
             self.process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -198,12 +220,11 @@ class DeckUpadLauncher(Gtk.Window):
                 bufsize=1
             )
 
-            # Send password + newline
             if sudo_pw:
                 try:
                     self.process.stdin.write(sudo_pw + "\n")
                     self.process.stdin.flush()
-                except OSError: pass # Process might have exited if pw wrong or not needed
+                except OSError: pass
 
             t = threading.Thread(target=self.monitor_process, daemon=True)
             t.start()
@@ -215,11 +236,8 @@ class DeckUpadLauncher(Gtk.Window):
     def monitor_process(self):
         while True:
             line = self.process.stdout.readline()
-            if not line and self.process.poll() is not None:
-                break
-            if line:
-                GLib.idle_add(self.append_log, line)
-
+            if not line and self.process.poll() is not None: break
+            if line: GLib.idle_add(self.append_log, line)
         GLib.idle_add(self.process_finished)
 
     def process_finished(self):
@@ -228,24 +246,22 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.set_sensitive(False)
         self.entry_ssid.set_sensitive(True)
         self.entry_pass.set_sensitive(True)
+        self.spin_channel.set_sensitive(True)
+        self.combo_mode.set_sensitive(True)
+        self.combo_country.set_sensitive(True)
         self.process = None
 
     def on_stop(self, widget):
         if self.process:
             self.append_log("\nStopping...\n")
-            try:
-                self.process.terminate()
+            try: self.process.terminate()
             except: pass
 
-            # Force cleanup of root process
             def force_kill_if_needed():
                 import time
                 time.sleep(1)
                 if self.process and self.process.poll() is None:
-                    # We need sudo to kill the sudo process
-                    subprocess.run(["sudo", "pkill", "-f", "deck_upad.py"],
-                                 stderr=subprocess.DEVNULL)
-
+                    subprocess.run(["sudo", "pkill", "-f", "deck_upad.py"], stderr=subprocess.DEVNULL)
             threading.Thread(target=force_kill_if_needed, daemon=True).start()
 
     def on_close(self, widget):

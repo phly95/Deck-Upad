@@ -33,7 +33,6 @@ class WifiManager:
         self.wifi_interface = self._get_active_wifi_interface()
         self.eth_interface = self._get_host_upstream_interface()
 
-        # Ensure we don't try to use the WiFi card as the Ethernet WAN
         if self.eth_interface == self.wifi_interface:
             self.eth_interface = None
 
@@ -58,7 +57,7 @@ class WifiManager:
         self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
 
         try:
-            # util-linux contains rfkill
+            # Install tools
             pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"
             print("   Installing dependencies (this may take a moment)...")
             self._run_command(f"podman exec {builder_name} apk add --no-cache {pkgs}")
@@ -74,33 +73,26 @@ class WifiManager:
 
     # --- Public API ---
 
-    def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax"):
-        """
-        Sets up the device as a Router (AP).
-        wifi_mode: 'n' (Legacy), 'ac' (WiFi 5), 'ax' (WiFi 6)
-        """
-        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Ch: {channel}, Mode: {wifi_mode})...")
+    def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax", country="US"):
+        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Ch: {channel}, Region: {country})...")
         self._initialize_container()
 
         # 1. Move WiFi Card to Container
         ctr_pid = self._move_wifi_card()
 
         # 2. Setup AP Logic
-        self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode)
+        self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode, country)
         print("[WifiManager] Host Mode Ready.")
 
-    def start_client_mode(self, ssid, password):
-        """
-        Connects the device to an existing WiFi network.
-        """
-        print(f"[WifiManager] Starting CLIENT mode (Connecting to: {ssid})...")
+    def start_client_mode(self, ssid, password, country="US"):
+        print(f"[WifiManager] Starting CLIENT mode (Connecting to: {ssid}, Region: {country})...")
         self._initialize_container()
 
         # 1. Move WiFi Card to Container
         ctr_pid = self._move_wifi_card()
 
         # 2. Setup Client Logic
-        self._setup_client_logic(ssid, password, ctr_pid)
+        self._setup_client_logic(ssid, password, ctr_pid, country)
         print("[WifiManager] Client Mode Ready.")
 
     def cleanup(self):
@@ -171,10 +163,10 @@ class WifiManager:
     def _initialize_container(self):
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
-        # 1. Build Image if missing (Requires Internet)
+        # 1. Build Image if missing
         self.ensure_image_exists()
 
-        # 2. Start Runtime Container (Isolated Network)
+        # 2. Start Runtime Container
         print(f"[WifiManager] Starting container '{CONTAINER_NAME}'...")
         podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
@@ -221,7 +213,6 @@ class WifiManager:
         return ctr_pid
 
     def _open_host_ports(self):
-        # 1. Fedora / RHEL / Bazzite (Firewalld)
         if shutil.which("firewall-cmd"):
             try:
                 self._run_command(f"firewall-cmd --zone=trusted --add-interface={VETH_HOST}", check=False)
@@ -230,8 +221,6 @@ class WifiManager:
                 self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/udp", check=False)
                 self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/tcp", check=False)
             except: pass
-
-        # 2. Ubuntu / Debian / Tuxedo (UFW)
         elif shutil.which("ufw"):
             try:
                 self._run_command(f"ufw allow in on {VETH_HOST}", check=False)
@@ -242,25 +231,26 @@ class WifiManager:
 
     # --- Mode Specific Logic ---
 
-    def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode="ax"):
+    def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode="ax", country="US"):
         has_wan = self._move_ethernet_card(ctr_pid)
         wan_iface = self.eth_interface if has_wan else "eth0"
 
-        # 2. Setup VETH Bridge to Host
+        # Apply Region
+        self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
+
+        # Setup VETH
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
-
         self._run_command(f"{self.exec_cmd} 'ip link add name br0 type bridge'")
         self._run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
         self._run_command(f"{self.exec_cmd} 'ip link set br0 up'")
         self._run_command(f"{self.exec_cmd} 'brctl addif br0 {VETH_CTR}'")
         self._run_command(f"{self.exec_cmd} 'ip addr add {ROUTER_LAN_IP}/24 dev br0'")
 
-        # 3. Connect Host to Bridge (Use NM to ensure Routes/DNS work)
+        # Connect Host to Bridge using NetworkManager for correct routing
         self._run_command(f"ip link set {VETH_HOST} up")
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
 
-        # Only set default gateway if we have a WAN connection to forward
         gw_arg = f"gw4 {ROUTER_LAN_IP}" if has_wan else ""
         dns_arg = "ipv4.dns '8.8.8.8'" if has_wan else ""
 
@@ -273,17 +263,16 @@ class WifiManager:
 
         self._open_host_ports()
 
-        # 4. NAT / Routing
+        # NAT / Routing
         if has_wan:
             self._run_command(f"{self.exec_cmd} 'sysctl -w net.ipv4.ip_forward=1'")
             self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o {wan_iface} -j MASQUERADE'")
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i br0 -o {wan_iface} -j ACCEPT'")
             self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {wan_iface} -o br0 -m state --state RELATED,ESTABLISHED -j ACCEPT'")
 
-        # Open Container Floodgates
         self._run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'", check=False)
 
-        # 5. Start Hostapd
+        # Hostapd Config
         is_5ghz = int(channel) > 14
         hw_mode = "a" if is_5ghz else "g"
 
@@ -297,7 +286,7 @@ class WifiManager:
         hostapd_conf = f"""interface=wlan0
 bridge=br0
 ssid={ssid}
-country_code=US
+country_code={country}
 hw_mode={hw_mode}
 channel={channel}
 wmm_enabled=1
@@ -312,15 +301,13 @@ rsn_pairwise=CCMP"""
 
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
 
-        self._run_command(f"{self.exec_cmd} 'iw reg set US'", check=False)
-        time.sleep(1)
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
         self._run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
 
-        # 6. Start DNS/DHCP
+        # DNS/DHCP
         dnsmasq_conf = f"""interface=br0
 dhcp-range={DHCP_RANGE}
 dhcp-option=3,{ROUTER_LAN_IP}
@@ -328,7 +315,7 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
         self._run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
-    def _setup_client_logic(self, ssid, password, ctr_pid):
+    def _setup_client_logic(self, ssid, password, ctr_pid, country="US"):
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self._run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
@@ -338,9 +325,12 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
         self._run_command(f"nmcli connection up {NM_CONN_NAME}")
 
+        # Apply Region
+        self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
+
         wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
 update_config=1
-country=US
+country={country}
 network={{
     ssid="{ssid}"
     psk="{password}"
@@ -360,7 +350,7 @@ network={{
 
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
 
-        # --- FIX: Fail if DHCP fails ---
+        # Critical: Fail if DHCP fails so main script stops
         try:
             self._run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
         except subprocess.CalledProcessError:

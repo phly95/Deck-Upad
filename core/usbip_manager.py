@@ -8,7 +8,7 @@ import re
 # --- Configuration ---
 CONTAINER_NAME = "usbip-sidecar"
 BUILDER_NAME = "usbip-builder"
-BASE_IMAGE = "fedora:41"  # Using Fedora for reliable usbip tools
+BASE_IMAGE = "fedora:41"
 CUSTOM_IMAGE = "usbip-ready-v9"
 
 # Steam Deck Hardware ID
@@ -24,21 +24,19 @@ class UsbIpManager:
         if os.geteuid() != 0:
             raise PermissionError("UsbIpManager must be run as root.")
 
-    # --- NEW: Explicit Build Step ---
     def ensure_image_exists(self):
         """
-        Checks if the image exists. If not, builds it.
-        MUST BE RUN while Host still has Internet access.
+        Ensures the USBIP image is built. Requires Internet.
         """
         if self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
-            return # Image exists
+            return
 
         print(f"[UsbIpManager] Building image '{CUSTOM_IMAGE}' (Internet Required)...")
         self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
         self._run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
         try:
-            # Install tools
+            # Install USBIP tools and kernel modules tools
             install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
             print("   Installing dependencies (this may take a minute)...")
             self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
@@ -54,8 +52,10 @@ class UsbIpManager:
     # --- Public API ---
 
     def start_sender_mode(self):
+        """
+        [Deck Side] Starts container, finds controller, binds it.
+        """
         print("[UsbIpManager] Initializing Sender (Deck)...")
-        # Removed image build check from here to avoid race condition
         self._start_container()
 
         print("   Loading kernel modules...")
@@ -69,11 +69,27 @@ class UsbIpManager:
             return None
 
         print(f"   Binding Controller at Bus {bus_id}...")
+        # Unbind first just in case
         self._run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
         self._run_command(f"{self.exec_cmd} 'usbip bind -b {bus_id}'")
         return bus_id
 
+    def release_device(self, bus_id):
+        """
+        [Critical] Unbinds from USBIP and returns control to SteamOS.
+        """
+        if not bus_id: return
+        print(f"[UsbIpManager] Restoring Controls (Unbinding {bus_id})...")
+        if self._is_container_running():
+            # Unbind from usbip-host
+            self._run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
+            # Trigger udev to re-bind the generic driver
+            self._run_command(f"{self.exec_cmd} 'udevadm trigger'", check=False)
+
     def start_receiver_mode(self):
+        """
+        [Host Side] Starts container, loads vhci-hcd.
+        """
         print("[UsbIpManager] Initializing Receiver (Host)...")
         self._start_container()
         print("   Loading vhci-hcd...")
@@ -91,27 +107,12 @@ class UsbIpManager:
                 print("   Already attached.")
                 return True
 
-            # Attach
-            # Note: We detach port 00 just in case to keep it clean, or we can manage ports dynamically
-            # For now, let's just try to attach.
             out = self._run_command(f"{self.exec_cmd} 'usbip attach -r {client_ip} -b {bus_id}'")
             print(f"   Result: {out}")
             return True
         except Exception as e:
             print(f"[ERROR] Attach failed: {e}")
             return False
-
-    def detach_all(self):
-        if self._is_container_running():
-            print("[UsbIpManager] Detaching all devices...")
-            # Receiver cleanup
-            self._run_command(f"{self.exec_cmd} 'usbip detach -p 00'", check=False)
-            self._run_command(f"{self.exec_cmd} 'usbip detach -p 01'", check=False)
-
-            # Sender cleanup (Unbind)
-            # We don't unbind automatically on close usually, to avoid resetting the controller
-            # while the user might still need it, but for a clean exit:
-            pass
 
     def cleanup(self):
         print("[UsbIpManager] Stopping container...")
@@ -123,10 +124,8 @@ class UsbIpManager:
     def _start_container(self):
         if self._is_container_running(): return
 
-        # Safety check: if image missing, we can't build because we might have lost net.
-        # But we try anyway just in case user is on Ethernet.
         if not self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
-             print("[WARNING] Image missing. Attempting build (might fail if WiFi is already down)...")
+             print("[WARNING] Image missing. Attempting build...")
              self.ensure_image_exists()
 
         print(f"[UsbIpManager] Starting {CONTAINER_NAME}...")
@@ -159,46 +158,11 @@ class UsbIpManager:
         res = self._run_command(f"podman ps -q -f name={CONTAINER_NAME}", check=False)
         return bool(res)
 
-    def _ensure_container_running(self):
-        if self._is_container_running(): return
-
-        # Check Image
-        if not self._run_command(f"podman images -q {CUSTOM_IMAGE}", check=False):
-            print(f"[UsbIpManager] Building image '{CUSTOM_IMAGE}'...")
-            self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-            self._run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
-
-            # Install tools
-            install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
-            self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
-
-            self._run_command(f"podman commit {BUILDER_NAME} {CUSTOM_IMAGE}")
-            self._run_command(f"podman rm -f {BUILDER_NAME}")
-
-        # Run Container
-        print(f"[UsbIpManager] Starting {CONTAINER_NAME}...")
-        self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
-        self._run_command(
-            f"podman run -d --name {CONTAINER_NAME} --replace "
-            "--privileged "
-            "--net=host "
-            "-v /dev:/dev "
-            "-v /lib/modules:/lib/modules:ro "
-            "-v /sys:/sys "
-            f"{CUSTOM_IMAGE} sleep infinity"
-        )
-
     def _find_valve_controller_bus(self):
-        # We look in the Host's sysfs, because /sys is mounted into the container
-        # But we need to run this check on the HOST (where this script runs),
-        # or inside the container?
-        # Since we mount /sys, looking at /sys/bus/usb/devices on the host is easiest.
-
         base_path = "/sys/bus/usb/devices"
         if not os.path.exists(base_path): return None
 
         for device_id in os.listdir(base_path):
-            # Skip root hubs (usb1, usb2) and interface endpoints (1-1:1.0)
             if ":" in device_id or device_id.startswith("usb"): continue
 
             vid_path = os.path.join(base_path, device_id, "idVendor")

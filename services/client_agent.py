@@ -121,17 +121,15 @@ class ClientService:
             f"podman run -d --replace --name {self.gui_container_name} "
             f"--net=host "
             f"--privileged "
-            # Bind mount X11 socket
             f"-v /tmp/.X11-unix:/tmp/.X11-unix "
-            # Bind mount Runtime dir (for Wayland/Pulse)
-            f"-v /run/user/{uid}:/run/user/{uid} "
-            # Environment variables
-            f"-e DISPLAY={display_env} "
-            f"-e XDG_RUNTIME_DIR=/run/user/{uid} "
-            f"-e GDK_BACKEND=x11,wayland " # Try X11 first (often more stable in container), then Wayland
+            f"-v /run/user/{os.getuid()}:/run/user/{os.getuid()} "
+            f"-e DISPLAY={os.environ.get('DISPLAY', ':0')} "
+            f"-e XDG_RUNTIME_DIR=/run/user/{os.getuid()} "
+            f"-e GDK_BACKEND=x11,wayland "
             f"-v {script_path}:/app/main.py "
             f"{REC_IMAGE} "
-            f"python3 /app/main.py"
+            # FIX: Pass host IP to the script inside the container
+            f"python3 /app/main.py --host-ip {TARGET_HOST_IP}"
         )
 
         # We REMOVED stderr=subprocess.DEVNULL so errors show in the launcher log
@@ -179,6 +177,11 @@ class ClientService:
                     if msg == "CMD_SHUTDOWN": return
                     elif msg == "CMD_START_VIDEO": self._send_gui_command("START_VIDEO")
                     elif msg == "CMD_STOP_VIDEO": self._send_gui_command("STOP_VIDEO")
+                    # NEW: Handle Resolution Update
+                    elif msg.startswith("CMD_RES_UPDATE:"):
+                        # Forward as RES_UPDATE:WxH to GUI
+                        res = msg.split(":")[1]
+                        self._send_gui_command(f"RES_UPDATE:{res}")
         except: pass
         finally: self.stop()
 

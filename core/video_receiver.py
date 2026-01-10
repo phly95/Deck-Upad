@@ -3,7 +3,7 @@ import socket
 import json
 import threading
 import time
-import argparse  # <--- Added
+import argparse
 import gi
 
 gi.require_version('Gst', '1.0')
@@ -14,10 +14,12 @@ from gi.repository import Gst, Gtk, Gdk, GLib, Pango
 # --- CONFIG ---
 CONTROL_PORT = 5003
 VIDEO_PORT = 5000
+INPUT_PORT = 5001
 
 class DeckUpadWindow(Gtk.Window):
-    def __init__(self, is_fullscreen=True):
+    def __init__(self, host_ip, is_fullscreen=True):
         super().__init__(title="Deck-Upad Receiver")
+        self.host_ip = host_ip
 
         self.set_default_size(1280, 800)
 
@@ -25,18 +27,17 @@ class DeckUpadWindow(Gtk.Window):
             self.set_keep_above(True)
             self.fullscreen()
         else:
-            self.set_keep_above(False) # Allow alt-tabbing in windowed mode
+            self.set_keep_above(False)
 
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-application-prefer-dark-theme", True)
 
-        # Main Container
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_transition_duration(200)
         self.add(self.stack)
 
-        # --- PAGE 1: IDLE ---
+        # --- IDLE SCREEN ---
         self.idle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.idle_box.set_valign(Gtk.Align.CENTER)
         self.idle_box.set_halign(Gtk.Align.CENTER)
@@ -54,14 +55,12 @@ class DeckUpadWindow(Gtk.Window):
         self.idle_area.add(self.idle_box)
         self.stack.add_named(self.idle_area, "idle")
 
-        # --- PAGE 2: VIDEO ---
+        # --- VIDEO SCREEN ---
         self.video_area = Gtk.DrawingArea()
         self.video_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 1))
         self.stack.add_named(self.video_area, "video")
 
-        # --- GSTREAMER ---
         Gst.init(None)
-        # Use localhost-friendly pipeline
         self.pipeline = Gst.parse_launch(
             f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
             "rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
@@ -73,12 +72,20 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.remove(self.video_area)
         self.stack.add_named(self.sink_widget, "video")
 
+        # --- INPUT HANDLING ---
         self.sink_widget.set_events(Gdk.EventMask.POINTER_MOTION_MASK |
                                     Gdk.EventMask.BUTTON_PRESS_MASK |
                                     Gdk.EventMask.BUTTON_RELEASE_MASK)
         self.sink_widget.connect("motion-notify-event", self.on_input_event, "move")
         self.sink_widget.connect("button-press-event", self.on_input_event, "press")
         self.sink_widget.connect("button-release-event", self.on_input_event, "release")
+
+        self.input_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.last_move = 0
+
+        # Stream Dimensions (Received from Host)
+        self.stream_w = 1280
+        self.stream_h = 800
 
         self.running = True
         self.ctl_thread = threading.Thread(target=self.control_listener, daemon=True)
@@ -109,24 +116,71 @@ class DeckUpadWindow(Gtk.Window):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.bind(("127.0.0.1", CONTROL_PORT))
-            print(f"GUI Listener active on {CONTROL_PORT}")
             while self.running:
                 data, _ = s.recvfrom(1024)
                 msg = data.decode().strip()
                 GLib.idle_add(self.handle_command, msg)
-        except Exception as e:
-            print(f"Control Listener Error: {e}")
+        except: pass
 
     def handle_command(self, cmd):
-        print(f"GUI Command: {cmd}")
-        if cmd == "START_VIDEO":
-            self.set_mode("video")
-        elif cmd == "STOP_VIDEO":
-            self.set_mode("idle", "Video Ended. Waiting...")
-        elif cmd.startswith("STATUS:"):
-            self.set_mode("idle", cmd.split(":", 1)[1])
+        if cmd == "START_VIDEO": self.set_mode("video")
+        elif cmd == "STOP_VIDEO": self.set_mode("idle", "Video Ended. Waiting...")
+        elif cmd.startswith("STATUS:"): self.set_mode("idle", cmd.split(":", 1)[1])
+        elif cmd.startswith("RES_UPDATE:"):
+            # Format RES_UPDATE:1280x800
+            try:
+                parts = cmd.split(":")[1].split("x")
+                self.stream_w = int(parts[0])
+                self.stream_h = int(parts[1])
+                print(f"Updated Stream Resolution: {self.stream_w}x{self.stream_h}")
+            except: pass
 
     def on_input_event(self, widget, event, input_type):
+        if not self.host_ip: return False
+
+        if input_type == "move":
+            if time.time() - self.last_move < 0.016: return True
+            self.last_move = time.time()
+
+        win_w = widget.get_allocated_width()
+        win_h = widget.get_allocated_height()
+        if win_w == 0 or win_h == 0 or self.stream_w == 0: return False
+
+        # --- ASPECT RATIO CORRECTION ---
+        # Calculate where GStreamer is actually drawing the video
+        win_aspect = win_w / win_h
+        src_aspect = self.stream_w / self.stream_h
+
+        if win_aspect > src_aspect:
+            # Pillarbox (Black bars on sides)
+            draw_h = win_h
+            draw_w = win_h * src_aspect
+            offset_x = (win_w - draw_w) / 2
+            offset_y = 0
+        else:
+            # Letterbox (Black bars on top/bottom)
+            draw_w = win_w
+            draw_h = win_w / src_aspect
+            offset_x = 0
+            offset_y = (win_h - draw_h) / 2
+
+        # Check bounds (ignore clicks in black bars)
+        if event.x < offset_x or event.x > (offset_x + draw_w): return True
+        if event.y < offset_y or event.y > (offset_y + draw_h): return True
+
+        # Normalize relative to the VIDEO CONTENT, not the window
+        nx = (event.x - offset_x) / draw_w
+        ny = (event.y - offset_y) / draw_h
+
+        # Clamp just in case
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+
+        payload = json.dumps({"type": input_type, "x": nx, "y": ny}).encode()
+        try:
+            self.input_sock.sendto(payload, (self.host_ip, INPUT_PORT))
+        except: pass
+
         return True
 
     def on_close(self, *args):
@@ -135,8 +189,9 @@ class DeckUpadWindow(Gtk.Window):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host-ip", default="127.0.0.1", help="Target Host IP for input")
     parser.add_argument("--windowed", action="store_true", help="Start in windowed mode")
     args = parser.parse_args()
 
-    win = DeckUpadWindow(is_fullscreen=not args.windowed)
+    win = DeckUpadWindow(host_ip=args.host_ip, is_fullscreen=not args.windowed)
     Gtk.main()

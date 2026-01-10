@@ -4,15 +4,18 @@ import sys
 import threading
 import subprocess
 import os
+import pwd
 
 sys.path.append(".")
 from core.wifi_manager import WifiManager, HOST_LAN_IP
 from core.usbip_manager import UsbIpManager
+from core.input_server import InputServer
 
 class HostService:
     def __init__(self):
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
+        self.input_server = InputServer()
         self.running = True
         self.server_socket = None
         self.client_conn = None
@@ -49,12 +52,13 @@ class HostService:
             sys.exit(1)
 
         print(f"[Host] Infrastructure Ready. IP: {HOST_LAN_IP}")
+
+        self.input_server.start()
         self.run_server()
 
     def run_server(self):
         attempts = 0
         bound = False
-
         while not bound and attempts < 10:
             try:
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -116,12 +120,13 @@ class HostService:
             env['UID'] = str(pw.pw_uid)
             env['XDG_RUNTIME_DIR'] = f"/run/user/{pw.pw_uid}"
 
-            # Find XAuthority for X11 support
             xauth = os.path.join(pw.pw_dir, ".Xauthority")
             if os.path.exists(xauth): env['XAUTHORITY'] = xauth
 
-            # Default Display
             if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+            if 'WAYLAND_DISPLAY' not in env:
+                if os.path.exists(os.path.join(env['XDG_RUNTIME_DIR'], 'wayland-0')):
+                    env['WAYLAND_DISPLAY'] = 'wayland-0'
             return env
         except:
             return os.environ.copy()
@@ -153,7 +158,23 @@ class HostService:
             if not line: break
 
             msg = line.strip()
-            if msg == "VIDEO_STARTING":
+
+            if msg.startswith("STREAM_RES:"):
+                try:
+                    # 1. Update Input Server (Host Side Mapping)
+                    parts = msg.split(":")[1].split("x")
+                    w, h = int(parts[0]), int(parts[1])
+                    self.input_server.update_stream_dimensions(w, h)
+
+                    # 2. Update Client (Deck Side Mapping)
+                    # We send CMD_RES_UPDATE:WxH
+                    if self.client_conn:
+                        cmd = f"CMD_RES_UPDATE:{w}x{h}"
+                        print(f"[Host] Forwarding Resolution to Deck: {w}x{h}")
+                        self.client_conn.send(cmd.encode())
+                except: pass
+
+            elif msg == "VIDEO_STARTING":
                 print("[Host] Signal: Video Starting -> Notifying Deck")
                 if self.client_conn:
                     try: self.client_conn.send(b"CMD_START_VIDEO")
@@ -175,6 +196,7 @@ class HostService:
 
     def stop(self):
         self.running = False
+        if self.input_server: self.input_server.stop()
         if self.client_conn:
             try: self.client_conn.send(b"CMD_SHUTDOWN"); self.client_conn.close()
             except: pass

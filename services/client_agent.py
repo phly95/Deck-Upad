@@ -27,10 +27,6 @@ class ClientService:
         self.gui_container_name = "stream-receiver"
 
     def ensure_receiver_image_exists(self):
-        """
-        Ensures the GStreamer Receiver image is built.
-        MUST run before WiFi is moved to container.
-        """
         res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
         if res.stdout.strip():
             return
@@ -111,23 +107,40 @@ class ClientService:
             self._monitor_lifecycle()
 
     def _launch_receiver_container(self):
+        # Clean up old container
         subprocess.run(["podman", "rm", "-f", self.gui_container_name], stderr=subprocess.DEVNULL)
 
         script_path = os.path.abspath("core/video_receiver.py")
+        uid = os.getuid()
+
+        # Pass both Wayland and X11 sockets
+        # Note: In Game Mode, DISPLAY is usually :0 or :1
+        display_env = os.environ.get('DISPLAY', ':0')
 
         cmd = (
             f"podman run -d --replace --name {self.gui_container_name} "
             f"--net=host "
             f"--privileged "
+            # Bind mount X11 socket
             f"-v /tmp/.X11-unix:/tmp/.X11-unix "
-            f"-v /run/user/{os.getuid()}:/run/user/{os.getuid()} "
-            f"-e DISPLAY={os.environ.get('DISPLAY', ':0')} "
+            # Bind mount Runtime dir (for Wayland/Pulse)
+            f"-v /run/user/{uid}:/run/user/{uid} "
+            # Environment variables
+            f"-e DISPLAY={display_env} "
+            f"-e XDG_RUNTIME_DIR=/run/user/{uid} "
+            f"-e GDK_BACKEND=x11,wayland " # Try X11 first (often more stable in container), then Wayland
             f"-v {script_path}:/app/main.py "
             f"{REC_IMAGE} "
             f"python3 /app/main.py"
         )
 
-        subprocess.run(shlex.split(cmd), stdout=subprocess.DEVNULL)
+        # We REMOVED stderr=subprocess.DEVNULL so errors show in the launcher log
+        result = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode != 0:
+            print(f"[Client] GUI Launch Failed:\n{result.stdout}")
+        else:
+            print(f"[Client] GUI Container ID: {result.stdout.strip()[:12]}")
+
         time.sleep(2)
 
     def _establish_handshake(self):
@@ -146,7 +159,7 @@ class ClientService:
                 if "ACK_AUTHORIZED" in resp:
                     print("   >> Session Established!")
                     self._send_gui_command("STATUS:Connected. Ready.")
-                    s.settimeout(None) # Disable timeout for persistent connection
+                    s.settimeout(None)
                     return s
                 else: s.close()
             except (socket.timeout, ConnectionRefusedError, OSError):
@@ -184,7 +197,6 @@ class ClientService:
         subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Restore Controls
         if self.bus_id:
             self.usbip.release_device(self.bus_id)
 

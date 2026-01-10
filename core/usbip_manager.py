@@ -114,7 +114,38 @@ class UsbIpManager:
             print(f"[ERROR] Attach failed: {e}")
             return False
 
+    def detach_all_ports(self):
+        """
+        [Host Side] Detaches all imported USBIP devices to prevent kernel hangs.
+        """
+        if not self._is_container_running(): return
+
+        print("[UsbIpManager] Detaching all virtual USB ports...")
+        try:
+            # List imported devices
+            out = self._run_command(f"{self.exec_cmd} 'usbip port'", check=False)
+            if not out: return
+
+            # Regex to find port numbers like "Port 00: <...>"
+            matches = re.findall(r"Port\s+(\d+):", out)
+            for port in matches:
+                print(f"   Detaching Port {port}...")
+                self._run_command(f"{self.exec_cmd} 'usbip detach -p {port}'", check=False)
+        except Exception as e:
+            print(f"[Warning] Error during detach: {e}")
+
     def cleanup(self):
+        # 1. Cleanly detach ports (Prevents Kernel Hangs/Sleep issues)
+        self.detach_all_ports()
+
+        # 2. Attempt to unload module (Receiver) or unbind (Sender)
+        # This is "Best Effort" cleanup
+        if self._is_container_running():
+            try:
+                # Try unloading vhci-hcd to fully clear state on Host
+                self._run_command(f"{self.exec_cmd} 'modprobe -r vhci-hcd'", check=False)
+            except: pass
+
         print("[UsbIpManager] Stopping container...")
         self._run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)

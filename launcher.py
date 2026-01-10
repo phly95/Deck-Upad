@@ -118,6 +118,12 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_start.connect("clicked", self.on_start)
         btn_box.pack_start(self.btn_start, False, False, 0)
 
+        # New Cleanup Button
+        self.btn_clean = Gtk.Button(label="Force Cleanup")
+        self.btn_clean.set_size_request(150, 50)
+        self.btn_clean.connect("clicked", self.on_cleanup)
+        btn_box.pack_start(self.btn_clean, False, False, 0)
+
         self.btn_stop = Gtk.Button(label="Stop Service")
         self.btn_stop.get_style_context().add_class("destructive-action")
         self.btn_stop.set_size_request(150, 50)
@@ -178,9 +184,15 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
     def on_start(self, widget):
+        # 1. Allow containers to access X11 Display
+        try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
+        except: pass
+
         self.save_config()
         self.btn_start.set_sensitive(False)
+        self.btn_clean.set_sensitive(False) # Disable cleanup while running
         self.btn_stop.set_sensitive(True)
+        # Lock inputs
         self.entry_ssid.set_sensitive(False)
         self.entry_pass.set_sensitive(False)
         self.spin_channel.set_sensitive(False)
@@ -209,7 +221,27 @@ class DeckUpadLauncher(Gtk.Window):
         ]
 
         self.append_log(f"--- STARTING {role.upper()} MODE ---\n")
+        self._run_process(cmd, sudo_pw)
 
+    def on_cleanup(self, widget):
+        self.save_config()
+        # Disable buttons temporarily
+        self.btn_start.set_sensitive(False)
+        self.btn_clean.set_sensitive(False)
+
+        sudo_pw = self.entry_sudo.get_text()
+        script_path = os.path.abspath("deck_upad.py")
+
+        cmd = [
+            "sudo", "-S",
+            "python3", "-u", script_path,
+            "--cleanup-only"
+        ]
+
+        self.append_log(f"--- STARTING SYSTEM CLEANUP ---\n")
+        self._run_process(cmd, sudo_pw)
+
+    def _run_process(self, cmd, sudo_pw):
         try:
             self.process = subprocess.Popen(
                 cmd,
@@ -231,7 +263,7 @@ class DeckUpadLauncher(Gtk.Window):
 
         except Exception as e:
             self.append_log(f"Failed to launch: {e}\n")
-            self.on_stop(None)
+            self.process_finished()
 
     def monitor_process(self):
         while True:
@@ -241,9 +273,11 @@ class DeckUpadLauncher(Gtk.Window):
         GLib.idle_add(self.process_finished)
 
     def process_finished(self):
-        self.append_log("\n--- SERVICE STOPPED ---\n")
+        self.append_log("\n--- PROCESS FINISHED ---\n")
         self.btn_start.set_sensitive(True)
+        self.btn_clean.set_sensitive(True)
         self.btn_stop.set_sensitive(False)
+        # Unlock inputs
         self.entry_ssid.set_sensitive(True)
         self.entry_pass.set_sensitive(True)
         self.spin_channel.set_sensitive(True)

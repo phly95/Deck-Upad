@@ -61,6 +61,8 @@ def perform_aggressive_cleanup(force=False):
 
     run_cmd("nmcli device set wlan0 managed yes")
     run_cmd("nmcli device connect wlan0")
+
+    # Only wait for net if we actually cleaned up (implies we might have broken it)
     wait_for_network_restore()
 
 def write_pid_file():
@@ -75,17 +77,31 @@ def remove_pid_file():
 
 def main():
     parser = argparse.ArgumentParser(description="Deck-Upad Service Runner")
-    parser.add_argument("--role", choices=["host", "client"], required=True)
+    # Role is now optional because cleanup-only doesn't need it
+    parser.add_argument("--role", choices=["host", "client"], required=False)
     parser.add_argument("--ssid", default="DeckUpad")
     parser.add_argument("--password", default="DeckUpad123")
     parser.add_argument("--channel", default=165, type=int)
     parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax")
     parser.add_argument("--country", default="US")
     parser.add_argument("--force-clean", action="store_true")
+    # New Flag
+    parser.add_argument("--cleanup-only", action="store_true", help="Run cleanup routine and exit")
 
     args = parser.parse_args()
 
-    perform_aggressive_cleanup(force=args.force_clean)
+    # If cleanup-only is requested, force is implied
+    should_force = args.force_clean or args.cleanup_only
+    perform_aggressive_cleanup(force=should_force)
+
+    if args.cleanup_only:
+        print("[Startup] Cleanup Complete. Exiting.")
+        sys.exit(0)
+
+    # If not cleaning up, Role is mandatory
+    if not args.role:
+        parser.error("the following arguments are required: --role")
+
     write_pid_file()
 
     service = None

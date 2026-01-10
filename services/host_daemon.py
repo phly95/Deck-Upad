@@ -108,18 +108,23 @@ class HostService:
         sudo_user = os.environ.get('SUDO_USER')
         if not sudo_user: return os.environ.copy()
 
-        env = os.environ.copy()
         try:
-            import pwd
             pw = pwd.getpwnam(sudo_user)
+            env = os.environ.copy()
             env['USER'] = sudo_user
-            env['LOGNAME'] = sudo_user
             env['HOME'] = pw.pw_dir
             env['UID'] = str(pw.pw_uid)
-            if 'XDG_RUNTIME_DIR' not in env:
-                env['XDG_RUNTIME_DIR'] = f"/run/user/{pw.pw_uid}"
-        except: pass
-        return env
+            env['XDG_RUNTIME_DIR'] = f"/run/user/{pw.pw_uid}"
+
+            # Find XAuthority for X11 support
+            xauth = os.path.join(pw.pw_dir, ".Xauthority")
+            if os.path.exists(xauth): env['XAUTHORITY'] = xauth
+
+            # Default Display
+            if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+            return env
+        except:
+            return os.environ.copy()
 
     def _start_video_process(self, target_ip):
         self._stop_video_process()

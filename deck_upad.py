@@ -96,14 +96,12 @@ def main():
     parser.add_argument("--password", default="DeckUpad123")
     parser.add_argument("--channel", default=165, type=int)
     parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax")
-    parser.add_argument("--force-clean", action="store_true", help="Force cleanup even if no crash detected")
+    parser.add_argument("--force-clean", action="store_true")
 
     args = parser.parse_args()
 
-    # 1. Intelligent Cleanup
+    # 1. Startup Cleanup
     perform_aggressive_cleanup(force=args.force_clean)
-
-    # 2. Mark run
     write_pid_file()
 
     service = None
@@ -127,6 +125,16 @@ def main():
             print("--- LAUNCHING CLIENT AGENT ---")
             service = ClientService()
             service.start(ssid=args.ssid, password=args.password)
+
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Script crashed: {e}")
+        # --- FIX: Ensure cleanup runs if we crash ---
+        if service:
+            try: service.stop()
+            except: pass
+        perform_aggressive_cleanup(force=True)
+        sys.exit(1)
+
     finally:
         remove_pid_file()
 

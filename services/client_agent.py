@@ -24,13 +24,14 @@ class ClientService:
         self.usbip = UsbIpManager()
         self.bus_id = None
         self.host_socket = None
+        # --- FIX: Define this here ---
+        self.gui_container_name = "stream-receiver"
 
     def ensure_receiver_image_exists(self):
         """
         Ensures the GStreamer Receiver image is built.
         MUST run before WiFi is moved to container.
         """
-        # Check if exists
         res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
         if res.stdout.strip():
             return
@@ -42,14 +43,10 @@ class ClientService:
             subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
             subprocess.run(["podman", "run", "-d", "--name", builder, REC_BASE, "sleep", "infinity"], check=True)
 
-            # Install GStreamer Deps
             print("   Installing GStreamer dependencies...")
-
-            # 1. RPM Fusion (For H.264)
             subprocess.run(["podman", "exec", builder, "dnf", "install", "-y", "--nogpgcheck",
                 "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-39.noarch.rpm"], check=True)
 
-            # 2. Packages
             pkgs = [
                 "python3-gobject", "gtk3", "gstreamer1", "gstreamer1-plugins-base",
                 "gstreamer1-plugins-good", "gstreamer1-plugins-good-gtk",
@@ -58,7 +55,6 @@ class ClientService:
             ]
             subprocess.run(["podman", "exec", builder, "dnf", "install", "-y"] + pkgs, check=True)
 
-            # 3. Commit
             print(f"   Committing to {REC_IMAGE}...")
             subprocess.run(["podman", "commit", builder, REC_IMAGE], check=True)
 
@@ -75,23 +71,23 @@ class ClientService:
         print("   DECK-UPAD CLIENT AGENT")
         print("="*50)
 
-        # --- 1. PRE-FLIGHT CHECK ---
+        # 1. PRE-FLIGHT CHECK
         print("[Client] Performing Pre-Flight Checks...")
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
-            self.ensure_receiver_image_exists() # <--- NEW: Build this while online
+            self.ensure_receiver_image_exists()
         except Exception as e:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
-            print("Ensure you have an active internet connection before starting.")
             sys.exit(1)
 
-        # --- 2. START HARDWARE ---
+        # 2. START HARDWARE
         print(f"[Client] Configuring WiFi Container for {ssid}...")
         try:
             self.wifi.start_client_mode(ssid=ssid, password=password)
         except Exception as e:
             print(f"[CRITICAL] WiFi Setup Failed: {e}")
+            # Ensure cleanup happens if wifi fails
             self.stop()
             sys.exit(1)
 
@@ -105,22 +101,20 @@ class ClientService:
         except Exception as e:
             print(f"[ERROR] USBIP Init Failed: {e}")
 
-        # --- 3. START GUI OVERLAY ---
+        # 3. START GUI OVERLAY
         print("[Client] Launching Video Receiver GUI...")
         self._launch_receiver_container()
 
-        # --- 4. CONNECT TO HOST ---
+        # 4. CONNECT TO HOST
         self.host_socket = self._establish_handshake()
 
-        # --- 5. RUNTIME LOOP ---
+        # 5. RUNTIME LOOP
         if self.host_socket:
             self._monitor_lifecycle()
 
     def _launch_receiver_container(self):
-        # Stop existing if any
         subprocess.run(["podman", "rm", "-f", self.gui_container_name], stderr=subprocess.DEVNULL)
 
-        # Map the local script into the container
         script_path = os.path.abspath("core/video_receiver.py")
 
         cmd = (
@@ -187,7 +181,10 @@ class ClientService:
         if self.host_socket:
             try: self.host_socket.close()
             except: pass
-        subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name], stderr=subprocess.DEVNULL)
+
+        subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         self.usbip.cleanup()
         self.wifi.cleanup()
         sys.exit(0)

@@ -359,8 +359,12 @@ network={{
             time.sleep(1)
 
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
-        try: self._run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
-        except: pass
+
+        # --- FIX: Fail if DHCP fails ---
+        try:
+            self._run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
+        except subprocess.CalledProcessError:
+            raise Exception("DHCP Request failed. Is the Host (Deck-Upad PC) running?")
 
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")

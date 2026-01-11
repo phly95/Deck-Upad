@@ -50,29 +50,41 @@ class DeckUpadWindow(Gtk.Window):
         self.lbl_status.set_markup("<span font='14' foreground='#888888'>Waiting for Stream...</span>")
         self.idle_box.pack_start(self.lbl_status, False, False, 10)
 
-        # Debug Label (To see if commands arrive)
-        self.lbl_debug = Gtk.Label()
-        self.lbl_debug.set_markup("<span font='10' foreground='#444444'>Ready</span>")
-        self.idle_box.pack_start(self.lbl_debug, False, False, 10)
-
         self.idle_area = Gtk.EventBox()
         self.idle_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 1))
         self.idle_area.add(self.idle_box)
         self.stack.add_named(self.idle_area, "idle")
 
-        # --- VIDEO CONTAINER ---
-        # We don't create the pipeline here anymore. We create it on demand.
-        self.video_area = Gtk.EventBox() # Container for the sink
+        # --- VIDEO SCREEN ---
+        self.video_area = Gtk.DrawingArea()
         self.video_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 1))
         self.stack.add_named(self.video_area, "video")
 
         Gst.init(None)
-        self.pipeline = None
-        self.sink_widget = None
+        # Pipeline is always configured to receive
+        self.pipeline = Gst.parse_launch(
+            f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
+            "rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
+            "queue ! gtksink name=sink sync=false"
+        )
+
+        sink = self.pipeline.get_by_name("sink")
+        self.sink_widget = sink.get_property("widget")
+        self.stack.remove(self.video_area)
+        self.stack.add_named(self.sink_widget, "video")
+
+        # --- INPUT HANDLING ---
+        self.sink_widget.set_events(Gdk.EventMask.POINTER_MOTION_MASK |
+                                    Gdk.EventMask.BUTTON_PRESS_MASK |
+                                    Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.sink_widget.connect("motion-notify-event", self.on_input_event, "move")
+        self.sink_widget.connect("button-press-event", self.on_input_event, "press")
+        self.sink_widget.connect("button-release-event", self.on_input_event, "release")
 
         self.input_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.last_move = 0
 
+        # Default Stream Dimensions
         self.stream_w = 1280
         self.stream_h = 800
 
@@ -82,73 +94,31 @@ class DeckUpadWindow(Gtk.Window):
 
         self.connect("destroy", self.on_close)
         self.show_all()
+
+        # --- FIX: Start Pipeline Immediately ---
+        # We keep the pipeline playing 100% of the time.
+        # If no video is sending, udpsrc just waits.
+        self.pipeline.set_state(Gst.State.PLAYING)
         self.set_mode("idle")
-
-    def create_pipeline(self):
-        """Creates a fresh GStreamer pipeline."""
-        if self.pipeline:
-            self.destroy_pipeline()
-
-        print("Creating new pipeline...")
-        # Low latency pipeline
-        # drop-on-latency=true ensures we don't lag behind if network glitches
-        pipe_str = (
-            f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
-            "rtpjitterbuffer latency=0 mode=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
-            "queue ! gtksink name=sink sync=false"
-        )
-        try:
-            self.pipeline = Gst.parse_launch(pipe_str)
-            sink = self.pipeline.get_by_name("sink")
-            self.sink_widget = sink.get_property("widget")
-
-            # Hook up input to the new widget
-            self.sink_widget.set_events(Gdk.EventMask.POINTER_MOTION_MASK |
-                                        Gdk.EventMask.BUTTON_PRESS_MASK |
-                                        Gdk.EventMask.BUTTON_RELEASE_MASK)
-            self.sink_widget.connect("motion-notify-event", self.on_input_event, "move")
-            self.sink_widget.connect("button-press-event", self.on_input_event, "press")
-            self.sink_widget.connect("button-release-event", self.on_input_event, "release")
-
-            # Add to UI
-            self.video_area.add(self.sink_widget)
-            self.video_area.show_all()
-
-        except Exception as e:
-            print(f"Pipeline creation failed: {e}")
-
-    def destroy_pipeline(self):
-        """Tears down the pipeline completely."""
-        if self.pipeline:
-            print("Destroying pipeline...")
-            self.pipeline.set_state(Gst.State.NULL)
-            if self.sink_widget:
-                self.video_area.remove(self.sink_widget)
-                self.sink_widget = None
-            self.pipeline = None
 
     def set_mode(self, mode, message=None):
         if message:
             self.lbl_status.set_markup(f"<span font='14' foreground='#888888'>{message}</span>")
 
         if mode == "video":
-            # 1. Create fresh pipeline (fixes JitterBuffer/Timestamp issues on restart)
-            self.create_pipeline()
-            if self.pipeline:
-                self.pipeline.set_state(Gst.State.PLAYING)
-
-            # 2. Switch UI
+            # Just show the video widget. The pipeline is already running.
             self.stack.set_visible_child_name("video")
+
+            # Hide Cursor
             win = self.get_window()
             if win:
                 cursor = Gdk.Cursor.new_from_name(self.get_display(), "none")
                 win.set_cursor(cursor)
         else:
-            # 1. Kill pipeline to free port and reset state
-            self.destroy_pipeline()
-
-            # 2. Switch UI
+            # Show idle screen. We do NOT stop the pipeline.
             self.stack.set_visible_child_name("idle")
+
+            # Restore Cursor
             win = self.get_window()
             if win: win.set_cursor(None)
 
@@ -163,17 +133,15 @@ class DeckUpadWindow(Gtk.Window):
         except: pass
 
     def handle_command(self, cmd):
-        # Update debug label so we know if network is working
-        self.lbl_debug.set_text(f"Last Cmd: {cmd}")
-
         if cmd == "START_VIDEO": self.set_mode("video")
-        elif cmd == "STOP_VIDEO": self.set_mode("idle", "Video Ended.")
+        elif cmd == "STOP_VIDEO": self.set_mode("idle", "Video Ended. Waiting...")
         elif cmd.startswith("STATUS:"): self.set_mode("idle", cmd.split(":", 1)[1])
         elif cmd.startswith("RES_UPDATE:"):
             try:
                 parts = cmd.split(":")[1].split("x")
                 self.stream_w = int(parts[0])
                 self.stream_h = int(parts[1])
+                print(f"Receiver: Updated Stream Resolution: {self.stream_w}x{self.stream_h}")
             except: pass
 
     def on_input_event(self, widget, event, input_type):
@@ -187,15 +155,18 @@ class DeckUpadWindow(Gtk.Window):
         win_h = widget.get_allocated_height()
         if win_w == 0 or win_h == 0 or self.stream_w == 0: return False
 
+        # --- ASPECT RATIO CORRECTION ---
         win_aspect = win_w / win_h
         src_aspect = self.stream_w / self.stream_h
 
         if win_aspect > src_aspect:
+            # Pillarbox
             draw_h = win_h
             draw_w = win_h * src_aspect
             offset_x = (win_w - draw_w) / 2
             offset_y = 0
         else:
+            # Letterbox
             draw_w = win_w
             draw_h = win_w / src_aspect
             offset_x = 0
@@ -206,6 +177,7 @@ class DeckUpadWindow(Gtk.Window):
 
         nx = (event.x - offset_x) / draw_w
         ny = (event.y - offset_y) / draw_h
+
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
 
@@ -227,4 +199,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     win = DeckUpadWindow(host_ip=args.host_ip, is_fullscreen=not args.windowed)
-    # Gtk.main()
+    Gtk.main()

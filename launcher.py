@@ -11,35 +11,25 @@ import importlib.util
 
 # --- DEPENDENCY CHECK & AUTO-INSTALL ---
 def check_and_install_deps():
-    """
-    Checks for required user-space libraries (glfw, PyOpenGL) needed by video_sender.py.
-    Installs them via pip --user if missing.
-    """
-    required = ["glfw", "OpenGL"] # OpenGL is PyOpenGL
+    required = ["glfw", "OpenGL"]
     missing = []
-
     for pkg in required:
         if importlib.util.find_spec(pkg) is None:
             missing.append(pkg)
-            # PyOpenGL is the package name for import OpenGL
             if pkg == "OpenGL": pkg = "PyOpenGL"
 
     if missing:
         print(f"[Launcher] Missing dependencies: {missing}. Installing...")
-        # Map import names to pip names
         pip_packages = []
         for m in missing:
             if m == "OpenGL": pip_packages.append("PyOpenGL")
             else: pip_packages.append(m)
-
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--user"] + pip_packages)
             print("[Launcher] Dependencies installed successfully.")
         except subprocess.CalledProcessError as e:
             print(f"[Launcher] Failed to install dependencies: {e}")
-            print("Please run: pip install --user glfw PyOpenGL")
 
-# Run check immediately before importing GUI libs
 check_and_install_deps()
 
 import gi
@@ -47,11 +37,9 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
 from gi.repository import Gtk, GLib, Pango, Gdk
 
-# Configuration File to save user preferences
 CONFIG_FILE = os.path.expanduser("~/.deck_upad_config.json")
-
-# Image Config (Must match client_agent.py)
 REC_IMAGE = "localhost/stream-receiver-final"
+REC_BASE = "registry.fedoraproject.org/fedora:39"
 
 class DeckUpadLauncher(Gtk.Window):
     def __init__(self):
@@ -67,25 +55,26 @@ class DeckUpadLauncher(Gtk.Window):
         self.test_sender_proc = None
         self.test_input_proc = None
         self.test_container_name = "deck-upad-test-rec"
+        self.cached_sudo_pw = "" # Cache password for cleanup
         self.config = self.load_config()
 
         # --- UI LAYOUT ---
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(main_vbox)
 
-        # 1. Header
+        # Header
         header = Gtk.Label()
         header.set_markup("<span size='xx-large' weight='bold' foreground='#3A9FED'>Deck-Upad</span>")
         main_vbox.pack_start(header, False, False, 5)
 
-        # 2. Controls Grid
+        # Controls Grid
         grid = Gtk.Grid()
         grid.set_column_spacing(20)
         grid.set_row_spacing(10)
         grid.set_halign(Gtk.Align.CENTER)
         main_vbox.pack_start(grid, False, False, 10)
 
-        # Row 0: Role Selection
+        # Row 0: Role
         grid.attach(Gtk.Label(label="Device Role:"), 0, 0, 1, 1)
         role_box = Gtk.Box(spacing=10)
         self.rb_client = Gtk.RadioButton.new_with_label_from_widget(None, "Client (Steam Deck)")
@@ -100,7 +89,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.entry_ssid.set_text(self.config.get("ssid", "DeckUpad"))
         grid.attach(self.entry_ssid, 1, 1, 2, 1)
 
-        # Row 2: WiFi Password
+        # Row 2: Password
         grid.attach(Gtk.Label(label="WiFi Password:"), 0, 2, 1, 1)
         self.entry_pass = Gtk.Entry()
         self.entry_pass.set_text(self.config.get("password", "DeckUpad123"))
@@ -109,7 +98,7 @@ class DeckUpadLauncher(Gtk.Window):
         # Row 3: WiFi Mode
         grid.attach(Gtk.Label(label="WiFi Standard:"), 0, 3, 1, 1)
         self.combo_mode = Gtk.ComboBoxText()
-        self.combo_mode.append("ax", "AX (WiFi 6 - Recommended)")
+        self.combo_mode.append("ax", "AX (WiFi 6)")
         self.combo_mode.append("ac", "AC (WiFi 5)")
         self.combo_mode.append("n", "N (Legacy)")
         self.combo_mode.set_active_id(self.config.get("wifi_mode", "ax"))
@@ -130,9 +119,7 @@ class DeckUpadLauncher(Gtk.Window):
         countries = [("US", "United States"), ("GB", "United Kingdom"), ("DE", "Germany"), ("JP", "Japan"), ("CA", "Canada"), ("AU", "Australia"), ("FR", "France"), ("KR", "South Korea"), ("CN", "China"), ("BR", "Brazil")]
         for code, name in countries:
             self.combo_country.append(code, f"{code} - {name}")
-
-        default_country = self.config.get("country", "US")
-        self.combo_country.set_active_id(default_country)
+        self.combo_country.set_active_id(self.config.get("country", "US"))
         grid.attach(self.combo_country, 1, 5, 2, 1)
 
         # Row 6: Sudo Password
@@ -149,7 +136,7 @@ class DeckUpadLauncher(Gtk.Window):
 
         if self.config.get("role") == "host": self.rb_host.set_active(True)
 
-        # 3. Action Buttons
+        # 3. Buttons
         btn_box = Gtk.Box(spacing=20)
         btn_box.set_halign(Gtk.Align.CENTER)
         main_vbox.pack_start(btn_box, False, False, 10)
@@ -170,7 +157,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_test_emu.set_size_request(120, 50)
         self.btn_test_emu.connect("clicked", lambda w: self.on_test_video(simulated=False))
         test_box.pack_start(self.btn_test_emu, False, False, 0)
-
         btn_box.pack_start(test_box, False, False, 0)
 
         self.btn_clean = Gtk.Button(label="Force Cleanup")
@@ -185,14 +171,12 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.connect("clicked", self.on_stop)
         btn_box.pack_start(self.btn_stop, False, False, 0)
 
-        # 4. Logs Area
+        # 4. Logs
         log_frame = Gtk.Frame(label="System Logs")
         main_vbox.pack_start(log_frame, True, True, 0)
-
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.ALWAYS)
         log_frame.add(scrolled)
-
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
         self.log_view.set_cursor_visible(False)
@@ -200,7 +184,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.1, 0.1, 0.1, 1))
         self.log_view.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0.9, 0, 1))
         scrolled.add(self.log_view)
-
         self.log_buffer = self.log_view.get_buffer()
         self.log_mark = self.log_buffer.create_mark("end", self.log_buffer.get_end_iter(), False)
 
@@ -237,8 +220,41 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
+    # --- NEW: Helper to Build Image if missing on Host ---
+    def ensure_receiver_image_exists(self):
+        res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
+        if res.stdout.strip():
+            return True # Already exists
+
+        GLib.idle_add(self.append_log, f"Building Receiver Image '{REC_IMAGE}'... (This takes a minute)\n")
+        builder = "stream-receiver-builder"
+        try:
+            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+            subprocess.run(["podman", "run", "-d", "--name", builder, REC_BASE, "sleep", "infinity"], check=True)
+
+            GLib.idle_add(self.append_log, "   Installing GStreamer dependencies...\n")
+            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y", "--nogpgcheck",
+                "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-39.noarch.rpm"], check=True)
+
+            pkgs = ["python3-gobject", "gtk3", "gstreamer1", "gstreamer1-plugins-base",
+                    "gstreamer1-plugins-good", "gstreamer1-plugins-good-gtk",
+                    "gstreamer1-libav", "gstreamer1-plugins-bad-free",
+                    "mesa-dri-drivers", "libwayland-client", "python3"]
+            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y"] + pkgs, check=True)
+
+            GLib.idle_add(self.append_log, "   Committing image...\n")
+            subprocess.run(["podman", "commit", builder, REC_IMAGE], check=True)
+            return True
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"Build Failed: {e}\n")
+            return False
+        finally:
+            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+
     def on_test_video(self, simulated=True):
         self.save_config()
+        self.cached_sudo_pw = self.entry_sudo.get_text() # Cache for stop
+
         mode_str = "SIMULATION" if simulated else "EMULATOR INTEGRATION"
         self.append_log(f"\n--- STARTING VIDEO TEST ({mode_str}) ---\n")
 
@@ -247,13 +263,19 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_start.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
 
+        # 1. Ensure Image Exists (Host might not have built it yet)
+        threading.Thread(target=self._run_test_sequence, args=(simulated,), daemon=True).start()
+
+    def _run_test_sequence(self, simulated):
+        if not self.ensure_receiver_image_exists():
+            GLib.idle_add(self.append_log, "Cannot start test without container image.\n")
+            return
+
         try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
         except: pass
 
-        sudo_pw = self.entry_sudo.get_text()
-
-        # 1. Start Input Server (Requires Sudo)
-        self.append_log("Starting Input Server (Sudo)...\n")
+        # 2. Start Input Server (Requires Sudo)
+        GLib.idle_add(self.append_log, "Starting Input Server (Sudo)...\n")
         try:
             self.test_input_proc = subprocess.Popen(
                 ["sudo", "-S", "python3", "core/input_server.py"],
@@ -263,9 +285,9 @@ class DeckUpadLauncher(Gtk.Window):
                 text=True,
                 bufsize=1
             )
-            if sudo_pw:
+            if self.cached_sudo_pw:
                 try:
-                    self.test_input_proc.stdin.write(sudo_pw + "\n")
+                    self.test_input_proc.stdin.write(self.cached_sudo_pw + "\n")
                     self.test_input_proc.stdin.flush()
                 except OSError: pass
 
@@ -273,7 +295,7 @@ class DeckUpadLauncher(Gtk.Window):
         except Exception as e:
             GLib.idle_add(self.append_log, f"Input Server Failed: {e}\n")
 
-        # 2. Launch Receiver
+        # 3. Launch Receiver
         uid = os.getuid()
         script_path = os.path.abspath("core/video_receiver.py")
         display = os.environ.get('DISPLAY', ':0')
@@ -310,8 +332,9 @@ class DeckUpadLauncher(Gtk.Window):
             GLib.idle_add(self.append_log, f"Container launch failed: {e}\n")
             return
 
-        # 3. Launch Sender
-        threading.Timer(3.0, lambda: self._start_test_sender(simulated)).start()
+        # 4. Launch Sender after delay
+        time.sleep(3)
+        self._start_test_sender(simulated)
 
     def _start_test_sender(self, simulated):
         args = ["python3", "core/video_sender.py", "127.0.0.1"]
@@ -359,27 +382,21 @@ class DeckUpadLauncher(Gtk.Window):
 
             if msg:
                 GLib.idle_add(self.append_log, f"[TX] {msg}\n")
-
-                # --- NEW LOGIC ---
                 if msg.startswith("HOST_RES:"):
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s.sendto(msg.encode(), ("127.0.0.1", 5004))
                     except: pass
-
                 elif msg.startswith("STREAM_RES:"):
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s.sendto(msg.encode(), ("127.0.0.1", 5004))
                     except: pass
-
                     res = msg.split(":")[1]
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s.sendto(f"RES_UPDATE:{res}".encode(), ("127.0.0.1", 5003))
                     except: pass
-                # ------------------
-
                 elif msg == "VIDEO_STARTING":
                     self._send_udp_signal()
                 elif msg == "VIDEO_STOPPED":
@@ -393,6 +410,7 @@ class DeckUpadLauncher(Gtk.Window):
         except: pass
 
         self.save_config()
+        self.cached_sudo_pw = self.entry_sudo.get_text() # Cache password
         self.btn_start.set_sensitive(False)
         self.btn_test_sim.set_sensitive(False)
         self.btn_test_emu.set_sensitive(False)
@@ -431,6 +449,7 @@ class DeckUpadLauncher(Gtk.Window):
 
     def on_cleanup(self, widget):
         self.save_config()
+        self.cached_sudo_pw = self.entry_sudo.get_text()
         self.btn_start.set_sensitive(False)
         self.btn_test_sim.set_sensitive(False)
         self.btn_test_emu.set_sensitive(False)
@@ -487,11 +506,14 @@ class DeckUpadLauncher(Gtk.Window):
         self.process = None
 
     def on_stop(self, widget):
+        # Stop Test Input (Cleanly using sudo and password)
         if self.test_input_proc:
             self.append_log("Stopping Input Server...\n")
             try:
-                subprocess.run(["sudo", "pkill", "-f", "core/input_server.py"], stderr=subprocess.DEVNULL)
-                self.test_input_proc.terminate()
+                cmd = ["sudo", "-S", "pkill", "-f", "core/input_server.py"]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                if self.cached_sudo_pw:
+                    proc.communicate(input=(self.cached_sudo_pw + "\n").encode())
             except: pass
             self.test_input_proc = None
 
@@ -513,11 +535,16 @@ class DeckUpadLauncher(Gtk.Window):
             self.append_log("\nStopping Service...\n")
             try: self.process.terminate()
             except: pass
+
+            # Force kill via Sudo with cached password
             def force_kill_if_needed():
                 import time
                 time.sleep(1)
                 if self.process and self.process.poll() is None:
-                    subprocess.run(["sudo", "pkill", "-f", "deck_upad.py"], stderr=subprocess.DEVNULL)
+                    cmd = ["sudo", "-S", "pkill", "-f", "deck_upad.py"]
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    if self.cached_sudo_pw:
+                        proc.communicate(input=(self.cached_sudo_pw + "\n").encode())
             threading.Thread(target=force_kill_if_needed, daemon=True).start()
 
     def on_close(self, widget):

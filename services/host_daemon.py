@@ -26,7 +26,6 @@ class HostService:
         print("   DECK-UPAD HOST DAEMON")
         print("="*50)
 
-        # 1. PRE-FLIGHT CHECKS
         print("[Host] Performing Pre-Flight Checks...")
         try:
             self.wifi.ensure_image_exists()
@@ -35,7 +34,6 @@ class HostService:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
             sys.exit(1)
 
-        # 2. START INFRASTRUCTURE
         print(f"[Host] Initializing WiFi Bridge (SSID: {ssid})...")
         try:
             self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode, country=country)
@@ -156,9 +154,12 @@ class HostService:
         while self.running and proc.poll() is None:
             line = proc.stdout.readline()
             if not line: break
+
             msg = line.strip()
 
-            # --- NEW: Forward Resolutions ---
+            # --- VERBOSE LOGGING ENABLED ---
+            print(f"[VideoLog] {msg}")
+
             if msg.startswith("HOST_RES:"):
                 try:
                     parts = msg.split(":")[1].split("x")
@@ -175,7 +176,6 @@ class HostService:
                     if self.client_conn:
                         self.client_conn.send(f"CMD_RES_UPDATE:{w}x{h}".encode())
                 except: pass
-            # --------------------------------
 
             elif msg == "VIDEO_STARTING":
                 print("[Host] Signal: Video Starting -> Notifying Deck")

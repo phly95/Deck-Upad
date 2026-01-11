@@ -26,6 +26,7 @@ CLIENT_GATEWAY_IP = "10.13.13.1"
 CLIENT_HOST_IP = "10.13.13.2"
 
 # Ports to forward (UDP/TCP)
+# We open a wide range to cover USBIP (3240), Video (5000), Input (5001), Control (5002-5004)
 FWD_PORT_RANGE = "2000:65535"
 
 class WifiManager:
@@ -87,14 +88,10 @@ class WifiManager:
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
         self._run_command(f"ip link delete {VETH_HOST}", check=False)
 
-        # Cleanup Firewall
         if shutil.which("firewall-cmd"):
             try:
-                # Remove interface from trusted zone
+                # Cleanly remove the trusted interface
                 self._run_command(f"firewall-cmd --zone=trusted --remove-interface={VETH_HOST}", check=False)
-                # We generally don't remove ports globally to avoid breaking other things,
-                # but we can try to clean up our specific range if we added it to public
-                pass
             except: pass
 
         self._run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
@@ -198,35 +195,25 @@ class WifiManager:
 
     def _open_host_ports(self):
         """
-        Aggressively opens ports on the Host OS firewall for the veth interface.
+        Configures Host Firewall. Simplified to avoid stutter/packet loss.
         """
         if shutil.which("firewall-cmd"):
-            print("[WifiManager] Configuring Firewalld...")
+            print("[WifiManager] Opening Ports (Firewalld)...")
             try:
-                # 1. Force the veth interface into the 'trusted' zone
-                # This allows ALL traffic on this specific link
+                # 1. Trust the interface (Allows all traffic on veth-host)
                 self._run_command(f"firewall-cmd --zone=trusted --add-interface={VETH_HOST}", check=False)
 
-                # 2. Open specific ports on the default zone just in case
-                self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/udp", check=False)
-                self._run_command(f"firewall-cmd --add-port={FWD_PORT_RANGE}/tcp", check=False)
-
-                # 3. Open ports on the trusted zone explicitly
+                # 2. Explicitly open UDP/TCP range on the trusted zone (Redundant but safe)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/udp", check=False)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/tcp", check=False)
-
-                # 4. Critical: Ensure local multicast/broadcast isn't blocked (for discovery)
-                self._run_command("firewall-cmd --add-protocol=igmp", check=False)
-                self._run_command("firewall-cmd --add-service=mdns", check=False)
             except: pass
 
         elif shutil.which("ufw"):
-            print("[WifiManager] Configuring UFW...")
+            print("[WifiManager] Opening Ports (UFW)...")
             try:
                 self._run_command(f"ufw allow in on {VETH_HOST}", check=False)
                 self._run_command(f"ufw allow out on {VETH_HOST}", check=False)
                 self._run_command(f"ufw allow from 192.168.50.0/24", check=False)
-                self._run_command(f"ufw allow from 10.13.13.0/24", check=False)
             except: pass
 
     # --- Mode Specific Logic ---
@@ -251,7 +238,6 @@ class WifiManager:
         gw_arg = f"gw4 {ROUTER_LAN_IP}" if has_wan else ""
         dns_arg = "ipv4.dns '8.8.8.8'" if has_wan else ""
 
-        # Note: We set connection.zone=trusted here too
         nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
                   f"ip4 {HOST_LAN_IP}/24 {gw_arg} connection.zone trusted "
                   f"ipv4.route-metric 20 {dns_arg} ipv4.ignore-auto-dns yes")

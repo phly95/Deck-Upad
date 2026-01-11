@@ -1,19 +1,56 @@
 #!/usr/bin/env python3
 import sys
 import os
-import gi
 import subprocess
 import threading
 import json
 import signal
 import socket
 import time
+import importlib.util
 
+# --- DEPENDENCY CHECK & AUTO-INSTALL ---
+def check_and_install_deps():
+    """
+    Checks for required user-space libraries (glfw, PyOpenGL) needed by video_sender.py.
+    Installs them via pip --user if missing.
+    """
+    required = ["glfw", "OpenGL"] # OpenGL is PyOpenGL
+    missing = []
+
+    for pkg in required:
+        if importlib.util.find_spec(pkg) is None:
+            missing.append(pkg)
+            # PyOpenGL is the package name for import OpenGL
+            if pkg == "OpenGL": pkg = "PyOpenGL"
+
+    if missing:
+        print(f"[Launcher] Missing dependencies: {missing}. Installing...")
+        # Map import names to pip names
+        pip_packages = []
+        for m in missing:
+            if m == "OpenGL": pip_packages.append("PyOpenGL")
+            else: pip_packages.append(m)
+
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user"] + pip_packages)
+            print("[Launcher] Dependencies installed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"[Launcher] Failed to install dependencies: {e}")
+            print("Please run: pip install --user glfw PyOpenGL")
+
+# Run check immediately before importing GUI libs
+check_and_install_deps()
+
+import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Pango', '1.0')
 from gi.repository import Gtk, GLib, Pango, Gdk
 
+# Configuration File to save user preferences
 CONFIG_FILE = os.path.expanduser("~/.deck_upad_config.json")
+
+# Image Config (Must match client_agent.py)
 REC_IMAGE = "localhost/stream-receiver-final"
 
 class DeckUpadLauncher(Gtk.Window):
@@ -28,7 +65,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.process = None
         self.test_receiver_proc = None
         self.test_sender_proc = None
-        self.test_input_proc = None # <--- New Input Process
+        self.test_input_proc = None
         self.test_container_name = "deck-upad-test-rec"
         self.config = self.load_config()
 
@@ -48,7 +85,7 @@ class DeckUpadLauncher(Gtk.Window):
         grid.set_halign(Gtk.Align.CENTER)
         main_vbox.pack_start(grid, False, False, 10)
 
-        # Row 0: Role
+        # Row 0: Role Selection
         grid.attach(Gtk.Label(label="Device Role:"), 0, 0, 1, 1)
         role_box = Gtk.Box(spacing=10)
         self.rb_client = Gtk.RadioButton.new_with_label_from_widget(None, "Client (Steam Deck)")
@@ -57,25 +94,28 @@ class DeckUpadLauncher(Gtk.Window):
         role_box.pack_start(self.rb_host, False, False, 0)
         grid.attach(role_box, 1, 0, 2, 1)
 
-        # Row 1-6 (SSID, Pass, Mode, Channel, Country, Sudo) - Same as before
+        # Row 1: SSID
         grid.attach(Gtk.Label(label="WiFi SSID:"), 0, 1, 1, 1)
         self.entry_ssid = Gtk.Entry()
         self.entry_ssid.set_text(self.config.get("ssid", "DeckUpad"))
         grid.attach(self.entry_ssid, 1, 1, 2, 1)
 
+        # Row 2: WiFi Password
         grid.attach(Gtk.Label(label="WiFi Password:"), 0, 2, 1, 1)
         self.entry_pass = Gtk.Entry()
         self.entry_pass.set_text(self.config.get("password", "DeckUpad123"))
         grid.attach(self.entry_pass, 1, 2, 2, 1)
 
+        # Row 3: WiFi Mode
         grid.attach(Gtk.Label(label="WiFi Standard:"), 0, 3, 1, 1)
         self.combo_mode = Gtk.ComboBoxText()
-        self.combo_mode.append("ax", "AX (WiFi 6)")
+        self.combo_mode.append("ax", "AX (WiFi 6 - Recommended)")
         self.combo_mode.append("ac", "AC (WiFi 5)")
         self.combo_mode.append("n", "N (Legacy)")
         self.combo_mode.set_active_id(self.config.get("wifi_mode", "ax"))
         grid.attach(self.combo_mode, 1, 3, 2, 1)
 
+        # Row 4: WiFi Channel
         grid.attach(Gtk.Label(label="WiFi Channel:"), 0, 4, 1, 1)
         adj = Gtk.Adjustment(value=165, lower=1, upper=177, step_increment=1, page_increment=10, page_size=0)
         self.spin_channel = Gtk.SpinButton(adjustment=adj)
@@ -83,15 +123,19 @@ class DeckUpadLauncher(Gtk.Window):
         self.spin_channel.set_value(int(self.config.get("channel", 165)))
         grid.attach(self.spin_channel, 1, 4, 2, 1)
 
+        # Row 5: WiFi Country
         grid.attach(Gtk.Label(label="WiFi Country:"), 0, 5, 1, 1)
         self.combo_country = Gtk.ComboBoxText()
         self.combo_country.set_entry_text_column(0)
         countries = [("US", "United States"), ("GB", "United Kingdom"), ("DE", "Germany"), ("JP", "Japan"), ("CA", "Canada"), ("AU", "Australia"), ("FR", "France"), ("KR", "South Korea"), ("CN", "China"), ("BR", "Brazil")]
         for code, name in countries:
             self.combo_country.append(code, f"{code} - {name}")
-        self.combo_country.set_active_id(self.config.get("country", "US"))
+
+        default_country = self.config.get("country", "US")
+        self.combo_country.set_active_id(default_country)
         grid.attach(self.combo_country, 1, 5, 2, 1)
 
+        # Row 6: Sudo Password
         grid.attach(Gtk.Label(label="Sudo Password:"), 0, 6, 1, 1)
         self.entry_sudo = Gtk.Entry()
         self.entry_sudo.set_visibility(False)
@@ -105,7 +149,7 @@ class DeckUpadLauncher(Gtk.Window):
 
         if self.config.get("role") == "host": self.rb_host.set_active(True)
 
-        # 3. Buttons
+        # 3. Action Buttons
         btn_box = Gtk.Box(spacing=20)
         btn_box.set_halign(Gtk.Align.CENTER)
         main_vbox.pack_start(btn_box, False, False, 10)
@@ -141,12 +185,14 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.connect("clicked", self.on_stop)
         btn_box.pack_start(self.btn_stop, False, False, 0)
 
-        # 4. Logs
+        # 4. Logs Area
         log_frame = Gtk.Frame(label="System Logs")
         main_vbox.pack_start(log_frame, True, True, 0)
+
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.ALWAYS)
         log_frame.add(scrolled)
+
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
         self.log_view.set_cursor_visible(False)
@@ -154,6 +200,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_view.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.1, 0.1, 0.1, 1))
         self.log_view.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0.9, 0, 1))
         scrolled.add(self.log_view)
+
         self.log_buffer = self.log_view.get_buffer()
         self.log_mark = self.log_buffer.create_mark("end", self.log_buffer.get_end_iter(), False)
 
@@ -192,7 +239,8 @@ class DeckUpadLauncher(Gtk.Window):
 
     def on_test_video(self, simulated=True):
         self.save_config()
-        self.append_log(f"\n--- STARTING VIDEO TEST ({'SIM' if simulated else 'EMU'}) ---\n")
+        mode_str = "SIMULATION" if simulated else "EMULATOR INTEGRATION"
+        self.append_log(f"\n--- STARTING VIDEO TEST ({mode_str}) ---\n")
 
         self.btn_test_sim.set_sensitive(False)
         self.btn_test_emu.set_sensitive(False)
@@ -245,7 +293,7 @@ class DeckUpadLauncher(Gtk.Window):
             REC_IMAGE,
             "python3", "/app/main.py",
             "--windowed",
-            "--host-ip", "127.0.0.1" # <--- FIXED: Tell receiver where to send input
+            "--host-ip", "127.0.0.1"
         ]
 
         GLib.idle_add(self.append_log, f"Launching Receiver Container (Windowed)...\n")
@@ -314,20 +362,17 @@ class DeckUpadLauncher(Gtk.Window):
 
                 # --- NEW LOGIC ---
                 if msg.startswith("HOST_RES:"):
-                    # Send to Input Server (5004)
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s.sendto(msg.encode(), ("127.0.0.1", 5004))
                     except: pass
 
                 elif msg.startswith("STREAM_RES:"):
-                    # Send to Input Server (5004)
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s.sendto(msg.encode(), ("127.0.0.1", 5004))
                     except: pass
 
-                    # Send to Receiver (5003) as RES_UPDATE
                     res = msg.split(":")[1]
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -442,23 +487,19 @@ class DeckUpadLauncher(Gtk.Window):
         self.process = None
 
     def on_stop(self, widget):
-        # Stop Test Input
         if self.test_input_proc:
             self.append_log("Stopping Input Server...\n")
             try:
-                # We need to sudo kill sudo... messy but effective
                 subprocess.run(["sudo", "pkill", "-f", "core/input_server.py"], stderr=subprocess.DEVNULL)
                 self.test_input_proc.terminate()
             except: pass
             self.test_input_proc = None
 
-        # Stop Test Receiver
         if self.test_receiver_proc:
             self.append_log("Stopping Test Receiver...\n")
             subprocess.run(["podman", "stop", "-t", "0", self.test_container_name], stderr=subprocess.DEVNULL)
             self.test_receiver_proc = None
 
-        # Stop Test Sender
         if self.test_sender_proc:
             self.append_log("Stopping Test Sender...\n")
             try:
@@ -468,7 +509,6 @@ class DeckUpadLauncher(Gtk.Window):
                 self.test_sender_proc.kill()
             self.test_sender_proc = None
 
-        # Stop Main Service
         if self.process:
             self.append_log("\nStopping Service...\n")
             try: self.process.terminate()

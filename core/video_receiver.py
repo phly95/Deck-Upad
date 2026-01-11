@@ -61,9 +61,7 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.add_named(self.video_area, "video")
 
         Gst.init(None)
-
-        # NOTE: We use sync=false to ensure lowest latency.
-        # rtpjitterbuffer latency=0 ensures we don't buffer packets.
+        # Pipeline is always configured to receive
         self.pipeline = Gst.parse_launch(
             f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
             "rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
@@ -97,7 +95,10 @@ class DeckUpadWindow(Gtk.Window):
         self.connect("destroy", self.on_close)
         self.show_all()
 
-        # Initialize in Idle mode
+        # --- FIX: Start Pipeline Immediately ---
+        # We keep the pipeline playing 100% of the time.
+        # If no video is sending, udpsrc just waits.
+        self.pipeline.set_state(Gst.State.PLAYING)
         self.set_mode("idle")
 
     def set_mode(self, mode, message=None):
@@ -105,8 +106,7 @@ class DeckUpadWindow(Gtk.Window):
             self.lbl_status.set_markup(f"<span font='14' foreground='#888888'>{message}</span>")
 
         if mode == "video":
-            # Just unpause. Socket was already open.
-            self.pipeline.set_state(Gst.State.PLAYING)
+            # Just show the video widget. The pipeline is already running.
             self.stack.set_visible_child_name("video")
 
             # Hide Cursor
@@ -115,9 +115,7 @@ class DeckUpadWindow(Gtk.Window):
                 cursor = Gdk.Cursor.new_from_name(self.get_display(), "none")
                 win.set_cursor(cursor)
         else:
-            # IMPORTANT: Switch to READY, not NULL.
-            # NULL closes the socket. READY keeps the socket bound but stops processing.
-            self.pipeline.set_state(Gst.State.READY)
+            # Show idle screen. We do NOT stop the pipeline.
             self.stack.set_visible_child_name("idle")
 
             # Restore Cursor

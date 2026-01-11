@@ -95,14 +95,13 @@ class VideoSender:
         glfw.make_context_current(self.window)
         self.egl_display = eglGetCurrentDisplay()
 
-        # --- NEW: Detect Host Res ---
+        # Detect Host Res
         monitor = glfw.get_primary_monitor()
         if monitor:
             mode = glfw.get_video_mode(monitor)
             self.notify(f"HOST_RES:{mode.size.width}x{mode.size.height}")
         else:
             self.notify("HOST_RES:1920x1080")
-        # ----------------------------
 
         self.init_gl()
 
@@ -182,9 +181,7 @@ class VideoSender:
         self.output_w = width
         self.output_h = height
 
-        # Announce Stream Resolution
         self.notify(f"STREAM_RES:{width}x{height}")
-
         self.notify(f"Configuring GStreamer for {width}x{height} -> {self.target_ip}")
 
         f = Gst.ElementFactory.find
@@ -264,6 +261,7 @@ class VideoSender:
 
                     glPixelStorei(GL_PACK_ALIGNMENT, 1)
                     pixels = glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE)
+
                     buf = Gst.Buffer.new_wrapped(pixels)
                     GstVideo.buffer_add_video_meta_full(buf, GstVideo.VideoFrameFlags.NONE, GstVideo.VideoFormat.RGBA, W, H, 1, [0, 0, 0, 0], [W * 4, 0, 0, 0])
                     pts = self.frame_count * self.duration
@@ -311,11 +309,13 @@ class VideoSender:
                     while True:
                         loop_start = time.time()
                         glfw.poll_events()
+
                         readable, _, _ = select.select([conn], [], [], 0)
                         if readable:
                             try:
                                 data, ancdata, _, _ = conn.recvmsg(TEX_SIZE, socket.CMSG_LEN(struct.calcsize('i') * 4))
                                 if not data: break
+
                                 if data[0] == TYPE_TEXTURE_DATA:
                                     fields = struct.unpack(TEX_FMT, data)
                                     w, h, fmt, stride = fields[2], fields[3], fields[4], fields[5]
@@ -329,10 +329,22 @@ class VideoSender:
                                     if fds:
                                         if current_fd != -1: os.close(current_fd)
                                         current_fd = fds[0]
+
                                         if self.egl_image: self.eglDestroyImageKHR(self.egl_display, self.egl_image)
-                                        attribs = [EGL_WIDTH, w, EGL_HEIGHT, h, EGL_LINUX_DRM_FOURCC_EXT, fmt, EGL_DMA_BUF_PLANE0_FD_EXT, current_fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, EGL_DMA_BUF_PLANE0_PITCH_EXT, stride, EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod & 0xFFFFFFFF, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (mod >> 32) & 0xFFFFFFFF, EGL_NONE]
+
+                                        attribs = [
+                                            EGL_WIDTH, w, EGL_HEIGHT, h,
+                                            EGL_LINUX_DRM_FOURCC_EXT, fmt,
+                                            EGL_DMA_BUF_PLANE0_FD_EXT, current_fd,
+                                            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+                                            EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+                                            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, mod & 0xFFFFFFFF,
+                                            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (mod >> 32) & 0xFFFFFFFF,
+                                            EGL_NONE
+                                        ]
                                         attr = (ctypes.c_int * len(attribs))(*attribs)
                                         self.egl_image = self.eglCreateImageKHR(self.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, None, attr)
+
                                         glBindTexture(GL_TEXTURE_2D, self.import_tex)
                                         self.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self.egl_image)
 
@@ -345,6 +357,7 @@ class VideoSender:
                                         if self.output_w != content_w or self.output_h != content_h:
                                             self.setup_fbo(content_w, content_h)
                                             self.setup_pipeline(content_w, content_h)
+
                                             q_arr = self.calculate_quad(w, h, rotate=self.is_rotated)
                                             glBindVertexArray(self.vao)
                                             glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
@@ -353,6 +366,7 @@ class VideoSender:
                                             glEnableVertexAttribArray(0)
                                             glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
                                             glEnableVertexAttribArray(1)
+
                             except Exception as e:
                                 self.notify(f"Recv Error: {e}")
                                 break
@@ -364,8 +378,10 @@ class VideoSender:
                             glBindVertexArray(self.vao)
                             glActiveTexture(GL_TEXTURE0)
                             glBindTexture(GL_TEXTURE_2D, self.import_tex)
+
                             glDrawArrays(GL_TRIANGLES, 0, 6)
                             glFinish()
+
                             glPixelStorei(GL_PACK_ALIGNMENT, 1)
                             pixels = glReadPixels(0, 0, self.output_w, self.output_h, GL_RGBA, GL_UNSIGNED_BYTE)
                             buf = Gst.Buffer.new_wrapped(pixels)
@@ -378,10 +394,16 @@ class VideoSender:
 
                         elapsed = time.time() - loop_start
                         if elapsed < FRAME_INTERVAL: time.sleep(FRAME_INTERVAL - elapsed)
+
                 finally:
                     if current_fd != -1: os.close(current_fd)
                     conn.close()
                     self.notify("VIDEO_STOPPED")
+
+                    # --- CRITICAL FIX: RESET STATE FOR NEXT CONNECTION ---
+                    self.output_w = 0
+                    self.output_h = 0
+
                     if self.pipeline:
                         self.pipeline.set_state(Gst.State.NULL)
                         self.pipeline = None
@@ -393,7 +415,7 @@ class VideoSender:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("target_ip", help="IP address of the Deck")
-    parser.add_argument("--test-mode", action="store_true", help="Generate test pattern")
+    parser.add_argument("--test-mode", action="store_true", help="Generate test pattern instead of reading socket")
     args = parser.parse_args()
 
     sender = VideoSender(args.target_ip)

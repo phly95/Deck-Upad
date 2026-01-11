@@ -156,23 +156,26 @@ class HostService:
         while self.running and proc.poll() is None:
             line = proc.stdout.readline()
             if not line: break
-
             msg = line.strip()
 
-            if msg.startswith("STREAM_RES:"):
+            # --- NEW: Forward Resolutions ---
+            if msg.startswith("HOST_RES:"):
                 try:
-                    # 1. Update Input Server (Host Side Mapping)
+                    parts = msg.split(":")[1].split("x")
+                    self.input_server.host_w = int(parts[0])
+                    self.input_server.host_h = int(parts[1])
+                except: pass
+
+            elif msg.startswith("STREAM_RES:"):
+                try:
                     parts = msg.split(":")[1].split("x")
                     w, h = int(parts[0]), int(parts[1])
                     self.input_server.update_stream_dimensions(w, h)
 
-                    # 2. Update Client (Deck Side Mapping)
-                    # We send CMD_RES_UPDATE:WxH
                     if self.client_conn:
-                        cmd = f"CMD_RES_UPDATE:{w}x{h}"
-                        print(f"[Host] Forwarding Resolution to Deck: {w}x{h}")
-                        self.client_conn.send(cmd.encode())
+                        self.client_conn.send(f"CMD_RES_UPDATE:{w}x{h}".encode())
                 except: pass
+            # --------------------------------
 
             elif msg == "VIDEO_STARTING":
                 print("[Host] Signal: Video Starting -> Notifying Deck")

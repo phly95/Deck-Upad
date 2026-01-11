@@ -95,14 +95,14 @@ class VideoSender:
         glfw.make_context_current(self.window)
         self.egl_display = eglGetCurrentDisplay()
 
-        # --- NEW: Detect and Announce Host Resolution ---
+        # --- NEW: Detect Host Res ---
         monitor = glfw.get_primary_monitor()
         if monitor:
             mode = glfw.get_video_mode(monitor)
             self.notify(f"HOST_RES:{mode.size.width}x{mode.size.height}")
         else:
-            self.notify("HOST_RES:1920x1080") # Fallback
-        # ------------------------------------------------
+            self.notify("HOST_RES:1920x1080")
+        # ----------------------------
 
         self.init_gl()
 

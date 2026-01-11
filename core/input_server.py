@@ -11,6 +11,12 @@ try:
 except ImportError:
     HAS_EVDEV = False
 
+try:
+    import glfw
+    HAS_GLFW = True
+except ImportError:
+    HAS_GLFW = False
+
 class InputServer(threading.Thread):
     def __init__(self, port=5001, control_port=5004):
         super().__init__()
@@ -25,18 +31,31 @@ class InputServer(threading.Thread):
         self.ctrl_sock.bind(("0.0.0.0", self.control_port))
 
         self.ui = None
-
-        # Dimensions
         self.host_w = 1920
         self.host_h = 1080
         self.stream_w = 0
         self.stream_h = 0
 
-        # Start Control Thread
+        self._detect_host_res()
         threading.Thread(target=self._control_loop, daemon=True).start()
 
+    def _detect_host_res(self):
+        if not HAS_GLFW: return
+        try:
+            if not glfw.init(): return
+            monitor = glfw.get_primary_monitor()
+            if monitor:
+                mode = glfw.get_video_mode(monitor)
+                self.host_w = mode.size.width
+                self.host_h = mode.size.height
+            glfw.terminate()
+        except: pass
+
+    def update_stream_dimensions(self, w, h):
+        self.stream_w = w
+        self.stream_h = h
+
     def _control_loop(self):
-        print(f"[InputServer] Control Listener on UDP {self.control_port}")
         while self.running:
             try:
                 data, _ = self.ctrl_sock.recvfrom(1024)
@@ -46,21 +65,14 @@ class InputServer(threading.Thread):
                     parts = msg.split(":")[1].split("x")
                     self.host_w = int(parts[0])
                     self.host_h = int(parts[1])
-                    print(f"[InputServer] Host Resolution Updated: {self.host_w}x{self.host_h}")
-
                 elif msg.startswith("STREAM_RES:"):
                     parts = msg.split(":")[1].split("x")
-                    self.stream_w = int(parts[0])
-                    self.stream_h = int(parts[1])
-                    print(f"[InputServer] Stream Resolution Updated: {self.stream_w}x{self.stream_h}")
-
+                    self.update_stream_dimensions(int(parts[0]), int(parts[1]))
+                elif msg == "STOP":
+                    break
             except: pass
 
     def calculate_input_box(self):
-        """
-        Calculates valid area on HOST screen.
-        Matches Sender's logic for pillarboxing/letterboxing.
-        """
         if self.stream_w == 0 or self.stream_h == 0:
             return (0.0, 0.0, 1.0, 1.0)
 
@@ -68,23 +80,19 @@ class InputServer(threading.Thread):
         stream_aspect = self.stream_w / self.stream_h
 
         if host_aspect > stream_aspect:
-            # Pillarbox (Bars on sides)
-            draw_w = self.host_h * stream_aspect
-            off_x = (self.host_w - draw_w) / 2.0
-
-            bx = off_x / self.host_w
+            # Pillarbox
+            draw_w = (self.host_h * stream_aspect) / self.host_w
+            bx = (1.0 - draw_w) / 2.0
             by = 0.0
-            bw = draw_w / self.host_w
+            bw = draw_w
             bh = 1.0
         else:
-            # Letterbox (Bars on top)
-            draw_h = self.host_w / stream_aspect
-            off_y = (self.host_h - draw_h) / 2.0
-
+            # Letterbox
+            draw_h = (self.host_w / stream_aspect) / self.host_h
             bx = 0.0
-            by = off_y / self.host_h
+            by = (1.0 - draw_h) / 2.0
             bw = 1.0
-            bh = draw_h / self.host_h
+            bh = draw_h
 
         return (bx, by, bw, bh)
 
@@ -99,13 +107,11 @@ class InputServer(threading.Thread):
         }
         try:
             self.ui = UInput(cap, name="Deck-Upad-Virtual-Touch", version=0x1)
-            print("[InputServer] Virtual Touch Device Created.")
             return True
         except: return False
 
     def run(self):
         if not self._init_uinput(): return
-        print(f"[InputServer] Listening on UDP {self.port}...")
 
         while self.running:
             try:
@@ -115,15 +121,12 @@ class InputServer(threading.Thread):
                 rx = msg['x']
                 ry = msg['y']
 
-                # Map 0..1 (Video Space) -> 0..1 (Host Screen Space)
                 ib_x, ib_y, ib_w, ib_h = self.calculate_input_box()
-
                 final_x = ib_x + (rx * ib_w)
                 final_y = ib_y + (ry * ib_h)
 
                 abs_x = int(final_x * 65535)
                 abs_y = int(final_y * 65535)
-
                 abs_x = max(0, min(65535, abs_x))
                 abs_y = max(0, min(65535, abs_y))
 
@@ -141,7 +144,8 @@ class InputServer(threading.Thread):
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 0)
                     self.ui.syn()
-            except: pass
+            except OSError: break
+            except Exception: pass
 
     def stop(self):
         self.running = False

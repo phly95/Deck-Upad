@@ -9,7 +9,7 @@ import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gst, Gtk, Gdk, GLib, Pango
+from gi.repository import Gst, Gtk, Gdk, GLib, Pango, GstVideo
 
 # --- CONFIG ---
 CONTROL_PORT = 5003
@@ -17,17 +17,16 @@ VIDEO_PORT = 5000
 INPUT_PORT = 5001
 
 class DeckUpadWindow(Gtk.Window):
-    def __init__(self, host_ip, is_fullscreen=True):
+    def __init__(self, host_ip, is_fullscreen=False):
         super().__init__(title="Deck-Upad Receiver")
         self.host_ip = host_ip
+        self.is_fullscreen_active = is_fullscreen
 
         self.set_default_size(1280, 800)
+        self.set_keep_above(False)
 
-        if is_fullscreen:
-            self.set_keep_above(True)
+        if self.is_fullscreen_active:
             self.fullscreen()
-        else:
-            self.set_keep_above(False)
 
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-application-prefer-dark-theme", True)
@@ -37,136 +36,150 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.set_transition_duration(200)
         self.add(self.stack)
 
-        # --- IDLE SCREEN ---
         self.idle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.idle_box.set_valign(Gtk.Align.CENTER)
         self.idle_box.set_halign(Gtk.Align.CENTER)
 
-        lbl_logo = Gtk.Label()
-        lbl_logo.set_markup("<span font='30' weight='bold' foreground='white'>Deck-Upad</span>")
-        self.idle_box.pack_start(lbl_logo, True, True, 20)
+        lbl = Gtk.Label(label="Waiting for Stream...")
+        self.idle_box.pack_start(lbl, True, True, 0)
 
-        self.lbl_status = Gtk.Label()
-        self.lbl_status.set_markup("<span font='14' foreground='#888888'>Waiting for Stream...</span>")
-        self.idle_box.pack_start(self.lbl_status, False, False, 10)
+        self.spinner = Gtk.Spinner()
+        self.spinner.start()
+        self.idle_box.pack_start(self.spinner, True, True, 0)
 
         self.idle_area = Gtk.EventBox()
-        self.idle_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 1))
         self.idle_area.add(self.idle_box)
+        self.idle_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.1, 0.1, 0.1, 1))
+
         self.stack.add_named(self.idle_area, "idle")
 
-        # --- VIDEO SCREEN ---
         self.video_area = Gtk.DrawingArea()
-        self.video_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0, 0, 0, 1))
+        self.video_area.connect("realize", self.on_realize)
+        self.video_area.connect("draw", self.on_draw)
+        self.video_area.set_events(Gdk.EventMask.ALL_EVENTS_MASK)
+        self.video_area.connect("button-press-event", self.on_input, "press")
+        self.video_area.connect("button-release-event", self.on_input, "release")
+        self.video_area.connect("motion-notify-event", self.on_input, "move")
         self.stack.add_named(self.video_area, "video")
 
-        Gst.init(None)
-        # Pipeline is always configured to receive
-        self.pipeline = Gst.parse_launch(
-            f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
-            "rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! "
-            "queue ! gtksink name=sink sync=false"
-        )
-
-        sink = self.pipeline.get_by_name("sink")
-        self.sink_widget = sink.get_property("widget")
-        self.stack.remove(self.video_area)
-        self.stack.add_named(self.sink_widget, "video")
-
-        # --- INPUT HANDLING ---
-        self.sink_widget.set_events(Gdk.EventMask.POINTER_MOTION_MASK |
-                                    Gdk.EventMask.BUTTON_PRESS_MASK |
-                                    Gdk.EventMask.BUTTON_RELEASE_MASK)
-        self.sink_widget.connect("motion-notify-event", self.on_input_event, "move")
-        self.sink_widget.connect("button-press-event", self.on_input_event, "press")
-        self.sink_widget.connect("button-release-event", self.on_input_event, "release")
+        self.connect("key-press-event", self.on_key_press)
 
         self.input_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.last_move = 0
-
-        # Default Stream Dimensions
+        self.pipeline = None
+        self.xid = None
         self.stream_w = 1280
         self.stream_h = 800
-
         self.running = True
-        self.ctl_thread = threading.Thread(target=self.control_listener, daemon=True)
-        self.ctl_thread.start()
+
+        self.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.control_sock.bind(("0.0.0.0", CONTROL_PORT))
+        self.control_sock.setblocking(False)
+        GLib.timeout_add(100, self.check_control_messages)
 
         self.connect("destroy", self.on_close)
         self.show_all()
 
-        # --- FIX: Start Pipeline Immediately ---
-        # We keep the pipeline playing 100% of the time.
-        # If no video is sending, udpsrc just waits.
-        self.pipeline.set_state(Gst.State.PLAYING)
-        self.set_mode("idle")
+    def on_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_F11:
+            if self.is_fullscreen_active:
+                self.unfullscreen()
+                self.is_fullscreen_active = False
+            else:
+                self.fullscreen()
+                self.is_fullscreen_active = True
+        elif event.keyval == Gdk.KEY_Escape:
+            if self.is_fullscreen_active:
+                self.unfullscreen()
+                self.is_fullscreen_active = False
 
-    def set_mode(self, mode, message=None):
-        if message:
-            self.lbl_status.set_markup(f"<span font='14' foreground='#888888'>{message}</span>")
-
-        if mode == "video":
-            # Just show the video widget. The pipeline is already running.
-            self.stack.set_visible_child_name("video")
-
-            # Hide Cursor
-            win = self.get_window()
-            if win:
-                cursor = Gdk.Cursor.new_from_name(self.get_display(), "none")
-                win.set_cursor(cursor)
-        else:
-            # Show idle screen. We do NOT stop the pipeline.
-            self.stack.set_visible_child_name("idle")
-
-            # Restore Cursor
-            win = self.get_window()
-            if win: win.set_cursor(None)
-
-    def control_listener(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.bind(("127.0.0.1", CONTROL_PORT))
-            while self.running:
-                data, _ = s.recvfrom(1024)
-                msg = data.decode().strip()
-                GLib.idle_add(self.handle_command, msg)
-        except: pass
-
-    def handle_command(self, cmd):
-        if cmd == "START_VIDEO": self.set_mode("video")
-        elif cmd == "STOP_VIDEO": self.set_mode("idle", "Video Ended. Waiting...")
-        elif cmd.startswith("STATUS:"): self.set_mode("idle", cmd.split(":", 1)[1])
-        elif cmd.startswith("RES_UPDATE:"):
+    def on_realize(self, widget):
+        window = widget.get_window()
+        if window:
             try:
-                parts = cmd.split(":")[1].split("x")
-                self.stream_w = int(parts[0])
-                self.stream_h = int(parts[1])
-                print(f"Receiver: Updated Stream Resolution: {self.stream_w}x{self.stream_h}")
-            except: pass
+                self.xid = window.get_xid()
+            except:
+                print("[RX] Could not get XID (Wayland?)")
 
-    def on_input_event(self, widget, event, input_type):
-        if not self.host_ip: return False
+    def on_draw(self, widget, cr):
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
 
-        if input_type == "move":
-            if time.time() - self.last_move < 0.016: return True
-            self.last_move = time.time()
+    def check_control_messages(self):
+        try:
+            while True:
+                data, _ = self.control_sock.recvfrom(1024)
+                msg = data.decode().strip()
+                print(f"[RX] CMD: {msg}")
+                if msg == "START_VIDEO": self.start_pipeline()
+                elif msg == "STOP_VIDEO": self.stop_pipeline()
+                elif msg.startswith("RES_UPDATE:"):
+                    try:
+                        res = msg.split(":")[1].split("x")
+                        self.stream_w = int(res[0])
+                        self.stream_h = int(res[1])
+                        print(f"[RX] Resolution Update: {self.stream_w}x{self.stream_h}")
+                    except: pass
+        except BlockingIOError: pass
+        except Exception as e: print(f"[RX] Error: {e}")
+        return True
 
-        win_w = widget.get_allocated_width()
-        win_h = widget.get_allocated_height()
-        if win_w == 0 or win_h == 0 or self.stream_w == 0: return False
+    def start_pipeline(self):
+        self.stop_pipeline()
+        print(f"[RX] Starting GStreamer Pipeline... {self.stream_w}x{self.stream_h}")
+        self.stack.set_visible_child_name("video")
 
-        # --- ASPECT RATIO CORRECTION ---
+        pipeline_str = (
+            f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
+            f"rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
+            f"xvimagesink name=sink sync=false render-delay=0"
+        )
+
+        try:
+            self.pipeline = Gst.parse_launch(pipeline_str)
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect('message', self.on_message)
+
+            if self.xid:
+                sink = self.pipeline.get_by_name("sink")
+                # CORRECT FIX: Call set_window_handle on the interface, not the object directly
+                GstVideo.VideoOverlay.set_window_handle(sink, self.xid)
+
+            self.pipeline.set_state(Gst.State.PLAYING)
+        except Exception as e:
+            print(f"[RX] Pipeline Error: {e}")
+            self.stop_pipeline()
+
+    def stop_pipeline(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self.stack.set_visible_child_name("idle")
+
+    def on_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"[RX] GStreamer Error: {err} {debug}")
+            self.stop_pipeline()
+        elif t == Gst.MessageType.EOS:
+            self.stop_pipeline()
+
+    def on_input(self, widget, event, input_type):
+        if not self.running: return False
+        alloc = widget.get_allocation()
+        win_w, win_h = alloc.width, alloc.height
+        if win_w == 0 or win_h == 0: return False
+
         win_aspect = win_w / win_h
         src_aspect = self.stream_w / self.stream_h
 
         if win_aspect > src_aspect:
-            # Pillarbox
             draw_h = win_h
             draw_w = win_h * src_aspect
             offset_x = (win_w - draw_w) / 2
             offset_y = 0
         else:
-            # Letterbox
             draw_w = win_w
             draw_h = win_w / src_aspect
             offset_x = 0
@@ -177,15 +190,12 @@ class DeckUpadWindow(Gtk.Window):
 
         nx = (event.x - offset_x) / draw_w
         ny = (event.y - offset_y) / draw_h
-
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
 
         payload = json.dumps({"type": input_type, "x": nx, "y": ny}).encode()
-        try:
-            self.input_sock.sendto(payload, (self.host_ip, INPUT_PORT))
+        try: self.input_sock.sendto(payload, (self.host_ip, INPUT_PORT))
         except: pass
-
         return True
 
     def on_close(self, *args):
@@ -194,9 +204,15 @@ class DeckUpadWindow(Gtk.Window):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host-ip", default="127.0.0.1", help="Target Host IP for input")
-    parser.add_argument("--windowed", action="store_true", help="Start in windowed mode")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host-ip", dest="host", help="Alias for --host")
+    parser.add_argument("--fullscreen", action="store_true")
+    parser.add_argument("--windowed", action="store_true")
     args = parser.parse_args()
 
-    win = DeckUpadWindow(host_ip=args.host_ip, is_fullscreen=not args.windowed)
+    is_fs = args.fullscreen
+    if args.windowed: is_fs = False
+
+    Gst.init(None)
+    win = DeckUpadWindow(args.host, is_fullscreen=is_fs)
     Gtk.main()

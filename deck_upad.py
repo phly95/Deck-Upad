@@ -13,8 +13,30 @@ from services.client_agent import ClientService
 
 PID_FILE = "/tmp/deck_upad.pid"
 
-def run_cmd(cmd):
-    subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+def run_cmd(cmd, check_output=False):
+    # Modified to optionally capture output for error checking
+    if check_output:
+        return subprocess.run(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        return None
+
+def robust_podman_rm(containers):
+    """
+    Attempts to remove containers. If Podman DB is corrupted (zombie process),
+    it runs 'podman system migrate' and tries again.
+    """
+    # 1. Try to remove normally
+    res = run_cmd(f"podman rm -f {containers}", check_output=True)
+
+    # 2. Check if it failed due to the specific "internal status" error
+    if res.returncode != 0:
+        err_msg = res.stderr.decode()
+        if "migrate" in err_msg or "invalid internal status" in err_msg:
+            print(f"[Cleanup] Podman state inconsistent. Repairing (podman system migrate)...")
+            run_cmd("podman system migrate")
+            # 3. Retry removal
+            run_cmd(f"podman rm -f {containers}")
 
 def check_internet():
     try:
@@ -46,9 +68,16 @@ def perform_aggressive_cleanup(force=False):
         try: os.remove(PID_FILE)
         except: pass
 
-    containers = "wifi-bridge usbip-sidecar stream-receiver"
+    # --- UPDATED: Include builders and use robust removal ---
+    containers = (
+        "wifi-bridge usbip-sidecar stream-receiver "
+        "wifi-bridge-builder usbip-sidecar-builder stream-receiver-builder "
+        "deck-upad-test-rec"
+    )
+
     run_cmd(f"podman stop -t 0 {containers}")
-    run_cmd(f"podman rm -f {containers}")
+    robust_podman_rm(containers)
+    # --------------------------------------------------------
 
     run_cmd("nmcli connection down veth-host-conn")
     run_cmd("nmcli connection delete veth-host-conn")
@@ -62,7 +91,6 @@ def perform_aggressive_cleanup(force=False):
     run_cmd("nmcli device set wlan0 managed yes")
     run_cmd("nmcli device connect wlan0")
 
-    # Only wait for net if we actually cleaned up (implies we might have broken it)
     wait_for_network_restore()
 
 def write_pid_file():
@@ -77,7 +105,6 @@ def remove_pid_file():
 
 def main():
     parser = argparse.ArgumentParser(description="Deck-Upad Service Runner")
-    # Role is now optional because cleanup-only doesn't need it
     parser.add_argument("--role", choices=["host", "client"], required=False)
     parser.add_argument("--ssid", default="DeckUpad")
     parser.add_argument("--password", default="DeckUpad123")
@@ -85,12 +112,10 @@ def main():
     parser.add_argument("--wifi-mode", choices=["n", "ac", "ax"], default="ax")
     parser.add_argument("--country", default="US")
     parser.add_argument("--force-clean", action="store_true")
-    # New Flag
     parser.add_argument("--cleanup-only", action="store_true", help="Run cleanup routine and exit")
 
     args = parser.parse_args()
 
-    # If cleanup-only is requested, force is implied
     should_force = args.force_clean or args.cleanup_only
     perform_aggressive_cleanup(force=should_force)
 
@@ -98,7 +123,6 @@ def main():
         print("[Startup] Cleanup Complete. Exiting.")
         sys.exit(0)
 
-    # If not cleaning up, Role is mandatory
     if not args.role:
         parser.error("the following arguments are required: --role")
 

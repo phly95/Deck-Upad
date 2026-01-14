@@ -55,7 +55,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.test_sender_proc = None
         self.test_input_proc = None
         self.test_container_name = "deck-upad-test-rec"
-        self.cached_sudo_pw = "" # Cache password for cleanup
+        self.cached_sudo_pw = ""
         self.config = self.load_config()
 
         # --- UI LAYOUT ---
@@ -220,16 +220,28 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
-    # --- NEW: Helper to Build Image if missing on Host ---
+    # --- NEW: Robust Container Removal ---
+    def _robust_podman_rm(self, container_name):
+        """Attempts to remove a container, auto-repairing if the state is corrupted."""
+        res = subprocess.run(["podman", "rm", "-f", container_name], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        if res.returncode != 0:
+            err = res.stderr.decode()
+            if "migrate" in err or "invalid internal status" in err:
+                GLib.idle_add(self.append_log, "   [Fixing] Podman state repair triggered...\n")
+                subprocess.run(["podman", "system", "migrate"], stderr=subprocess.DEVNULL)
+                subprocess.run(["podman", "rm", "-f", container_name], stderr=subprocess.DEVNULL)
+
     def ensure_receiver_image_exists(self):
         res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
         if res.stdout.strip():
-            return True # Already exists
+            return True
 
         GLib.idle_add(self.append_log, f"Building Receiver Image '{REC_IMAGE}'... (This takes a minute)\n")
         builder = "stream-receiver-builder"
         try:
-            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+            # Use the robust removal before starting
+            self._robust_podman_rm(builder)
+
             subprocess.run(["podman", "run", "-d", "--name", builder, REC_BASE, "sleep", "infinity"], check=True)
 
             GLib.idle_add(self.append_log, "   Installing GStreamer dependencies...\n")
@@ -249,11 +261,11 @@ class DeckUpadLauncher(Gtk.Window):
             GLib.idle_add(self.append_log, f"Build Failed: {e}\n")
             return False
         finally:
-            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+            self._robust_podman_rm(builder)
 
     def on_test_video(self, simulated=True):
         self.save_config()
-        self.cached_sudo_pw = self.entry_sudo.get_text() # Cache for stop
+        self.cached_sudo_pw = self.entry_sudo.get_text()
 
         mode_str = "SIMULATION" if simulated else "EMULATOR INTEGRATION"
         self.append_log(f"\n--- STARTING VIDEO TEST ({mode_str}) ---\n")
@@ -263,7 +275,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_start.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
 
-        # 1. Ensure Image Exists (Host might not have built it yet)
         threading.Thread(target=self._run_test_sequence, args=(simulated,), daemon=True).start()
 
     def _run_test_sequence(self, simulated):
@@ -274,7 +285,6 @@ class DeckUpadLauncher(Gtk.Window):
         try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
         except: pass
 
-        # 2. Start Input Server (Requires Sudo)
         GLib.idle_add(self.append_log, "Starting Input Server (Sudo)...\n")
         try:
             self.test_input_proc = subprocess.Popen(
@@ -295,12 +305,12 @@ class DeckUpadLauncher(Gtk.Window):
         except Exception as e:
             GLib.idle_add(self.append_log, f"Input Server Failed: {e}\n")
 
-        # 3. Launch Receiver
+        # Use robust removal for the test container too
+        self._robust_podman_rm(self.test_container_name)
+
         uid = os.getuid()
         script_path = os.path.abspath("core/video_receiver.py")
         display = os.environ.get('DISPLAY', ':0')
-
-        subprocess.run(["podman", "rm", "-f", self.test_container_name], stderr=subprocess.DEVNULL)
 
         cmd = [
             "podman", "run", "--rm", "--name", self.test_container_name,
@@ -332,7 +342,6 @@ class DeckUpadLauncher(Gtk.Window):
             GLib.idle_add(self.append_log, f"Container launch failed: {e}\n")
             return
 
-        # 4. Launch Sender after delay
         time.sleep(3)
         self._start_test_sender(simulated)
 
@@ -410,13 +419,12 @@ class DeckUpadLauncher(Gtk.Window):
         except: pass
 
         self.save_config()
-        self.cached_sudo_pw = self.entry_sudo.get_text() # Cache password
+        self.cached_sudo_pw = self.entry_sudo.get_text()
         self.btn_start.set_sensitive(False)
         self.btn_test_sim.set_sensitive(False)
         self.btn_test_emu.set_sensitive(False)
         self.btn_clean.set_sensitive(False)
         self.btn_stop.set_sensitive(True)
-        # Lock inputs
         self.entry_ssid.set_sensitive(False)
         self.entry_pass.set_sensitive(False)
         self.spin_channel.set_sensitive(False)
@@ -506,7 +514,6 @@ class DeckUpadLauncher(Gtk.Window):
         self.process = None
 
     def on_stop(self, widget):
-        # Stop Test Input (Cleanly using sudo and password)
         if self.test_input_proc:
             self.append_log("Stopping Input Server...\n")
             try:
@@ -519,7 +526,8 @@ class DeckUpadLauncher(Gtk.Window):
 
         if self.test_receiver_proc:
             self.append_log("Stopping Test Receiver...\n")
-            subprocess.run(["podman", "stop", "-t", "0", self.test_container_name], stderr=subprocess.DEVNULL)
+            # Use robust removal here as well
+            self._robust_podman_rm(self.test_container_name)
             self.test_receiver_proc = None
 
         if self.test_sender_proc:
@@ -536,7 +544,6 @@ class DeckUpadLauncher(Gtk.Window):
             try: self.process.terminate()
             except: pass
 
-            # Force kill via Sudo with cached password
             def force_kill_if_needed():
                 import time
                 time.sleep(1)

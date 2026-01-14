@@ -48,3 +48,20 @@ It appears that things like network scanning are creating latency issues. This p
 The `wifi_container.py` script automatically sets up a root-level Podman container on Alpine Linux that takes control of the physical Wi-Fi chip. The physical Wi-Fi card is moved into the container's namespace.
 
 Traffic flows through a high-speed **VETH network bridge** that connects the host PC to the container. The container passes the internet connection to the host machine via **NAT (Network Address Translation) using `iptables MASQUERADE`**. This setup prevents the host PC from performing any operations that could interfere with Wi-Fi latency.
+
+## Acknowledgements
+
+Thanks to the following projects for providing reference material and functionality for making this a reality:
+
+obs-vkcapture
+kmscube
+podman
+Gemini
+vkcube
+Azahar
+gstreamer
+usbip
+Alpine Linux
+Fedora
+PyOpenGL
+python-evdev

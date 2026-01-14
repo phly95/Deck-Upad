@@ -53,15 +53,15 @@ Traffic flows through a high-speed **VETH network bridge** that connects the hos
 
 Thanks to the following projects for providing reference material and functionality for making this a reality:
 
-obs-vkcapture
-kmscube
-podman
-Gemini
-vkcube
-Azahar
-gstreamer
-usbip
-Alpine Linux
-Fedora
-PyOpenGL
-python-evdev
+* obs-vkcapture
+* kmscube
+* podman
+* Gemini
+* vkcube
+* Azahar
+* gstreamer
+* usbip
+* Alpine Linux
+* Fedora
+* PyOpenGL
+* python-evdev

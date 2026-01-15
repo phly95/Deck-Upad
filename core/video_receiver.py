@@ -37,21 +37,12 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.set_transition_duration(200)
         self.add(self.stack)
 
-        # --- IDLE SCREEN ---
-        self.idle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.idle_box.set_valign(Gtk.Align.CENTER)
-        self.idle_box.set_halign(Gtk.Align.CENTER)
-
-        lbl = Gtk.Label(label="Waiting for Stream...")
-        self.idle_box.pack_start(lbl, True, True, 0)
-        self.spinner = Gtk.Spinner()
-        self.spinner.start()
-        self.idle_box.pack_start(self.spinner, True, True, 0)
-
+        # --- IDLE SCREEN (UPDATED) ---
+        # Pure black event box. No text, no spinner, no animations.
         self.idle_area = Gtk.EventBox()
-        self.idle_area.add(self.idle_box)
-        # Fix deprecation warning by using CSS
-        css = b"* { background-color: #1a1a1a; }"
+
+        # Apply CSS for #000000 (Black) background
+        css = b"* { background-color: #000000; }"
         provider = Gtk.CssProvider()
         provider.load_from_data(css)
         self.idle_area.get_style_context().add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -59,8 +50,10 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.add_named(self.idle_area, "idle")
 
         # --- VIDEO AREA (GTKSINK CONTAINER) ---
-        # We use an EventBox to capture input, and a Box to hold the GStreamer widget
         self.video_event_box = Gtk.EventBox()
+        # Ensure the video background is also black during aspect ratio adjustments
+        self.video_event_box.get_style_context().add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
         self.video_layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.video_event_box.add(self.video_layout)
 
@@ -105,7 +98,6 @@ class DeckUpadWindow(Gtk.Window):
             while True:
                 data, _ = self.control_sock.recvfrom(1024)
                 msg = data.decode().strip()
-                print(f"[RX] CMD: {msg}")
                 if msg == "START_VIDEO": self.start_pipeline()
                 elif msg == "STOP_VIDEO": self.stop_pipeline()
                 elif msg.startswith("RES_UPDATE:"):
@@ -113,10 +105,9 @@ class DeckUpadWindow(Gtk.Window):
                         res = msg.split(":")[1].split("x")
                         self.stream_w = int(res[0])
                         self.stream_h = int(res[1])
-                        print(f"[RX] Resolution Update: {self.stream_w}x{self.stream_h}")
                     except: pass
         except BlockingIOError: pass
-        except Exception as e: print(f"[RX] Error: {e}")
+        except Exception: pass
         return True
 
     def start_pipeline(self):
@@ -124,9 +115,8 @@ class DeckUpadWindow(Gtk.Window):
         print(f"[RX] Starting GStreamer Pipeline... {self.stream_w}x{self.stream_h}")
         self.stack.set_visible_child_name("video")
 
-        # --- GTKSINK IMPLEMENTATION ---
-        # gtksink automatically handles GL context and cropping (fixes green border).
-        # It also returns a proper GTK widget, preventing crashes on Wayland.
+        # gtksink: Fixes Green Border
+        # decodebin: Enables Hardware Decoding (VAAPI)
         pipeline_str = (
             f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
             f"rtph264depay ! h264parse ! decodebin ! videoconvert ! "
@@ -139,7 +129,6 @@ class DeckUpadWindow(Gtk.Window):
             bus.add_signal_watch()
             bus.connect('message', self.on_message)
 
-            # Retrieve the GtkWidget from gtksink and display it
             sink = self.pipeline.get_by_name("sink")
             video_widget = sink.get_property("widget")
             self.video_layout.pack_start(video_widget, True, True, 0)
@@ -155,7 +144,6 @@ class DeckUpadWindow(Gtk.Window):
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
 
-        # Remove the video widget to clean up
         for child in self.video_layout.get_children():
             self.video_layout.remove(child)
 
@@ -173,24 +161,19 @@ class DeckUpadWindow(Gtk.Window):
     def on_input(self, widget, event, input_type):
         if not self.running: return False
 
-        # Calculate coordinates relative to the video widget
         alloc = widget.get_allocation()
         win_w, win_h = alloc.width, alloc.height
         if win_w == 0 or win_h == 0: return False
 
-        # Assuming 'gtksink' maintains aspect ratio with black bars,
-        # we calculate where the image actually is to normalize clicks.
         win_aspect = win_w / win_h
         src_aspect = self.stream_w / self.stream_h
 
         if win_aspect > src_aspect:
-            # Window is wider than video (Pillarbox)
             draw_h = win_h
             draw_w = win_h * src_aspect
             offset_x = (win_w - draw_w) / 2
             offset_y = 0
         else:
-            # Window is taller than video (Letterbox)
             draw_w = win_w
             draw_h = win_w / src_aspect
             offset_x = 0

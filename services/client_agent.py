@@ -4,6 +4,7 @@ import sys
 import subprocess
 import os
 import shlex
+import pwd
 
 sys.path.append(".")
 from core.wifi_manager import WifiManager
@@ -13,11 +14,6 @@ TARGET_HOST_IP = "192.168.50.2"
 TARGET_PORT = 5555
 GUI_CONTROL_PORT = 5003
 
-# Image Config
-REC_CONTAINER = "stream-receiver"
-REC_IMAGE = "localhost/stream-receiver-final"
-REC_BASE = "registry.fedoraproject.org/fedora:39"
-
 class ClientService:
     def __init__(self):
         self.wifi = WifiManager()
@@ -25,11 +21,31 @@ class ClientService:
         self.bus_id = None
         self.host_socket = None
         self.receiver_proc = None
-        self.inhibitor_proc = None # NEW: Track the sleep inhibitor
+        self.inhibitor_proc = None
         self.sudo_user = os.environ.get('SUDO_USER') or "deck"
 
+        # Get UID for environment variables
+        try:
+            self.user_uid = pwd.getpwnam(self.sudo_user).pw_uid
+        except:
+            self.user_uid = 1000 # Default fallback
+
+    def _get_user_cmd(self, cmd_list):
+        """
+        Wraps a command to run as the non-root user while preserving
+        critical environment variables (XDG_RUNTIME_DIR) required for Flatpak/Wayland.
+        """
+        # We use 'env' to manually inject the runtime dir, which sudo usually strips.
+        runtime_dir = f"/run/user/{self.user_uid}"
+        wrapper = [
+            "sudo", "-u", self.sudo_user,
+            "env",
+            f"XDG_RUNTIME_DIR={runtime_dir}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus"
+        ]
+        return wrapper + cmd_list
+
     def _ensure_flatpak_runtime(self):
-        # ... (This method remains exactly as we fixed it in the previous step) ...
         # GNOME SDK 45 + FFmpeg 23.08
         runtime = "org.gnome.Sdk/x86_64/45"
         ffmpeg = "org.freedesktop.Platform.ffmpeg-full/x86_64/23.08"
@@ -39,8 +55,9 @@ class ClientService:
         missing = []
         for ref in [runtime, ffmpeg]:
             try:
-                subprocess.run(["sudo", "-u", self.sudo_user, "flatpak", "info", ref],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # FIX: Use _get_user_cmd to correctly verify existence without crashing on missing env
+                check_cmd = self._get_user_cmd(["flatpak", "info", ref])
+                subprocess.run(check_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except:
                 missing.append(ref)
 
@@ -51,39 +68,35 @@ class ClientService:
         print(f"[Client] Installing missing components: {missing}")
 
         try:
-            subprocess.run(
-                ["sudo", "-u", self.sudo_user, "flatpak", "remote-add", "--if-not-exists", "--user", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"],
-                check=True, stderr=subprocess.DEVNULL
-            )
+            # FIX: Use _get_user_cmd for installation too
+            setup_cmds = [
+                ["flatpak", "remote-add", "--if-not-exists", "--user", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"],
+            ]
             for ref in missing:
-                subprocess.run(
-                    ["sudo", "-u", self.sudo_user, "flatpak", "install", "--user", "-y", "flathub", ref],
-                    check=True
-                )
+                setup_cmds.append(["flatpak", "install", "--user", "-y", "flathub", ref])
+
+            for cmd in setup_cmds:
+                full_cmd = self._get_user_cmd(cmd)
+                subprocess.run(full_cmd, check=True)
+
             print("   >> Installation Complete.")
         except subprocess.CalledProcessError as e:
             print(f"[CRITICAL] Failed to install dependencies via Flatpak: {e}")
+            print("Since Test Mode worked, try running the client again.")
             sys.exit(1)
 
     def _set_awake_state(self, active):
         """
-        Prevents SteamOS/Bazzite from sleeping or dimming the screen.
-        Since we unbind the controller, the OS thinks we are AFK.
-        We use systemd-inhibit to force the system to stay awake.
+        Prevents SteamOS/Bazzite from auto-sleeping due to inactivity.
+        We ONLY block 'idle', so the Power Button still works as a panic/suspend switch.
         """
         if active:
             if self.inhibitor_proc: return # Already awake
 
             print("[Client] Engaging Sleep Inhibitor (Keep-Alive)...")
             try:
-                # We spawn systemd-inhibit and make it wait forever ('sleep infinity').
-                # While this process runs, the system cannot sleep.
                 cmd = [
                     "systemd-inhibit",
-                    # OLD (Too aggressive):
-                    # "--what=idle:sleep:handle-suspend-key:handle-lid-switch",
-
-                    # NEW (Safe): Only prevent auto-dimming/auto-sleep
                     "--what=idle",
                     "--who=DeckUpad-Stream",
                     "--why=Streaming Video",
@@ -154,8 +167,8 @@ class ClientService:
 
         print(f"[Client] Launching Receiver via Flatpak wrapper...")
 
-        cmd = [
-            "sudo", "-u", self.sudo_user,
+        # FIX: Use _get_user_cmd to ensure Wayland/X11 sockets are visible
+        flatpak_cmd = [
             "flatpak", "run",
             "--command=python3",
             "--filesystem=host",
@@ -169,9 +182,11 @@ class ClientService:
             "--fullscreen"
         ]
 
+        full_cmd = self._get_user_cmd(flatpak_cmd)
+
         try:
             self.receiver_proc = subprocess.Popen(
-                cmd,
+                full_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True
@@ -218,10 +233,10 @@ class ClientService:
                     if msg == "CMD_SHUTDOWN": return
                     elif msg == "CMD_START_VIDEO":
                         self._send_gui_command("START_VIDEO")
-                        self._set_awake_state(True) # <--- WAKE ON
+                        self._set_awake_state(True)
                     elif msg == "CMD_STOP_VIDEO":
                         self._send_gui_command("STOP_VIDEO")
-                        self._set_awake_state(False) # <--- WAKE OFF
+                        self._set_awake_state(False)
                     elif msg.startswith("CMD_RES_UPDATE:"):
                         res = msg.split(":")[1]
                         self._send_gui_command(f"RES_UPDATE:{res}")
@@ -236,7 +251,7 @@ class ClientService:
 
     def stop(self):
         print("\n[Client] Stopping...")
-        self._set_awake_state(False) # Ensure we don't leave it locked on exit
+        self._set_awake_state(False)
 
         if self.host_socket:
             try: self.host_socket.close()

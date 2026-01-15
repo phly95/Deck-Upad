@@ -4,6 +4,7 @@ import threading
 import os
 import sys
 import time
+import subprocess
 
 try:
     from evdev import UInput, ecodes, AbsInfo
@@ -99,30 +100,53 @@ class InputServer(threading.Thread):
     def _init_uinput(self):
         if not HAS_EVDEV: return False
 
-        # 1. Add BTN_TOOL_FINGER to keys
+        # 1. Define Capabilities for a pure Touchscreen
+        # BTN_TOUCH: Reports contact
+        # BTN_TOOL_FINGER: Reports that the contact is a finger (Required for libinput)
+        cap_keys = [ecodes.BTN_TOUCH, ecodes.BTN_TOOL_FINGER]
+
+        # 2. Define Absolute Axes
+        # resolution=320 is arbitrary but necessary.
+        # Without resolution, libinput treats it as undefined/invalid for DIRECT mapping.
+        cap_abs = [
+            (ecodes.ABS_X, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=320)),
+            (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=320))
+        ]
+
         cap = {
-            ecodes.EV_KEY: [
-                ecodes.BTN_LEFT,
-                ecodes.BTN_RIGHT,
-                ecodes.BTN_TOUCH,
-                ecodes.BTN_TOOL_FINGER  # <--- REQUIRED for valid touch events
-            ],
-            ecodes.EV_ABS: [
-                (ecodes.ABS_X, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)),
-                (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0))
-            ]
+            ecodes.EV_KEY: cap_keys,
+            ecodes.EV_ABS: cap_abs
         }
+
         try:
-            # 2. Add input_props=[ecodes.INPUT_PROP_DIRECT]
-            # This tells Gamescope/Libinput: "Map this 1:1 to the screen, do not treat as trackpad"
+            # 3. Use INPUT_PROP_DIRECT
+            # This tells Gamescope "This device maps 1:1 to the screen pixels"
             self.ui = UInput(
                 cap,
-                name="Deck-Upad-Virtual-Touch",
+                name="Deck-Upad-Touchscreen",
                 version=0x1,
                 input_props=[ecodes.INPUT_PROP_DIRECT]
             )
+
+            # 4. FIX PERMISSIONS
+            # The script runs as root (sudo), so the /dev/input/eventX node is root-only.
+            # Gamescope runs as user 'deck'. We must allow 'deck' to read the device.
+            if self.ui.device and self.ui.device.path:
+                print(f"[InputServer] Setting permissions on {self.ui.device.path} for access...")
+                try:
+                    os.chmod(self.ui.device.path, 0o666)
+                except Exception as e:
+                    print(f"[InputServer] Warning: Failed to chmod device: {e}")
+
+            # 5. TRIGGER UDEV
+            # Force the OS to re-scan the new device so properties apply immediately
+            subprocess.run("udevadm trigger --action=add --sysname-match=event*", shell=True)
+
+            print("[InputServer] Virtual Touchscreen initialized successfully.")
             return True
-        except: return False
+        except Exception as e:
+            print(f"[InputServer] Failed to init UInput: {e}")
+            return False
 
     def run(self):
         if not self._init_uinput(): return
@@ -147,20 +171,18 @@ class InputServer(threading.Thread):
                 if msg['type'] == 'move':
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
-                    # For a touchscreen, you generally want the tool to be active during drag
-                    # but only if a press was already registered.
                     self.ui.syn()
                 elif msg['type'] == 'press':
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
-                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+                    # Indicate a finger is touching the screen
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 1)
-                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 1) # <--- Activate Tool
+                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 1)
                     self.ui.syn()
                 elif msg['type'] == 'release':
-                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+                    # Indicate finger lifted
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 0)
-                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 0) # <--- Deactivate Tool
+                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 0)
                     self.ui.syn()
             except OSError: break
             except Exception: pass

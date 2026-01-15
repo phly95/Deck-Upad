@@ -98,16 +98,29 @@ class InputServer(threading.Thread):
 
     def _init_uinput(self):
         if not HAS_EVDEV: return False
+
+        # 1. Add BTN_TOOL_FINGER to keys
         cap = {
-            ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_TOUCH],
+            ecodes.EV_KEY: [
+                ecodes.BTN_LEFT,
+                ecodes.BTN_RIGHT,
+                ecodes.BTN_TOUCH,
+                ecodes.BTN_TOOL_FINGER  # <--- REQUIRED for valid touch events
+            ],
             ecodes.EV_ABS: [
                 (ecodes.ABS_X, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)),
                 (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0))
             ]
         }
-        props = [ecodes.INPUT_PROP_DIRECT]
         try:
-            self.ui = UInput(cap, name="Deck-Upad-Virtual-Touch", version=0x1, input_props=props)
+            # 2. Add input_props=[ecodes.INPUT_PROP_DIRECT]
+            # This tells Gamescope/Libinput: "Map this 1:1 to the screen, do not treat as trackpad"
+            self.ui = UInput(
+                cap,
+                name="Deck-Upad-Virtual-Touch",
+                version=0x1,
+                input_props=[ecodes.INPUT_PROP_DIRECT]
+            )
             return True
         except: return False
 
@@ -134,16 +147,20 @@ class InputServer(threading.Thread):
                 if msg['type'] == 'move':
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
+                    # For a touchscreen, you generally want the tool to be active during drag
+                    # but only if a press was already registered.
                     self.ui.syn()
                 elif msg['type'] == 'press':
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_X, abs_x)
                     self.ui.write(ecodes.EV_ABS, ecodes.ABS_Y, abs_y)
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 1)
+                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 1) # <--- Activate Tool
                     self.ui.syn()
                 elif msg['type'] == 'release':
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
                     self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOUCH, 0)
+                    self.ui.write(ecodes.EV_KEY, ecodes.BTN_TOOL_FINGER, 0) # <--- Deactivate Tool
                     self.ui.syn()
             except OSError: break
             except Exception: pass

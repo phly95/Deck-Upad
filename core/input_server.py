@@ -105,8 +105,9 @@ class InputServer(threading.Thread):
                 (ecodes.ABS_Y, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0))
             ]
         }
+        props = [ecodes.INPUT_PROP_DIRECT]
         try:
-            self.ui = UInput(cap, name="Deck-Upad-Virtual-Touch", version=0x1)
+            self.ui = UInput(cap, name="Deck-Upad-Virtual-Touch", version=0x1, input_props=props)
             return True
         except: return False
 

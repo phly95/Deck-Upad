@@ -33,6 +33,10 @@ FRAME_INTERVAL = 1.0 / TARGET_FPS
 FLIP_X = True
 FLIP_Y = False
 
+# Max resolution for the Deck (16:10 aspect ratio preserved via scaling)
+MAX_WIDTH = 1280
+MAX_HEIGHT = 800
+
 # --- EGL CONSTANTS ---
 EGL_PLATFORM_GBM_KHR = 0x31D7
 EGL_LINUX_DMA_BUF_EXT = 0x3270
@@ -411,9 +415,25 @@ class VideoSenderHeadless:
                                         if w < h:
                                             content_w, content_h = h, w
                                             self.is_rotated = True
-                                        if self.output_w != content_w or self.output_h != content_h:
-                                            self.setup_fbo(content_w, content_h)
-                                            self.setup_pipeline(content_w, content_h)
+
+                                        # --- SCALING LOGIC ---
+                                        scale_factor = 1.0
+                                        if content_w > MAX_WIDTH or content_h > MAX_HEIGHT:
+                                            scale_factor = min(MAX_WIDTH / content_w, MAX_HEIGHT / content_h)
+
+                                        target_w = int(content_w * scale_factor)
+                                        target_h = int(content_h * scale_factor)
+
+                                        # Ensure even dimensions
+                                        if target_w % 2 != 0: target_w -= 1
+                                        if target_h % 2 != 0: target_h -= 1
+                                        target_w = max(2, target_w)
+                                        target_h = max(2, target_h)
+                                        # ---------------------
+
+                                        if self.output_w != target_w or self.output_h != target_h:
+                                            self.setup_fbo(target_w, target_h)
+                                            self.setup_pipeline(target_w, target_h)
                                             q_arr = self.calculate_quad(w, h, rotate=self.is_rotated)
                                             glBindVertexArray(self.vao)
                                             glBindBuffer(GL_ARRAY_BUFFER, self.vbo)

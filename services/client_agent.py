@@ -24,56 +24,63 @@ class ClientService:
         self.usbip = UsbIpManager()
         self.bus_id = None
         self.host_socket = None
-        self.gui_container_name = "stream-receiver"
+        self.receiver_proc = None
+        self.sudo_user = os.environ.get('SUDO_USER') or "deck" # Fallback to 'deck' if detecting fails
 
-    def ensure_receiver_image_exists(self):
-        res = subprocess.run(["podman", "images", "-q", REC_IMAGE], stdout=subprocess.PIPE, text=True)
-        if res.stdout.strip():
+    def _ensure_flatpak_runtime(self):
+        # GNOME SDK 45 + FFmpeg 23.08
+        runtime = "org.gnome.Sdk/x86_64/45"
+        ffmpeg = "org.freedesktop.Platform.ffmpeg-full/x86_64/23.08"
+
+        print(f"[Client] Checking for Flatpak Runtime & Codecs...")
+
+        # Check Logic
+        missing = []
+        for ref in [runtime, ffmpeg]:
+            try:
+                subprocess.run(["sudo", "-u", self.sudo_user, "flatpak", "info", ref],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                missing.append(ref)
+
+        if not missing:
+            print("   >> Components found.")
             return
 
-        print(f"[Client] Building Receiver Image '{REC_IMAGE}' (Internet Required)...")
-        builder = f"{REC_CONTAINER}-builder"
+        print(f"[Client] Installing missing components: {missing}")
 
         try:
-            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
-            subprocess.run(["podman", "run", "-d", "--name", builder, REC_BASE, "sleep", "infinity"], check=True)
+            # Ensure Flathub
+            subprocess.run(
+                ["sudo", "-u", self.sudo_user, "flatpak", "remote-add", "--if-not-exists", "--user", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"],
+                check=True, stderr=subprocess.DEVNULL
+            )
 
-            print("   Installing GStreamer dependencies...")
-            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y", "--nogpgcheck",
-                "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-39.noarch.rpm"], check=True)
-
-            pkgs = [
-                "python3-gobject", "gtk3", "gstreamer1", "gstreamer1-plugins-base",
-                "gstreamer1-plugins-good", "gstreamer1-plugins-good-gtk",
-                "gstreamer1-libav", "gstreamer1-plugins-bad-free",
-                "mesa-dri-drivers", "libwayland-client", "python3"
-            ]
-            subprocess.run(["podman", "exec", builder, "dnf", "install", "-y"] + pkgs, check=True)
-
-            print(f"   Committing to {REC_IMAGE}...")
-            subprocess.run(["podman", "commit", builder, REC_IMAGE], check=True)
-
+            # Install
+            for ref in missing:
+                subprocess.run(
+                    ["sudo", "-u", self.sudo_user, "flatpak", "install", "--user", "-y", "flathub", ref],
+                    check=True
+                )
+            print("   >> Installation Complete.")
         except subprocess.CalledProcessError as e:
-            print(f"[CRITICAL] Failed to build receiver image: {e}")
-            subprocess.run(["podman", "stop", builder], stderr=subprocess.DEVNULL)
-            raise e
-        finally:
-            subprocess.run(["podman", "rm", "-f", builder], stderr=subprocess.DEVNULL)
+            print(f"[CRITICAL] Failed to install dependencies via Flatpak: {e}")
+            sys.exit(1)
 
     def start(self, ssid, password, country="US"):
         print("="*50)
-        print("   DECK-UPAD CLIENT AGENT")
+        print("   DECK-UPAD CLIENT AGENT (NATIVE FLATPAK)")
         print("="*50)
 
-        # 1. PRE-FLIGHT CHECK
+        # 1. PRE-FLIGHT CHECKS
         print("[Client] Performing Pre-Flight Checks...")
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
-            self.ensure_receiver_image_exists()
+            # NEW: Check for Flatpak Runtime
+            self._ensure_flatpak_runtime()
         except Exception as e:
-            print(f"[CRITICAL] Pre-flight build failed: {e}")
-            print("Ensure you have an active internet connection before starting.")
+            print(f"[CRITICAL] Pre-flight failed: {e}")
             sys.exit(1)
 
         # 2. START HARDWARE
@@ -96,8 +103,8 @@ class ClientService:
             print(f"[ERROR] USBIP Init Failed: {e}")
 
         # 3. START GUI OVERLAY
-        print("[Client] Launching Video Receiver GUI...")
-        self._launch_receiver_container()
+        print("[Client] Launching Native Video Receiver...")
+        self._launch_native_receiver()
 
         # 4. CONNECT TO HOST
         self.host_socket = self._establish_handshake()
@@ -106,38 +113,39 @@ class ClientService:
         if self.host_socket:
             self._monitor_lifecycle()
 
-    def _launch_receiver_container(self):
-        # Clean up old container
-        subprocess.run(["podman", "rm", "-f", self.gui_container_name], stderr=subprocess.DEVNULL)
+    def _launch_native_receiver(self):
+        # Kill old instances
+        subprocess.run(["pkill", "-f", "core/video_receiver.py"], stderr=subprocess.DEVNULL)
 
         script_path = os.path.abspath("core/video_receiver.py")
-        uid = os.getuid()
 
-        # Pass both Wayland and X11 sockets
-        # Note: In Game Mode, DISPLAY is usually :0 or :1
-        display_env = os.environ.get('DISPLAY', ':0')
+        print(f"[Client] Launching Receiver via Flatpak wrapper...")
 
-        cmd = (
-            f"podman run -d --replace --name {self.gui_container_name} "
-            f"--net=host "
-            f"--privileged "
-            f"-v /tmp/.X11-unix:/tmp/.X11-unix "
-            f"-v /run/user/{os.getuid()}:/run/user/{os.getuid()} "
-            f"-e DISPLAY={os.environ.get('DISPLAY', ':0')} "
-            f"-e XDG_RUNTIME_DIR=/run/user/{os.getuid()} "
-            f"-e GDK_BACKEND=x11,wayland "
-            f"-v {script_path}:/app/main.py "
-            f"{REC_IMAGE} "
-            # FIX: Pass host IP to the script inside the container
-            f"python3 /app/main.py --host-ip {TARGET_HOST_IP}"
-        )
+        cmd = [
+            "sudo", "-u", self.sudo_user,
+            "flatpak", "run",
+            "--command=python3",
+            "--filesystem=host",
+            "--share=network",
+            "--device=all",
+            "--socket=x11",
+            "--socket=wayland",
+            "org.gnome.Sdk//45",
+            script_path,
+            "--host-ip", TARGET_HOST_IP,
+            "--fullscreen"
+        ]
 
-        # We REMOVED stderr=subprocess.DEVNULL so errors show in the launcher log
-        result = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if result.returncode != 0:
-            print(f"[Client] GUI Launch Failed:\n{result.stdout}")
-        else:
-            print(f"[Client] GUI Container ID: {result.stdout.strip()[:12]}")
+        try:
+            self.receiver_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            print(f"[Client] Receiver PID: {self.receiver_proc.pid}")
+        except Exception as e:
+            print(f"[Client] Failed to launch GUI: {e}")
 
         time.sleep(2)
 
@@ -177,9 +185,7 @@ class ClientService:
                     if msg == "CMD_SHUTDOWN": return
                     elif msg == "CMD_START_VIDEO": self._send_gui_command("START_VIDEO")
                     elif msg == "CMD_STOP_VIDEO": self._send_gui_command("STOP_VIDEO")
-                    # NEW: Handle Resolution Update
                     elif msg.startswith("CMD_RES_UPDATE:"):
-                        # Forward as RES_UPDATE:WxH to GUI
                         res = msg.split(":")[1]
                         self._send_gui_command(f"RES_UPDATE:{res}")
         except: pass
@@ -197,8 +203,12 @@ class ClientService:
             try: self.host_socket.close()
             except: pass
 
-        subprocess.run(["podman", "stop", "-t", "0", self.gui_container_name],
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.receiver_proc:
+            self.receiver_proc.terminate()
+            try: self.receiver_proc.wait(timeout=1)
+            except: self.receiver_proc.kill()
+
+        subprocess.run(["pkill", "-f", "core/video_receiver.py"], stderr=subprocess.DEVNULL)
 
         if self.bus_id:
             self.usbip.release_device(self.bus_id)

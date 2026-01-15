@@ -8,6 +8,7 @@ import signal
 import socket
 import time
 import importlib.util
+from core.video_sender_manager import VideoSenderManager
 
 # --- DEPENDENCY CHECK & AUTO-INSTALL ---
 def check_and_install_deps():
@@ -56,6 +57,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.test_input_proc = None
         self.test_container_name = "deck-upad-test-rec"
         self.cached_sudo_pw = ""
+        self.sender_mgr = VideoSenderManager()
         self.config = self.load_config()
 
         # --- UI LAYOUT ---
@@ -220,6 +222,49 @@ class DeckUpadLauncher(Gtk.Window):
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
 
+    def _ensure_flatpak_runtime(self):
+        """Checks and installs Flatpak GNOME SDK + FFmpeg for the Test Mode."""
+        runtime_ref = "org.gnome.Sdk/x86_64/45"
+        ffmpeg_ref = "org.freedesktop.Platform.ffmpeg-full/x86_64/23.08" # Needed for H.264
+
+        # 1. Check SDK
+        sdk_installed = False
+        try:
+            subprocess.run(["flatpak", "info", runtime_ref], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sdk_installed = True
+        except: pass
+
+        # 2. Check FFmpeg
+        ffmpeg_installed = False
+        try:
+            subprocess.run(["flatpak", "info", ffmpeg_ref], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ffmpeg_installed = True
+        except: pass
+
+        if sdk_installed and ffmpeg_installed:
+            return True
+
+        GLib.idle_add(self.append_log, f"Installing Runtime & Codecs... (This may take a moment)\n")
+
+        try:
+            # Add Flathub
+            subprocess.run(["flatpak", "remote-add", "--if-not-exists", "--user", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"], check=True)
+
+            # Install SDK
+            if not sdk_installed:
+                subprocess.run(["flatpak", "install", "--user", "--or-update", "-y", "flathub", runtime_ref], check=True)
+
+            # Install FFmpeg
+            if not ffmpeg_installed:
+                 GLib.idle_add(self.append_log, f"Installing FFmpeg Extension...\n")
+                 subprocess.run(["flatpak", "install", "--user", "--or-update", "-y", "flathub", ffmpeg_ref], check=True)
+
+            GLib.idle_add(self.append_log, f"Runtime & Codecs Ready.\n")
+            return True
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"Failed to install dependencies: {e}\n")
+            return False
+
     # --- NEW: Robust Container Removal ---
     def _robust_podman_rm(self, container_name):
         """Attempts to remove a container, auto-repairing if the state is corrupted."""
@@ -263,6 +308,36 @@ class DeckUpadLauncher(Gtk.Window):
         finally:
             self._robust_podman_rm(builder)
 
+    def _ensure_flatpak_runtime(self):
+        """Checks and installs Flatpak GNOME SDK for the Test Mode."""
+        runtime_ref = "org.gnome.Sdk/x86_64/45"
+
+        # 1. Strict Check: Parse 'flatpak list' to ensure it is fully installed and recognized
+        # We check specific columns to ensure we aren't matching partial strings.
+        try:
+            res = subprocess.run(["flatpak", "list", "--runtime", "--columns=application,branch,arch"], stdout=subprocess.PIPE, text=True)
+            # Check for "org.gnome.Sdk  45  x86_64" existence
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    if "org.gnome.Sdk" in parts[0] and "45" in parts[1] and "x86_64" in parts[2]:
+                        return True
+        except: pass
+
+        GLib.idle_add(self.append_log, f"Installing GNOME SDK... (This may take a minute)\n")
+
+        try:
+            # 2. Force Install / Repair
+            subprocess.run(["flatpak", "remote-add", "--if-not-exists", "--user", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"], check=True)
+            # We use --or-update to ensure that if it exists but is broken, it gets fixed.
+            subprocess.run(["flatpak", "install", "--user", "--or-update", "-y", "flathub", runtime_ref], check=True)
+
+            GLib.idle_add(self.append_log, f"SDK installed successfully.\n")
+            return True
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"Failed to install SDK: {e}\n")
+            return False
+
     def on_test_video(self, simulated=True):
         self.save_config()
         self.cached_sudo_pw = self.entry_sudo.get_text()
@@ -278,13 +353,14 @@ class DeckUpadLauncher(Gtk.Window):
         threading.Thread(target=self._run_test_sequence, args=(simulated,), daemon=True).start()
 
     def _run_test_sequence(self, simulated):
-        if not self.ensure_receiver_image_exists():
-            GLib.idle_add(self.append_log, "Cannot start test without container image.\n")
+        # 1. Ensure Flatpak Runtime exists
+        if not self._ensure_flatpak_runtime():
             return
 
         try: subprocess.run(["xhost", "+"], stderr=subprocess.DEVNULL)
         except: pass
 
+        # 2. Start Input Server
         GLib.idle_add(self.append_log, "Starting Input Server (Sudo)...\n")
         try:
             self.test_input_proc = subprocess.Popen(
@@ -305,30 +381,27 @@ class DeckUpadLauncher(Gtk.Window):
         except Exception as e:
             GLib.idle_add(self.append_log, f"Input Server Failed: {e}\n")
 
-        # Use robust removal for the test container too
-        self._robust_podman_rm(self.test_container_name)
-
-        uid = os.getuid()
+        # 3. Start Receiver (Native Flatpak Wrapper)
         script_path = os.path.abspath("core/video_receiver.py")
-        display = os.environ.get('DISPLAY', ':0')
+
+        # Use the exact full reference to avoid ambiguity
+        runtime_ref = "org.gnome.Sdk/x86_64/45"
 
         cmd = [
-            "podman", "run", "--rm", "--name", self.test_container_name,
-            "--net=host",
-            "--privileged",
-            "-v", "/tmp/.X11-unix:/tmp/.X11-unix",
-            "-v", f"/run/user/{uid}:/run/user/{uid}",
-            "-e", f"DISPLAY={display}",
-            "-e", f"XDG_RUNTIME_DIR=/run/user/{uid}",
-            "-e", "GDK_BACKEND=x11,wayland",
-            "-v", f"{script_path}:/app/main.py",
-            REC_IMAGE,
-            "python3", "/app/main.py",
+            "flatpak", "run",
+            "--command=python3",
+            "--filesystem=host",
+            "--share=network",
+            "--device=all",
+            "--socket=x11",
+            "--socket=wayland",
+            runtime_ref, # <--- Use full ref
+            script_path,
             "--windowed",
             "--host-ip", "127.0.0.1"
         ]
 
-        GLib.idle_add(self.append_log, f"Launching Receiver Container (Windowed)...\n")
+        GLib.idle_add(self.append_log, f"Launching Receiver (Flatpak wrapper)...\n")
 
         try:
             self.test_receiver_proc = subprocess.Popen(
@@ -339,28 +412,32 @@ class DeckUpadLauncher(Gtk.Window):
             )
             threading.Thread(target=self._monitor_pipe, args=(self.test_receiver_proc, "[RX]"), daemon=True).start()
         except Exception as e:
-            GLib.idle_add(self.append_log, f"Container launch failed: {e}\n")
+            GLib.idle_add(self.append_log, f"Flatpak launch failed: {e}\n")
             return
 
         time.sleep(3)
         self._start_test_sender(simulated)
 
     def _start_test_sender(self, simulated):
-        args = ["python3", "core/video_sender.py", "127.0.0.1"]
+        GLib.idle_add(self.append_log, "Preparing Sender Container...\n")
+
+        # Build image if missing (Runs in this thread, effectively blocking next steps, which is fine)
+        try:
+            self.sender_mgr.ensure_image_exists()
+        except Exception as e:
+             GLib.idle_add(self.append_log, f"Sender Build Failed: {e}\n")
+             return
+
         if simulated:
-            args.append("--test-mode")
-            GLib.idle_add(self.append_log, "Launching Sender (Generated Pattern)...\n")
+            GLib.idle_add(self.append_log, "Mode: Test Pattern\n")
         else:
-            GLib.idle_add(self.append_log, "Launching Sender (Waiting for Azahar)...\n")
-            GLib.idle_add(self.append_log, ">>> PLEASE LAUNCH AZAHAR NOW <<<\n")
+            GLib.idle_add(self.append_log, "Mode: Emulator Capture\n>>> LAUNCH AZAHAR NOW <<<\n")
 
         try:
-            self.test_sender_proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
+            # Use the Manager to start the container
+            self.test_sender_proc = self.sender_mgr.start("127.0.0.1", test_mode=simulated)
+
+            # Monitor output
             threading.Thread(target=self._monitor_sender_output, args=(self.test_sender_proc,), daemon=True).start()
 
             if simulated:
@@ -532,11 +609,7 @@ class DeckUpadLauncher(Gtk.Window):
 
         if self.test_sender_proc:
             self.append_log("Stopping Test Sender...\n")
-            try:
-                self.test_sender_proc.terminate()
-                self.test_sender_proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                self.test_sender_proc.kill()
+            self.sender_mgr.stop()
             self.test_sender_proc = None
 
         if self.process:

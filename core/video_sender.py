@@ -229,19 +229,31 @@ class VideoSenderHeadless:
         pipeline_tail = f"rtph264pay config-interval=1 pt=96 ! udpsink host={self.target_ip} port=5000 sync=false"
 
         enc = ""
-        # 1. Try VAAPI Hardware (if not previously failed)
-        if f("vaapih264enc") and not self.use_fallback_enc:
-             self.notify("--- Encoder: VAAPI (Hardware) ---")
+        # 1. Try NVIDIA NVENC
+        if f("nvh264enc"):
+             self.notify("--- Encoder: NVENC (NVIDIA) ---")
+             enc = "videoconvert ! video/x-raw,format=NV12 ! nvh264enc preset=low-latency-hq bitrate=10000 zerolatency=true !"
+
+        # 2. Try Modern VAAPI (gstreamer-plugin-va)
+        elif f("vah264enc") and not self.use_fallback_enc:
+             self.notify("--- Encoder: VAAPI (Modern vah264enc) ---")
+             # FIX: Changed 'keyframe-period' to 'key-int-max'
+             enc = "videoconvert ! video/x-raw,format=NV12 ! vah264enc bitrate=10000 key-int-max=60 !"
+
+        # 3. Try Legacy VAAPI (gstreamer-vaapi)
+        elif f("vaapih264enc") and not self.use_fallback_enc:
+             self.notify("--- Encoder: VAAPI (Legacy vaapih264enc) ---")
              enc = "videoconvert ! video/x-raw,format=NV12 ! vaapih264enc rate-control=cbr bitrate=10000 keyframe-period=60 !"
-        # 2. Try x264 (Software)
+
+        # 4. Try x264 (Software)
         elif f("x264enc"):
             self.notify("--- Encoder: x264 (Software) ---")
             enc = "videoconvert ! video/x-raw,format=I420 ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=5000 key-int-max=60 !"
-        # 3. Try OpenH264 (Common Fallback)
+        # 4. Try OpenH264 (Common Fallback)
         elif f("openh264enc"):
             self.notify("--- Encoder: OpenH264 (Software) ---")
             enc = "videoconvert ! video/x-raw,format=I420 ! openh264enc bitrate=5000000 !"
-        # 4. Try FFmpeg/LibAV (Universal Fallback)
+        # 5. Try FFmpeg/LibAV (Universal Fallback)
         elif f("avenc_h264"):
             self.notify("--- Encoder: libav/ffmpeg (Software) ---")
             enc = "videoconvert ! video/x-raw,format=I420 ! avenc_h264 bitrate=5000000 !"

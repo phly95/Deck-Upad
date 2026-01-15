@@ -9,6 +9,7 @@ import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
+gi.require_version('GstVideo', '1.0')
 from gi.repository import Gst, Gtk, Gdk, GLib, Pango, GstVideo
 
 # --- CONFIG ---
@@ -36,37 +37,44 @@ class DeckUpadWindow(Gtk.Window):
         self.stack.set_transition_duration(200)
         self.add(self.stack)
 
+        # --- IDLE SCREEN ---
         self.idle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.idle_box.set_valign(Gtk.Align.CENTER)
         self.idle_box.set_halign(Gtk.Align.CENTER)
 
         lbl = Gtk.Label(label="Waiting for Stream...")
         self.idle_box.pack_start(lbl, True, True, 0)
-
         self.spinner = Gtk.Spinner()
         self.spinner.start()
         self.idle_box.pack_start(self.spinner, True, True, 0)
 
         self.idle_area = Gtk.EventBox()
         self.idle_area.add(self.idle_box)
-        self.idle_area.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.1, 0.1, 0.1, 1))
+        # Fix deprecation warning by using CSS
+        css = b"* { background-color: #1a1a1a; }"
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        self.idle_area.get_style_context().add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         self.stack.add_named(self.idle_area, "idle")
 
-        self.video_area = Gtk.DrawingArea()
-        self.video_area.connect("realize", self.on_realize)
-        self.video_area.connect("draw", self.on_draw)
-        self.video_area.set_events(Gdk.EventMask.ALL_EVENTS_MASK)
-        self.video_area.connect("button-press-event", self.on_input, "press")
-        self.video_area.connect("button-release-event", self.on_input, "release")
-        self.video_area.connect("motion-notify-event", self.on_input, "move")
-        self.stack.add_named(self.video_area, "video")
+        # --- VIDEO AREA (GTKSINK CONTAINER) ---
+        # We use an EventBox to capture input, and a Box to hold the GStreamer widget
+        self.video_event_box = Gtk.EventBox()
+        self.video_layout = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.video_event_box.add(self.video_layout)
+
+        # Input Wiring
+        self.video_event_box.connect("button-press-event", self.on_input, "press")
+        self.video_event_box.connect("button-release-event", self.on_input, "release")
+        self.video_event_box.connect("motion-notify-event", self.on_input, "move")
+
+        self.stack.add_named(self.video_event_box, "video")
 
         self.connect("key-press-event", self.on_key_press)
 
         self.input_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.pipeline = None
-        self.xid = None
         self.stream_w = 1280
         self.stream_h = 800
         self.running = True
@@ -92,18 +100,6 @@ class DeckUpadWindow(Gtk.Window):
                 self.unfullscreen()
                 self.is_fullscreen_active = False
 
-    def on_realize(self, widget):
-        window = widget.get_window()
-        if window:
-            try:
-                self.xid = window.get_xid()
-            except:
-                print("[RX] Could not get XID (Wayland?)")
-
-    def on_draw(self, widget, cr):
-        cr.set_source_rgb(0, 0, 0)
-        cr.paint()
-
     def check_control_messages(self):
         try:
             while True:
@@ -128,10 +124,13 @@ class DeckUpadWindow(Gtk.Window):
         print(f"[RX] Starting GStreamer Pipeline... {self.stream_w}x{self.stream_h}")
         self.stack.set_visible_child_name("video")
 
+        # --- GTKSINK IMPLEMENTATION ---
+        # gtksink automatically handles GL context and cropping (fixes green border).
+        # It also returns a proper GTK widget, preventing crashes on Wayland.
         pipeline_str = (
             f"udpsrc port={VIDEO_PORT} caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96\" ! "
-            f"rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-            f"xvimagesink name=sink sync=false render-delay=0"
+            f"rtph264depay ! h264parse ! decodebin ! videoconvert ! "
+            f"gtksink name=sink sync=false"
         )
 
         try:
@@ -140,10 +139,11 @@ class DeckUpadWindow(Gtk.Window):
             bus.add_signal_watch()
             bus.connect('message', self.on_message)
 
-            if self.xid:
-                sink = self.pipeline.get_by_name("sink")
-                # CORRECT FIX: Call set_window_handle on the interface, not the object directly
-                GstVideo.VideoOverlay.set_window_handle(sink, self.xid)
+            # Retrieve the GtkWidget from gtksink and display it
+            sink = self.pipeline.get_by_name("sink")
+            video_widget = sink.get_property("widget")
+            self.video_layout.pack_start(video_widget, True, True, 0)
+            self.video_layout.show_all()
 
             self.pipeline.set_state(Gst.State.PLAYING)
         except Exception as e:
@@ -154,6 +154,11 @@ class DeckUpadWindow(Gtk.Window):
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
+
+        # Remove the video widget to clean up
+        for child in self.video_layout.get_children():
+            self.video_layout.remove(child)
+
         self.stack.set_visible_child_name("idle")
 
     def on_message(self, bus, message):
@@ -167,19 +172,25 @@ class DeckUpadWindow(Gtk.Window):
 
     def on_input(self, widget, event, input_type):
         if not self.running: return False
+
+        # Calculate coordinates relative to the video widget
         alloc = widget.get_allocation()
         win_w, win_h = alloc.width, alloc.height
         if win_w == 0 or win_h == 0: return False
 
+        # Assuming 'gtksink' maintains aspect ratio with black bars,
+        # we calculate where the image actually is to normalize clicks.
         win_aspect = win_w / win_h
         src_aspect = self.stream_w / self.stream_h
 
         if win_aspect > src_aspect:
+            # Window is wider than video (Pillarbox)
             draw_h = win_h
             draw_w = win_h * src_aspect
             offset_x = (win_w - draw_w) / 2
             offset_y = 0
         else:
+            # Window is taller than video (Letterbox)
             draw_w = win_w
             draw_h = win_w / src_aspect
             offset_x = 0

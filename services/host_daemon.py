@@ -4,17 +4,19 @@ import sys
 import threading
 import subprocess
 import os
-import pwd
 
 sys.path.append(".")
 from core.wifi_manager import WifiManager, HOST_LAN_IP
 from core.usbip_manager import UsbIpManager
 from core.input_server import InputServer
+# NEW IMPORT
+from core.video_sender_manager import VideoSenderManager
 
 class HostService:
     def __init__(self):
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
+        self.video_mgr = VideoSenderManager() # NEW
         self.input_server = InputServer()
         self.running = True
         self.server_socket = None
@@ -23,13 +25,14 @@ class HostService:
 
     def start(self, ssid, password, channel=165, wifi_mode="ax", country="US"):
         print("="*50)
-        print("   DECK-UPAD HOST DAEMON")
+        print("   DECK-UPAD HOST DAEMON (CONTAINERIZED)")
         print("="*50)
 
         print("[Host] Performing Pre-Flight Checks...")
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
+            self.video_mgr.ensure_image_exists() # NEW: Build sender image
         except Exception as e:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
             sys.exit(1)
@@ -106,47 +109,12 @@ class HostService:
             except Exception as e:
                 print(f"[Host] Loop Error: {e}")
 
-    def _get_user_env(self):
-        sudo_user = os.environ.get('SUDO_USER')
-        if not sudo_user: return os.environ.copy()
-
-        try:
-            pw = pwd.getpwnam(sudo_user)
-            env = os.environ.copy()
-            env['USER'] = sudo_user
-            env['HOME'] = pw.pw_dir
-            env['UID'] = str(pw.pw_uid)
-            env['XDG_RUNTIME_DIR'] = f"/run/user/{pw.pw_uid}"
-
-            xauth = os.path.join(pw.pw_dir, ".Xauthority")
-            if os.path.exists(xauth): env['XAUTHORITY'] = xauth
-
-            if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
-            if 'WAYLAND_DISPLAY' not in env:
-                if os.path.exists(os.path.join(env['XDG_RUNTIME_DIR'], 'wayland-0')):
-                    env['WAYLAND_DISPLAY'] = 'wayland-0'
-            return env
-        except:
-            return os.environ.copy()
-
     def _start_video_process(self, target_ip):
         self._stop_video_process()
+        print(f"[Host] Launching Video Sender Container...")
 
-        sudo_user = os.environ.get('SUDO_USER')
-        cmd = ["python3", "core/video_sender.py", target_ip]
-        if sudo_user:
-            cmd = ["sudo", "-u", sudo_user, "-E", "python3", "core/video_sender.py", target_ip]
-
-        print(f"[Host] Launching Video Sender as user: {sudo_user or 'root'}")
-
-        self.video_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=self._get_user_env(),
-            text=True,
-            bufsize=1
-        )
+        # USE THE MANAGER
+        self.video_proc = self.video_mgr.start(target_ip)
 
         threading.Thread(target=self._monitor_video_output, args=(self.video_proc,), daemon=True).start()
 
@@ -156,8 +124,6 @@ class HostService:
             if not line: break
 
             msg = line.strip()
-
-            # --- VERBOSE LOGGING ENABLED ---
             print(f"[VideoLog] {msg}")
 
             if msg.startswith("HOST_RES:"):
@@ -178,23 +144,18 @@ class HostService:
                 except: pass
 
             elif msg == "VIDEO_STARTING":
-                print("[Host] Signal: Video Starting -> Notifying Deck")
                 if self.client_conn:
                     try: self.client_conn.send(b"CMD_START_VIDEO")
                     except: pass
             elif msg == "VIDEO_STOPPED":
-                print("[Host] Signal: Video Stopped -> Notifying Deck")
                 if self.client_conn:
                     try: self.client_conn.send(b"CMD_STOP_VIDEO")
                     except: pass
-            elif "CRASH" in msg:
-                 print(f"[Host] Video Sender Error: {msg}")
 
     def _stop_video_process(self):
         if self.video_proc:
             print("[Host] Stopping Video Process...")
-            self.video_proc.terminate()
-            self.video_proc.wait()
+            self.video_mgr.stop() # USE MANAGER
             self.video_proc = None
 
     def stop(self):

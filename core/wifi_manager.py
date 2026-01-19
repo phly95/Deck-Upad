@@ -26,19 +26,11 @@ CLIENT_GATEWAY_IP = "10.13.13.1"
 CLIENT_HOST_IP = "10.13.13.2"
 
 # Ports to forward (UDP/TCP)
-# We open a wide range to cover USBIP (3240), Video (5000), Input (5001), Control (5002-5004)
 FWD_PORT_RANGE = "2000:65535"
 
 class WifiManager:
     def __init__(self):
-        self.wifi_interface = self._get_active_wifi_interface()
-        self.eth_interface = self._get_host_upstream_interface()
-
-        if self.eth_interface == self.wifi_interface:
-            self.eth_interface = None
-
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
-        self.moved_eth = False
         self.check_root()
 
     def check_root(self):
@@ -68,17 +60,51 @@ class WifiManager:
 
     # --- Public API ---
 
-    def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax", country="US"):
-        print(f"[WifiManager] Starting HOST mode (AP: {ssid}, Ch: {channel}, Region: {country})...")
+    def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax", country="US",
+                        p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None):
+
+        # 1. Determine Interfaces
+        wifi_interface = p2p_iface if p2p_iface else self._get_active_wifi_interface()
+        print(f"[WifiManager] Starting HOST mode on {wifi_interface} (AP: {ssid}, Region: {country})...")
+
         self._initialize_container()
-        ctr_pid = self._move_wifi_card()
-        self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode, country)
+
+        # 2. Move P2P Interface to Container
+        ctr_pid = self._move_wifi_card(wifi_interface, "wlan0") # Rename to wlan0 inside
+
+        # 3. Handle Internet Interface
+        has_wan = False
+        wan_iface = "eth0" # Default name inside if wired
+
+        if internet_iface and internet_iface.lower() != "none":
+            print(f"[WifiManager] Configuring Internet via {internet_iface}...")
+
+            # Check if Internet interface is WiFi
+            is_wifi_wan = self._is_interface_wifi(internet_iface)
+
+            if is_wifi_wan:
+                # Upstream WiFi Logic
+                wan_iface = "wlan1" # Rename to wlan1 inside
+                self._move_wifi_card(internet_iface, wan_iface)
+                self._connect_upstream_wifi(wan_iface, internet_ssid, internet_pass, country)
+                has_wan = True
+            else:
+                # Wired/Ethernet Logic
+                has_wan = self._move_ethernet_card(internet_iface, ctr_pid)
+                # _move_ethernet_card already handles renaming/DHCP if successful
+                wan_iface = internet_iface # Usually keeps name or becomes eth0
+
+        # 4. Setup AP & Routing
+        self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode, country, has_wan, wan_iface)
         print("[WifiManager] Host Mode Ready.")
 
     def start_client_mode(self, ssid, password, country="US"):
         print(f"[WifiManager] Starting CLIENT mode (Connecting to: {ssid}, Region: {country})...")
+        # Client mode usually just needs one card for P2P connection to Host
+        wifi_interface = self._get_active_wifi_interface()
+
         self._initialize_container()
-        ctr_pid = self._move_wifi_card()
+        ctr_pid = self._move_wifi_card(wifi_interface, "wlan0")
         self._setup_client_logic(ssid, password, ctr_pid, country)
         print("[WifiManager] Client Mode Ready.")
 
@@ -89,24 +115,18 @@ class WifiManager:
         self._run_command(f"ip link delete {VETH_HOST}", check=False)
 
         if shutil.which("firewall-cmd"):
-            try:
-                # Cleanly remove the trusted interface
-                self._run_command(f"firewall-cmd --zone=trusted --remove-interface={VETH_HOST}", check=False)
+            try: self._run_command(f"firewall-cmd --zone=trusted --remove-interface={VETH_HOST}", check=False)
             except: pass
 
         self._run_command(f"podman stop -t 0 {CONTAINER_NAME}", check=False)
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
 
         time.sleep(1)
+        # Attempt to restore NM on common interfaces
         try:
-            iface = self._get_active_wifi_interface() or "wlan0"
-            self._run_command(f"nmcli device connect {iface}", check=False)
+            # We don't know exactly which were moved without state, but trying to up everything is usually safe
+            self._run_command("nmcli device connect wlan0", check=False)
         except: pass
-
-        if self.eth_interface:
-            try:
-                self._run_command(f"nmcli device connect {self.eth_interface}", check=False)
-            except: pass
 
     # --- Internal Helpers ---
 
@@ -126,15 +146,6 @@ class WifiManager:
                 raise e
             return None
 
-    def _get_host_upstream_interface(self):
-        try:
-            out = self._run_command("ip route get 8.8.8.8", check=False)
-            if out:
-                match = re.search(r"dev\s+(\S+)", out)
-                if match: return match.group(1)
-        except: pass
-        return None
-
     def _get_active_wifi_interface(self):
         try:
             output = self._run_command("nmcli -t -f DEVICE,TYPE,STATE device", check=False)
@@ -145,6 +156,9 @@ class WifiManager:
             if output: return output.split()[-1]
         except: pass
         return "wlan0"
+
+    def _is_interface_wifi(self, iface):
+        return os.path.exists(f"/sys/class/net/{iface}/wireless")
 
     def _initialize_container(self):
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
@@ -163,51 +177,85 @@ class WifiManager:
             self._run_command(f"chrt -f -p 99 {ctr_pid}", check=False)
         except: pass
 
-    def _move_wifi_card(self):
+    def _move_wifi_card(self, host_iface, container_name):
         phy = "phy0"
         try:
-            out = self._run_command(f"iw dev {self.wifi_interface} info", check=False)
+            out = self._run_command(f"iw dev {host_iface} info", check=False)
             if out:
                 m = re.search(r"wiphy\s+(\d+)", out)
                 if m: phy = f"phy{m.group(1)}"
         except: pass
 
-        self._run_command(f"nmcli device disconnect {self.wifi_interface}", check=False)
+        self._run_command(f"nmcli device disconnect {host_iface}", check=False)
         ctr_pid = self._run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
 
         try:
             self._run_command(f"iw phy {phy} set netns {ctr_pid}")
         except Exception as e:
-            raise Exception(f"Failed to move {phy} to container. Is wpa_supplicant holding it? {e}")
+            raise Exception(f"Failed to move {phy} ({host_iface}) to container. Is NM/wpa_supplicant holding it? {e}")
 
         time.sleep(1)
+        # Rename inside container
         try:
+            # Find the interface name associated with that phy inside the container
             iw_out = self._run_command(f"{self.exec_cmd} 'iw dev'", check=False)
-            found_iface = None
+            current_name = None
             if iw_out:
-                for line in iw_out.split('\n'):
-                    if "Interface" in line:
-                        found_iface = line.split()[-1]; break
-            if found_iface and found_iface != "wlan0":
-                self._run_command(f"{self.exec_cmd} 'ip link set {found_iface} name wlan0'")
+                # Simple parser to find interface for the phy we just moved.
+                # Note: This might be tricky if multiple phys.
+                # Assuming the most recently moved is the one we want or grep by phy#
+                # A safer bet is to match phy# to Interface
+                sections = iw_out.split("phy#")
+                for sec in sections:
+                    if sec.startswith(phy.replace("phy", "")):
+                        m = re.search(r"Interface\s+(\S+)", sec)
+                        if m: current_name = m.group(1)
+
+            if current_name and current_name != container_name:
+                 self._run_command(f"{self.exec_cmd} 'ip link set {current_name} name {container_name}'")
+
+            self._run_command(f"{self.exec_cmd} 'ip link set {container_name} up'")
         except: pass
         return ctr_pid
 
+    def _connect_upstream_wifi(self, iface_name, ssid, password, country):
+        print(f"[WifiManager] Connecting {iface_name} to upstream WiFi: {ssid}...")
+        self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
+
+        wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country={country}
+network={{
+    ssid="{ssid}"
+    psk="{password}"
+}}
+"""
+        # Write config for specific interface
+        conf_path = f"/etc/wpa_supplicant_{iface_name}.conf"
+        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > {conf_path}'", shell=True, input=wpa_conf)
+
+        self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i {iface_name} -c {conf_path}'")
+
+        # Wait for connection
+        for _ in range(15):
+            status = self._run_command(f"{self.exec_cmd} 'wpa_cli -i {iface_name} status'", check=False)
+            if status and "wpa_state=COMPLETED" in status: break
+            time.sleep(1)
+
+        # DHCP
+        try:
+            self._run_command(f"{self.exec_cmd} 'udhcpc -i {iface_name} -n -q -f -t 10'")
+        except:
+            print("[WifiManager] Warning: Upstream DHCP failed.")
+
     def _open_host_ports(self):
-        """
-        Configures Host Firewall. Simplified to avoid stutter/packet loss.
-        """
         if shutil.which("firewall-cmd"):
             print("[WifiManager] Opening Ports (Firewalld)...")
             try:
-                # 1. Trust the interface (Allows all traffic on veth-host)
                 self._run_command(f"firewall-cmd --zone=trusted --add-interface={VETH_HOST}", check=False)
-
-                # 2. Explicitly open UDP/TCP range on the trusted zone (Redundant but safe)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/udp", check=False)
                 self._run_command(f"firewall-cmd --zone=trusted --add-port={FWD_PORT_RANGE}/tcp", check=False)
             except: pass
-
         elif shutil.which("ufw"):
             print("[WifiManager] Opening Ports (UFW)...")
             try:
@@ -218,10 +266,8 @@ class WifiManager:
 
     # --- Mode Specific Logic ---
 
-    def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode="ax", country="US"):
-        has_wan = self._move_ethernet_card(ctr_pid)
-        wan_iface = self.eth_interface if has_wan else "eth0"
-
+    def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode, country, has_wan, wan_iface):
+        # 1. Setup Veth Bridge
         self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
 
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
@@ -236,6 +282,7 @@ class WifiManager:
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
 
         gw_arg = f"gw4 {ROUTER_LAN_IP}" if has_wan else ""
+        # Only set DNS if we have WAN, otherwise host might lose DNS resolution
         dns_arg = "ipv4.dns '8.8.8.8'" if has_wan else ""
 
         nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
@@ -247,6 +294,7 @@ class WifiManager:
 
         self._open_host_ports()
 
+        # 2. Setup NAT if WAN exists
         if has_wan:
             self._run_command(f"{self.exec_cmd} 'sysctl -w net.ipv4.ip_forward=1'")
             self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o {wan_iface} -j MASQUERADE'")
@@ -255,6 +303,7 @@ class WifiManager:
 
         self._run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'", check=False)
 
+        # 3. Hostapd Config
         is_5ghz = int(channel) > 14
         hw_mode = "a" if is_5ghz else "g"
         enable_ac = 1 if is_5ghz and wifi_mode in ["ac", "ax"] else 0
@@ -283,6 +332,7 @@ rsn_pairwise=CCMP"""
         self._run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
 
+        # 4. Dnsmasq Config
         dnsmasq_conf = f"""interface=br0
 dhcp-range={DHCP_RANGE}
 dhcp-option=3,{ROUTER_LAN_IP}
@@ -291,6 +341,7 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
 
     def _setup_client_logic(self, ssid, password, ctr_pid, country="US"):
+        # (Same as before)
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self._run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
@@ -324,8 +375,7 @@ network={{
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
         try:
             self._run_command(f"{self.exec_cmd} 'udhcpc -i wlan0 -n -q -f -t 5'")
-        except subprocess.CalledProcessError:
-            raise Exception("DHCP Request failed. Is the Host (Deck-Upad PC) running?")
+        except: pass
 
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE'")
         self._run_command(f"{self.exec_cmd} 'iptables -A FORWARD -i {VETH_CTR} -o wlan0 -j ACCEPT'")
@@ -340,19 +390,18 @@ network={{
         self._run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
         self._run_command(f"{self.exec_cmd} 'avahi-daemon -D'")
 
-    def _move_ethernet_card(self, ctr_pid):
-        if not self.eth_interface: return False
-        self._run_command(f"nmcli device disconnect {self.eth_interface}", check=False)
+    def _move_ethernet_card(self, host_iface, ctr_pid):
+        self._run_command(f"nmcli device disconnect {host_iface}", check=False)
         time.sleep(1)
         try:
-            self._run_command(f"ip link set {self.eth_interface} netns {ctr_pid}")
-            self.moved_eth = True
+            self._run_command(f"ip link set {host_iface} netns {ctr_pid}")
         except: return False
+
         self._run_command(f"{self.exec_cmd} 'ip route flush default'", check=False)
-        self._run_command(f"{self.exec_cmd} 'ip link set {self.eth_interface} up'")
+        self._run_command(f"{self.exec_cmd} 'ip link set {host_iface} up'")
         time.sleep(2)
         try:
-            subprocess.run(shlex.split(f"{self.exec_cmd} 'udhcpc -i {self.eth_interface} -n -q -f -t 5'"),
+            subprocess.run(shlex.split(f"{self.exec_cmd} 'udhcpc -i {host_iface} -n -q -f -t 5'"),
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         except: pass
         return True

@@ -9,21 +9,21 @@ sys.path.append(".")
 from core.wifi_manager import WifiManager, HOST_LAN_IP
 from core.usbip_manager import UsbIpManager
 from core.input_server import InputServer
-# NEW IMPORT
 from core.video_sender_manager import VideoSenderManager
 
 class HostService:
     def __init__(self):
         self.wifi = WifiManager()
         self.usbip = UsbIpManager()
-        self.video_mgr = VideoSenderManager() # NEW
+        self.video_mgr = VideoSenderManager()
         self.input_server = InputServer()
         self.running = True
         self.server_socket = None
         self.client_conn = None
         self.video_proc = None
 
-    def start(self, ssid, password, channel=165, wifi_mode="ax", country="US"):
+    def start(self, ssid, password, channel=165, wifi_mode="ax", country="US",
+              p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None):
         print("="*50)
         print("   DECK-UPAD HOST DAEMON (CONTAINERIZED)")
         print("="*50)
@@ -32,14 +32,25 @@ class HostService:
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
-            self.video_mgr.ensure_image_exists() # NEW: Build sender image
+            self.video_mgr.ensure_image_exists()
         except Exception as e:
             print(f"[CRITICAL] Pre-flight build failed: {e}")
             sys.exit(1)
 
         print(f"[Host] Initializing WiFi Bridge (SSID: {ssid})...")
         try:
-            self.wifi.start_host_mode(ssid=ssid, password=password, channel=channel, wifi_mode=wifi_mode, country=country)
+            # Pass new explicit interface configuration
+            self.wifi.start_host_mode(
+                ssid=ssid,
+                password=password,
+                channel=channel,
+                wifi_mode=wifi_mode,
+                country=country,
+                p2p_iface=p2p_iface,
+                internet_iface=internet_iface,
+                internet_ssid=internet_ssid,
+                internet_pass=internet_pass
+            )
         except Exception as e:
             print(f"[CRITICAL] WiFi Failed: {e}")
             self.stop()
@@ -112,10 +123,7 @@ class HostService:
     def _start_video_process(self, target_ip):
         self._stop_video_process()
         print(f"[Host] Launching Video Sender Container...")
-
-        # USE THE MANAGER
         self.video_proc = self.video_mgr.start(target_ip)
-
         threading.Thread(target=self._monitor_video_output, args=(self.video_proc,), daemon=True).start()
 
     def _monitor_video_output(self, proc):
@@ -138,7 +146,6 @@ class HostService:
                     parts = msg.split(":")[1].split("x")
                     w, h = int(parts[0]), int(parts[1])
                     self.input_server.update_stream_dimensions(w, h)
-
                     if self.client_conn:
                         self.client_conn.send(f"CMD_RES_UPDATE:{w}x{h}".encode())
                 except: pass
@@ -155,7 +162,7 @@ class HostService:
     def _stop_video_process(self):
         if self.video_proc:
             print("[Host] Stopping Video Process...")
-            self.video_mgr.stop() # USE MANAGER
+            self.video_mgr.stop()
             self.video_proc = None
 
     def stop(self):

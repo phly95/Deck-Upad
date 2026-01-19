@@ -14,7 +14,6 @@ from services.client_agent import ClientService
 PID_FILE = "/tmp/deck_upad.pid"
 
 def run_cmd(cmd, check_output=False):
-    # Modified to optionally capture output for error checking
     if check_output:
         return subprocess.run(cmd, shell=True, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
     else:
@@ -22,20 +21,12 @@ def run_cmd(cmd, check_output=False):
         return None
 
 def robust_podman_rm(containers):
-    """
-    Attempts to remove containers. If Podman DB is corrupted (zombie process),
-    it runs 'podman system migrate' and tries again.
-    """
-    # 1. Try to remove normally
     res = run_cmd(f"podman rm -f {containers}", check_output=True)
-
-    # 2. Check if it failed due to the specific "internal status" error
     if res.returncode != 0:
         err_msg = res.stderr.decode()
         if "migrate" in err_msg or "invalid internal status" in err_msg:
             print(f"[Cleanup] Podman state inconsistent. Repairing (podman system migrate)...")
             run_cmd("podman system migrate")
-            # 3. Retry removal
             run_cmd(f"podman rm -f {containers}")
 
 def check_internet():
@@ -68,7 +59,6 @@ def perform_aggressive_cleanup(force=False):
         try: os.remove(PID_FILE)
         except: pass
 
-    # --- UPDATED: Include builders and use robust removal ---
     containers = (
         "wifi-bridge usbip-sidecar stream-receiver "
         "wifi-bridge-builder usbip-sidecar-builder stream-receiver-builder "
@@ -77,7 +67,6 @@ def perform_aggressive_cleanup(force=False):
 
     run_cmd(f"podman stop -t 0 {containers}")
     robust_podman_rm(containers)
-    # --------------------------------------------------------
 
     run_cmd("nmcli connection down veth-host-conn")
     run_cmd("nmcli connection delete veth-host-conn")
@@ -114,6 +103,12 @@ def main():
     parser.add_argument("--force-clean", action="store_true")
     parser.add_argument("--cleanup-only", action="store_true", help="Run cleanup routine and exit")
 
+    # New Network Configuration Arguments
+    parser.add_argument("--p2p-iface", help="Explicit interface for P2P/Hotspot (e.g., wlan0)")
+    parser.add_argument("--internet-iface", default="none", help="Interface for Internet (e.g., eth0 or wlan1)")
+    parser.add_argument("--internet-ssid", help="SSID for upstream internet (if using WiFi)")
+    parser.add_argument("--internet-pass", help="Password for upstream internet (if using WiFi)")
+
     args = parser.parse_args()
 
     should_force = args.force_clean or args.cleanup_only
@@ -143,11 +138,21 @@ def main():
         if args.role == "host":
             print("--- LAUNCHING HOST DAEMON ---")
             service = HostService()
-            service.start(ssid=args.ssid, password=args.password,
-                          channel=args.channel, wifi_mode=args.wifi_mode,
-                          country=args.country)
+            service.start(
+                ssid=args.ssid,
+                password=args.password,
+                channel=args.channel,
+                wifi_mode=args.wifi_mode,
+                country=args.country,
+                p2p_iface=args.p2p_iface,
+                internet_iface=args.internet_iface,
+                internet_ssid=args.internet_ssid,
+                internet_pass=args.internet_pass
+            )
         else:
             print("--- LAUNCHING CLIENT AGENT ---")
+            # Client only uses p2p_iface logic implicitly inside WifiManager auto-detection or explicit arg if updated later.
+            # Currently client logic is simple "connect to this SSID", standard wlan0 assumption usually holds on Deck.
             service = ClientService()
             service.start(ssid=args.ssid, password=args.password, country=args.country)
     except Exception as e:

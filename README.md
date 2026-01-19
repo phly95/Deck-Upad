@@ -29,7 +29,7 @@ git clone https://github.com/phly95/Deck-Upad.git
 * Add ~/Deck-Upad/launcher.py as a non-Steam game as well as the Azahar flatpak you just installed. (Azahar only if you plan to play 3DS games)
 * Rename launcher.py in your Steam Library as "Deck-Upad" Feel free to set the artwork as the items in the "placeholder_logos" folder if you like.
 
-* Go to Game Mode, launch Deck-Upad. Your gaming PC should be set as a Host, your Steam Deck should be set as a client.
+* Go to Game Mode, launch Deck-Upad. Your gaming PC should be set as a Host, your Steam Deck should be set as a client. Feel free to leave the default region and channel if your country allows UNII-3 Channels (North and South America). If you are in Europe or Asia, change the channel to channel 48 and adjust your region settings.
 Start the service on the desktop PC first, then start the service on the Steam Deck. They should pair with eachother and the Steam Deck should go black.
 
 **Feel free to play any game you wish. Your Steam Deck is now a Steam Controller.** Ending the service on the Host PC will automatically disconnect any Steam Decks paired to the host PC.

@@ -19,11 +19,9 @@ Using the Azahar fork https://github.com/phly95/azahar-upad you can use this to 
 
 ## Installation instructions
 
-* Open a terminal and enter the following commands:
-```
-cd ~
-git clone https://github.com/phly95/Deck-Upad.git
-```
+
+* Go to https://github.com/phly95/Deck-Upad/releases/latest and download the zip file. Extract the files to your home folder. You should now have a folder named "Deck-Upad" in the root of your home folder.
+
 * If you want to play 3DS games with the second screen, go to https://github.com/phly95/azahar-upad/releases/latest and install the flatpak (note: it will replace any existing Azahar flatpak if you have it installed. It won't affect the Appimage preinstalled by Emudeck)
 
 * Add ~/Deck-Upad/launcher.py as a non-Steam game as well as the Azahar flatpak you just installed. (Azahar only if you plan to play 3DS games)

@@ -102,7 +102,7 @@ class DeckUpadLauncher(Gtk.Window):
         grid.attach(self.combo_p2p, 1, 1, 2, 1)
 
         # Row 2: Internet Interface Selection
-        grid.attach(Gtk.Label(label="Internet Interface:\n(Must not be same as P2P)\n(Phone's USB Tethering works)"), 0, 2, 1, 1)
+        grid.attach(Gtk.Label(label="Internet Interface:\n(Must not be same as P2P)\n(Phone's USB Tethering works)\n(No need on client)"), 0, 2, 1, 1)
         self.combo_net = Gtk.ComboBoxText()
         self.combo_net.append("none", "No Internet")
 

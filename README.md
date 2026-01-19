@@ -34,6 +34,10 @@ Start the service on the desktop PC first, then start the service on the Steam D
 
 If you wish to play 3DS games with the second screen, launch the Azahar fork **make sure Vulkan** is the rendering backend. Also, make sure to set the screen layout to "Deck-Upad Streaming" Feel free to also enable async shader compilation and disable async presentation in the settings for a better experience. Once you launch your 3DS game, the touch screen should automatically show up on your Steam Deck.
 
+## Troubleshooting
+
+Touch does not work in the Steam Deck when playing 3DS games: Make sure that the Steam input settings are configured to have the touch screen act as a left mouse click on the Steam Deck side. This can be found under "Action Sets"
+
 ## Acknowledgements
 
 Thanks to the following projects for providing reference material and functionality for making this a reality:

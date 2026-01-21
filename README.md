@@ -1,3 +1,8 @@
+## Important Update
+
+This was tested on Bazzite, but has an issue running on SteamOS due to a difference in partitioning. Before this can be used on SteamOS, some changes need to be made to respect the partition layout in SteamOS.
+
+
 ## Description
 
 Note: Installation instructions later down the Readme.

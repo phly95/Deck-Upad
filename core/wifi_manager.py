@@ -164,11 +164,15 @@ class WifiManager:
         self._run_command(f"podman rm -f {CONTAINER_NAME}", check=False)
         self.ensure_image_exists()
         print(f"[WifiManager] Starting container '{CONTAINER_NAME}'...")
+
+        # FIX: Added --tmpfs /tmp and --tmpfs /run to force RAM usage and avoid writing to /var overlay
         podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
             "--net=none "
             "--sysctl net.ipv4.ip_forward=1 "
+            "--tmpfs /tmp "
+            "--tmpfs /run "
             f"{CUSTOM_IMAGE} sleep infinity"
         )
         self._run_command(podman_run)
@@ -222,7 +226,8 @@ class WifiManager:
         print(f"[WifiManager] Connecting {iface_name} to upstream WiFi: {ssid}...")
         self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
 
-        wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
+        # FIX: Use /tmp (RAM) for control sockets and config
+        wpa_conf = f"""ctrl_interface=/tmp/wpa_supplicant
 update_config=1
 country={country}
 network={{
@@ -230,15 +235,16 @@ network={{
     psk="{password}"
 }}
 """
-        # Write config for specific interface
-        conf_path = f"/etc/wpa_supplicant_{iface_name}.conf"
+        # Write config for specific interface to /tmp
+        conf_path = f"/tmp/wpa_supplicant_{iface_name}.conf"
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > {conf_path}'", shell=True, input=wpa_conf)
 
         self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i {iface_name} -c {conf_path}'")
 
         # Wait for connection
         for _ in range(15):
-            status = self._run_command(f"{self.exec_cmd} 'wpa_cli -i {iface_name} status'", check=False)
+            # FIX: Point wpa_cli to /tmp
+            status = self._run_command(f"{self.exec_cmd} 'wpa_cli -p /tmp/wpa_supplicant -i {iface_name} status'", check=False)
             if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
 
@@ -309,6 +315,7 @@ network={{
         enable_ac = 1 if is_5ghz and wifi_mode in ["ac", "ax"] else 0
         enable_ax = 1 if is_5ghz and wifi_mode == "ax" else 0
 
+        # FIX: Write hostapd config to /tmp (RAM)
         hostapd_conf = f"""interface=wlan0
 bridge=br0
 ssid={ssid}
@@ -325,20 +332,21 @@ wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP"""
 
-        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/hostapd/hostapd.conf'", shell=True, input=hostapd_conf)
+        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /tmp/hostapd.conf'", shell=True, input=hostapd_conf)
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
-        self._run_command(f"{self.exec_cmd} 'hostapd -B /etc/hostapd/hostapd.conf'")
+        self._run_command(f"{self.exec_cmd} 'hostapd -B /tmp/hostapd.conf'")
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
 
         # 4. Dnsmasq Config
+        # FIX: Write dnsmasq config to /tmp (RAM)
         dnsmasq_conf = f"""interface=br0
 dhcp-range={DHCP_RANGE}
 dhcp-option=3,{ROUTER_LAN_IP}
 dhcp-option=6,8.8.8.8"""
-        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
-        self._run_command(f"{self.exec_cmd} 'dnsmasq -C /etc/dnsmasq.conf'")
+        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /tmp/dnsmasq.conf'", shell=True, input=dnsmasq_conf)
+        self._run_command(f"{self.exec_cmd} 'dnsmasq -C /tmp/dnsmasq.conf'")
 
     def _setup_client_logic(self, ssid, password, ctr_pid, country="US"):
         # (Same as before)
@@ -353,7 +361,8 @@ dhcp-option=6,8.8.8.8"""
 
         self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
 
-        wpa_conf = f"""ctrl_interface=/var/run/wpa_supplicant
+        # FIX: Write config to /tmp (RAM)
+        wpa_conf = f"""ctrl_interface=/tmp/wpa_supplicant
 update_config=1
 country={country}
 network={{
@@ -361,14 +370,15 @@ network={{
     psk="{password}"
 }}
 """
-        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /etc/wpa_supplicant.conf'", shell=True, input=wpa_conf)
+        self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /tmp/wpa_supplicant.conf'", shell=True, input=wpa_conf)
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
-        self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf'")
+        self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf'")
 
         for _ in range(15):
-            status = self._run_command(f"{self.exec_cmd} 'wpa_cli status'", check=False)
+            # FIX: Point wpa_cli to /tmp
+            status = self._run_command(f"{self.exec_cmd} 'wpa_cli -p /tmp/wpa_supplicant status'", check=False)
             if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
 
@@ -385,8 +395,14 @@ network={{
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
 
-        self._run_command(f"{self.exec_cmd} 'dbus-uuidgen > /var/lib/dbus/machine-id'", check=False)
+        # FIX: Generate DBus ID in /tmp (RAM)
+        self._run_command(f"{self.exec_cmd} 'dbus-uuidgen > /tmp/machine-id'", check=False)
+        # We need /var/lib/dbus to exist for dbus-daemon to start, but we link the file from /tmp
+        self._run_command(f"{self.exec_cmd} 'mkdir -p /var/lib/dbus'", check=False)
+        self._run_command(f"{self.exec_cmd} 'ln -sf /tmp/machine-id /var/lib/dbus/machine-id'", check=False)
+        # /var/run is usually a symlink to /run (tmpfs), but we create just in case
         self._run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
+
         self._run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")
         self._run_command(f"{self.exec_cmd} 'avahi-daemon -D'")
 

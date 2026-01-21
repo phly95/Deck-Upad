@@ -133,6 +133,7 @@ class VideoSenderManager:
                         env_vars.extend(["-e", "LIBVA_DRIVER_NAME=iHD"])
             except: pass
 
+        # FIX: Add --tmpfs /tmp and direct GStreamer cache there
         cmd = [
             "podman", "run", "--rm", "--replace",
             "--name", CONTAINER_NAME,
@@ -143,6 +144,10 @@ class VideoSenderManager:
             "--security-opt", "label=disable",  # Disable SELinux isolation
             "--device", "/dev/dri",             # Map all DRI devices recursively
 
+            # Map /tmp to RAM to avoid /var writes
+            "--tmpfs", "/tmp",
+            "-e", "XDG_CACHE_HOME=/tmp/.cache",
+
             "-v", "/dev/dri:/dev/dri",
             "-v", f"{script_path}:/app/sender.py",
         ] + env_vars + [
@@ -150,7 +155,7 @@ class VideoSenderManager:
             "sh", "-c",
             # We run 'vainfo' first to debug the driver state, then run the python script
             "echo '--- VAINFO DEBUG ---'; vainfo; echo '--------------------'; "
-            "rm -rf /root/.cache/gstreamer-1.0 && python3 -u /app/sender.py " + target_ip + (" --test-mode" if test_mode else "")
+            "python3 -u /app/sender.py " + target_ip + (" --test-mode" if test_mode else "")
         ]
 
         print(f"[SenderMgr] Launching Container for Target: {target_ip}")

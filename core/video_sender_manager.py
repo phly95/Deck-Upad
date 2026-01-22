@@ -50,7 +50,7 @@ class VideoSenderManager:
 
             # Start builder
             self._run_cmd(
-                ["podman", "run", "-d", "--name", builder, BASE_IMAGE, "sleep", "infinity"],
+                ["podman", "run", "-d", "--net=host", "--name", builder, BASE_IMAGE, "sleep", "infinity"],
                 "Starting Base Container"
             )
 

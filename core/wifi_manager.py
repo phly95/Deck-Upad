@@ -44,7 +44,7 @@ class WifiManager:
         print(f"[WifiManager] Image '{CUSTOM_IMAGE}' not found. Building from '{BASE_IMAGE}'...")
         builder_name = f"{CONTAINER_NAME}-builder"
         self._run_command(f"podman rm -f {builder_name}", check=False)
-        self._run_command(f"podman run -d --name {builder_name} {BASE_IMAGE} sleep infinity")
+        self._run_command(f"podman run -d --net=host --name {builder_name} {BASE_IMAGE} sleep infinity")
 
         try:
             pkgs = "wpa_supplicant iw iptables hostapd dnsmasq iproute2 iproute2-tc bridge-utils avahi avahi-tools dbus dhcpcd util-linux"

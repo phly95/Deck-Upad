@@ -1,3 +1,5 @@
+--- START OF FILE Deck-Upad-main/core/usbip_manager.py ---
+
 import subprocess
 import time
 import os
@@ -33,11 +35,16 @@ class UsbIpManager:
 
         print(f"[UsbIpManager] Building image '{CUSTOM_IMAGE}' (Internet Required)...")
         self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-        self._run_command(f"podman run -d --net=host --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
+        self._run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
         try:
+            # FIX FOR STEAMOS: Disable zchunk to prevent "No space left on device" errors
+            print("   Configuring DNF for limited storage (SteamOS fix)...")
+            self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c 'echo zchunk=False >> /etc/dnf/dnf.conf && dnf clean all'")
+
             # Install USBIP tools and kernel modules tools
-            install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
+            # Added --setopt=install_weak_deps=False to save space
+            install_cmd = "dnf install -y --setopt=install_weak_deps=False usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
             print("   Installing dependencies (this may take a minute)...")
             self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
 

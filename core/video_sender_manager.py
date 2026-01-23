@@ -1,3 +1,5 @@
+--- START OF FILE Deck-Upad-main/core/video_sender_manager.py ---
+
 import subprocess
 import os
 import sys
@@ -50,8 +52,14 @@ class VideoSenderManager:
 
             # Start builder
             self._run_cmd(
-                ["podman", "run", "-d", "--net=host", "--name", builder, BASE_IMAGE, "sleep", "infinity"],
+                ["podman", "run", "-d", "--name", builder, BASE_IMAGE, "sleep", "infinity"],
                 "Starting Base Container"
+            )
+
+            # FIX FOR STEAMOS: Disable zchunk to prevent disk space errors
+            self._run_cmd(
+                ["podman", "exec", builder, "/bin/bash", "-c", "echo zchunk=False >> /etc/dnf/dnf.conf && dnf clean all"],
+                "Configuring DNF for limited storage"
             )
 
             # Install RPM Fusion
@@ -87,7 +95,8 @@ class VideoSenderManager:
                 "libva-utils"
             ]
 
-            install_cmd = ["podman", "exec", builder, "dnf", "install", "-y", "--allowerasing", "--skip-broken"] + deps
+            # Added --setopt=install_weak_deps=False
+            install_cmd = ["podman", "exec", builder, "dnf", "install", "-y", "--setopt=install_weak_deps=False", "--allowerasing", "--skip-broken"] + deps
             self._run_cmd(install_cmd, "Installing Packages")
 
             # Install PyOpenGL

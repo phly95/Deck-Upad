@@ -1,5 +1,3 @@
---- START OF FILE Deck-Upad-main/core/video_sender_manager.py ---
-
 import subprocess
 import os
 import sys

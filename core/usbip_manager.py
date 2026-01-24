@@ -33,7 +33,7 @@ class UsbIpManager:
 
         print(f"[UsbIpManager] Building image '{CUSTOM_IMAGE}' (Internet Required)...")
         self._run_command(f"podman rm -f {BUILDER_NAME}", check=False)
-        self._run_command(f"podman run -d --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
+        self._run_command(f"podman run -d --net=host --name {BUILDER_NAME} {BASE_IMAGE} sleep infinity")
 
         try:
             # FIX FOR STEAMOS: Disable zchunk to prevent "No space left on device" errors
@@ -41,8 +41,7 @@ class UsbIpManager:
             self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c 'echo zchunk=False >> /etc/dnf/dnf.conf && dnf clean all'")
 
             # Install USBIP tools and kernel modules tools
-            # Added --setopt=install_weak_deps=False to save space
-            install_cmd = "dnf install -y --setopt=install_weak_deps=False usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
+            install_cmd = "dnf install -y usbip kmod hostname procps-ng findutils coreutils python3 --exclude=kernel-debug*"
             print("   Installing dependencies (this may take a minute)...")
             self._run_command(f"podman exec {BUILDER_NAME} /bin/bash -c '{install_cmd}'")
 
@@ -187,7 +186,15 @@ class UsbIpManager:
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            if check: raise e
+            if check:
+                # --- NEW DETAILED LOGGING ---
+                print(f"\n[ERROR] Command failed: {cmd}")
+                print(f"EXIT CODE: {e.returncode}")
+                print(f"--- STDOUT ---\n{e.stdout}")
+                print(f"--- STDERR ---\n{e.stderr}")
+                print("----------------------\n")
+                raise e
+
             return None
 
     def _is_container_running(self):

@@ -45,6 +45,110 @@ def wait_for_network_restore(timeout=15):
     print("[Startup] Warning: Internet not detected.")
     return False
 
+# --- AUTOMATIC STORAGE CONFIGURATION ---
+def configure_storage_location():
+    """
+    1. Migrates storage from small /var to /home if needed.
+    2. Injects a custom storage.conf to fix OverlayFS on SteamOS /home (casefold).
+    """
+    if os.geteuid() != 0:
+        return
+
+    VAR_PATH = "/var/lib/containers"
+    sudo_user = os.environ.get('SUDO_USER')
+    if not sudo_user:
+        return
+
+    user_home = os.path.expanduser(f"~{sudo_user}")
+    target_storage = os.path.join(user_home, "deck-upad-container-storage")
+    config_path = os.path.join(target_storage, "storage.conf")
+
+    # --- STEP 1: CHECK DISK SPACE & MIGRATE IF NEEDED ---
+    needs_migration = False
+
+    # Check if we are already symlinked
+    is_symlinked = os.path.islink(VAR_PATH)
+
+    # If not symlinked, check space
+    if not is_symlinked:
+        try:
+            stats = os.statvfs("/var")
+            free_gb = (stats.f_bavail * stats.f_frsize) / (1024**3)
+            if free_gb < 5:
+                needs_migration = True
+                print("="*60)
+                print(f"[STORAGE ALERT] /var has only {free_gb:.2f} GB free.")
+                print("[AUTO-FIX] Moving Podman storage to /home to prevent full disk...")
+                print("="*60)
+        except: pass
+
+    if needs_migration:
+        # Stop and Nuke
+        run_cmd("podman stop -a")
+        run_cmd("podman system reset --force")
+        time.sleep(2)
+
+        # Remove old folder
+        if os.path.exists(VAR_PATH):
+            try: shutil.rmtree(VAR_PATH)
+            except: run_cmd(f"rm -rf {VAR_PATH}")
+
+        # Create Target
+        if not os.path.exists(target_storage):
+            os.makedirs(target_storage, exist_ok=True)
+            try:
+                uid = int(os.environ.get('SUDO_UID'))
+                gid = int(os.environ.get('SUDO_GID'))
+                os.chown(target_storage, uid, gid)
+            except: pass
+
+        # Link
+        try:
+            os.symlink(target_storage, VAR_PATH)
+            print("[AUTO-FIX] Symlink created successfully.")
+        except Exception as e:
+            print(f"[CRITICAL] Failed to link storage: {e}")
+            sys.exit(1)
+
+    # --- STEP 2: INJECT COMPATIBLE STORAGE CONFIG ---
+    # Even if we didn't migrate just now, if we are running from /home (symlinked),
+    # we MUST fix the storage driver because kernel overlayfs fails on /home (ext4 casefold).
+
+    if os.path.islink(VAR_PATH):
+        # Determine best driver
+        if shutil.which("fuse-overlayfs"):
+            # Preferred: fuse-overlayfs
+            driver_config = """
+[storage]
+driver = "overlay"
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+"""
+        else:
+            # Fallback: vfs (slow but guaranteed to work)
+            print("[Startup] fuse-overlayfs not found. Falling back to VFS driver.")
+            driver_config = """
+[storage]
+driver = "vfs"
+"""
+
+        # Write config if missing or force update
+        # We write it to the target storage folder
+        if not os.path.exists(target_storage):
+             os.makedirs(target_storage, exist_ok=True)
+
+        try:
+            with open(config_path, "w") as f:
+                f.write(driver_config)
+
+            # CRITICAL: Tell Podman to use this config
+            os.environ["CONTAINERS_STORAGE_CONF"] = config_path
+            # print(f"[Startup] Applied compatibility config: {config_path}")
+        except Exception as e:
+            print(f"[Startup] Warning: Failed to write storage config: {e}")
+
+# ----------------------------------------
+
 def perform_aggressive_cleanup(force=False):
     if not force and not os.path.exists(PID_FILE): return
 
@@ -103,13 +207,15 @@ def main():
     parser.add_argument("--force-clean", action="store_true")
     parser.add_argument("--cleanup-only", action="store_true", help="Run cleanup routine and exit")
 
-    # New Network Configuration Arguments
     parser.add_argument("--p2p-iface", help="Explicit interface for P2P/Hotspot (e.g., wlan0)")
     parser.add_argument("--internet-iface", default="none", help="Interface for Internet (e.g., eth0 or wlan1)")
     parser.add_argument("--internet-ssid", help="SSID for upstream internet (if using WiFi)")
     parser.add_argument("--internet-pass", help="Password for upstream internet (if using WiFi)")
 
     args = parser.parse_args()
+
+    # 1. Run Storage Fix & Config Injection
+    configure_storage_location()
 
     should_force = args.force_clean or args.cleanup_only
     perform_aggressive_cleanup(force=should_force)
@@ -151,8 +257,6 @@ def main():
             )
         else:
             print("--- LAUNCHING CLIENT AGENT ---")
-            # Client only uses p2p_iface logic implicitly inside WifiManager auto-detection or explicit arg if updated later.
-            # Currently client logic is simple "connect to this SSID", standard wlan0 assumption usually holds on Deck.
             service = ClientService()
             service.start(ssid=args.ssid, password=args.password, country=args.country)
     except Exception as e:

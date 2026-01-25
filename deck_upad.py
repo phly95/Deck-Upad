@@ -15,6 +15,8 @@ from services.client_agent import ClientService
 PID_FILE = "/tmp/deck_upad.pid"
 # Global Snapshot: Stores { 'wlan0': 'aa:bb:cc...', 'wlan1': '11:22:33...' }
 SYSTEM_WIFI_MAP = {}
+ORIGINAL_IFACE = None
+ORIGINAL_MAC = None
 
 def run_cmd(cmd, check_output=False):
     if check_output:
@@ -58,6 +60,18 @@ def get_interface_mac(iface_name):
     except: pass
     return None
 
+def find_interface_by_mac(target_mac):
+    """Scans all network interfaces to find the one matching the MAC."""
+    if not target_mac: return None
+    try:
+        if os.path.exists("/sys/class/net"):
+            for iface in os.listdir("/sys/class/net"):
+                mac = get_interface_mac(iface)
+                if mac == target_mac:
+                    return iface
+    except: pass
+    return None
+
 def capture_system_state():
     """
     Scans ALL wireless interfaces and records their Name->MAC mapping.
@@ -77,7 +91,7 @@ def capture_system_state():
                         SYSTEM_WIFI_MAP[iface] = mac
     except: pass
 
-    # Double check with iw (sometimes /sys is weird in containers, though we are host here)
+    # Double check with iw
     if not SYSTEM_WIFI_MAP:
         try:
             res = run_cmd("iw dev", check_output=True)
@@ -101,6 +115,9 @@ def capture_system_state():
 def get_active_wifi_interface():
     # Helper to just get *one* active interface (legacy fallback)
     if SYSTEM_WIFI_MAP:
+        # Prefer ORIGINAL_IFACE if available
+        if ORIGINAL_IFACE and ORIGINAL_IFACE in SYSTEM_WIFI_MAP:
+            return ORIGINAL_IFACE
         return list(SYSTEM_WIFI_MAP.keys())[0]
     return "wlan0"
 
@@ -138,15 +155,15 @@ def find_driver_fallback():
 def reset_wifi_driver():
     """
     Identifies the driver used by the primary interface and resets it.
-    Note: This will likely reset ALL cards using that same driver.
     """
     print("[Cleanup] Analyzing WiFi Hardware state...")
 
-    # Try to find driver from known interfaces
     driver = None
-    for iface in SYSTEM_WIFI_MAP.keys():
-        driver = get_driver_for_interface(iface)
-        if driver: break
+    if ORIGINAL_IFACE: driver = get_driver_for_interface(ORIGINAL_IFACE)
+    if not driver and SYSTEM_WIFI_MAP:
+        for iface in SYSTEM_WIFI_MAP.keys():
+            driver = get_driver_for_interface(iface)
+            if driver: break
 
     if not driver:
         driver = find_driver_fallback()
@@ -158,14 +175,12 @@ def reset_wifi_driver():
     print(f"   >> Detected Driver: {driver}")
 
     try:
-        # Steam Deck OLED (ath11k)
         if "ath11k" in driver:
             print(f"   >> Performing OLED/Qualcomm Reset ({driver})...")
             run_cmd(f"modprobe -r {driver}")
             time.sleep(1)
             run_cmd(f"modprobe {driver}")
 
-        # Steam Deck LCD (rtw88)
         elif "rtw88" in driver:
             print(f"   >> Performing LCD/Realtek Reset ({driver})...")
             run_cmd("modprobe -r rtw88_8822ce")
@@ -175,7 +190,6 @@ def reset_wifi_driver():
             run_cmd("modprobe rtw88_pci")
             run_cmd("modprobe rtw88_8822ce")
 
-        # Generic Host
         else:
             print(f"   >> Performing Generic Driver Reset ({driver})...")
             run_cmd(f"modprobe -r {driver}")
@@ -183,7 +197,6 @@ def reset_wifi_driver():
             run_cmd(f"modprobe {driver}")
 
         print("   >> Waiting for hardware to initialize...")
-        # Wait until at least one interface reappears
         for _ in range(15):
             found = False
             if os.path.exists("/sys/class/net"):
@@ -198,62 +211,40 @@ def reset_wifi_driver():
         print(f"   [Warning] Driver reset failed: {e}")
         return False
 
-def restore_system_state_map():
+def smart_rename_interface(target_mac, desired_name):
     """
-    Iterates through the Startup Snapshot and ensures every MAC address
-    is assigned back to its Original Name.
+    Finds the interface with target_mac and renames it to desired_name.
     """
-    if not SYSTEM_WIFI_MAP: return
+    if not target_mac or not desired_name: return None
 
-    print("[Cleanup] Restoring Interface Names from Snapshot...")
+    current_name = find_interface_by_mac(target_mac)
+    if not current_name:
+        return None # Card not found (yet)
 
-    # Build current map { mac: current_name }
-    current_map = {}
-    if os.path.exists("/sys/class/net"):
-        for iface in os.listdir("/sys/class/net"):
-            mac = get_interface_mac(iface)
-            if mac: current_map[mac] = iface
+    if current_name == desired_name:
+        return current_name
 
-    # Iterate through original expectations
-    for original_name, mac in SYSTEM_WIFI_MAP.items():
-        if mac not in current_map:
-            print(f"   [Warning] Original card {original_name} ({mac}) disappeared!")
-            continue
+    print(f"[Cleanup] Renaming drift: {current_name} ({target_mac}) -> {desired_name}...")
 
-        current_name = current_map[mac]
+    # Check for collision
+    collision_mac = get_interface_mac(desired_name)
+    if collision_mac:
+        print(f"   [Notice] Name {desired_name} taken by {collision_mac}. Moving squatter...")
+        run_cmd(f"ip link set {desired_name} down")
+        run_cmd(f"ip link set {desired_name} name {desired_name}_tmp")
+        run_cmd(f"ip link set {desired_name}_tmp up")
 
-        # If it's already correct, skip
-        if current_name == original_name:
-            continue
-
-        print(f"   >> Restore: {mac} is {current_name}, needs to be {original_name}...")
-
-        # CHECK COLLISION: Is 'original_name' currently taken by a different card?
-        collision_mac = None
-        for c_mac, c_name in current_map.items():
-            if c_name == original_name:
-                collision_mac = c_mac
-                break
-
-        if collision_mac:
-            # Move the squatter to a temp name
-            temp_name = f"{original_name}_tmp"
-            print(f"      Moving squatter ({collision_mac}) {original_name} -> {temp_name}")
-            run_cmd(f"ip link set {original_name} down")
-            run_cmd(f"ip link set {original_name} name {temp_name}")
-            run_cmd(f"ip link set {temp_name} up")
-            # Update our local map so we know where the squatter went
-            current_map[collision_mac] = temp_name
-
-        # Rename our target
-        try:
-            run_cmd(f"ip link set {current_name} down")
-            run_cmd(f"ip link set {current_name} name {original_name}")
-            run_cmd(f"ip link set {original_name} up")
-            current_map[mac] = original_name # Update local map
-            print(f"      Success.")
-        except Exception as e:
-            print(f"      Failed to rename: {e}")
+    try:
+        run_cmd(f"ip link set {current_name} down")
+        res = run_cmd(f"ip link set {current_name} name {desired_name}", check_output=True)
+        if res.returncode != 0:
+            print(f"   [Warning] Rename failed: {res.stderr.decode().strip()}")
+            return current_name
+        run_cmd(f"ip link set {desired_name} up")
+        return desired_name
+    except Exception as e:
+        print(f"   [Warning] Rename exception: {e}")
+        return current_name
 
 # --- STORAGE FIX ---
 def configure_storage_location():
@@ -308,6 +299,7 @@ def configure_storage_location():
 # ----------------------------------------
 
 def perform_aggressive_cleanup(force=False):
+    global ORIGINAL_IFACE, ORIGINAL_MAC
     if not force and not os.path.exists(PID_FILE): return
 
     print("\n[Cleanup] Starting Cleanup Routine...")
@@ -333,44 +325,67 @@ def perform_aggressive_cleanup(force=False):
         run_cmd(f"firewall-cmd --remove-port={ports}/udp")
         run_cmd(f"firewall-cmd --remove-port={ports}/tcp")
 
-    # --- PHASE 1: SOFT RESTORE ---
-    print("[Cleanup] Attempting Soft Network Restore...")
+    # --- PHASE 1: SMART SOFT RESTORE ---
+    print("[Cleanup] Waiting for WiFi hardware to return from container...")
 
-    # Try soft restore on ALL tracked interfaces
+    # Wait for the card with our MAC to appear (Name might be drifted)
+    found_name = None
+    if ORIGINAL_MAC:
+        for _ in range(10):
+            found_name = find_interface_by_mac(ORIGINAL_MAC)
+            if found_name: break
+            time.sleep(0.5)
+
+    if found_name and ORIGINAL_IFACE:
+        # If the card is back but named wrong (e.g. wlan9), fix it NOW
+        if found_name != ORIGINAL_IFACE:
+            print(f"   >> Interface drift detected ({found_name}). Correcting to {ORIGINAL_IFACE}...")
+            corrected_name = smart_rename_interface(ORIGINAL_MAC, ORIGINAL_IFACE)
+            if corrected_name: found_name = corrected_name
+
+    # Try restore on the corrected name
+    target_iface = found_name or ORIGINAL_IFACE or "wlan0"
+
+    print(f"[Cleanup] Attempting Soft Restore on {target_iface}...")
     run_cmd("rfkill unblock wifi")
     run_cmd("rfkill unblock all")
-
-    if SYSTEM_WIFI_MAP:
-        for iface in SYSTEM_WIFI_MAP.keys():
-            run_cmd(f"nmcli device set {iface} managed yes")
-            run_cmd(f"nmcli device set {iface} autoconnect yes")
+    run_cmd(f"nmcli device set {target_iface} managed yes")
+    run_cmd(f"nmcli device set {target_iface} autoconnect yes")
 
     if wait_for_network_restore(timeout=5):
         print("[Cleanup] Network restored gracefully.")
         return
 
-    # --- PHASE 2: HARDWARE RESET ---
+    # --- PHASE 2: HARDWARE RESET (The Nuclear Option) ---
     print("[Cleanup] Soft restore failed. Initiating Driver Reset...")
 
     run_cmd("systemctl stop NetworkManager")
     run_cmd("pkill wpa_supplicant")
 
-    reset_wifi_driver()
+    was_reset = reset_wifi_driver()
 
-    # --- PHASE 3: SYSTEM RECONSTRUCTION ---
-    restore_system_state_map()
+    # --- PHASE 3: RECONSTRUCTION ---
+    # After reset, names are scrambled again. Fix them based on Snapshot.
+    if was_reset and SYSTEM_WIFI_MAP:
+        print("[Cleanup] Reconstructing Interface Map...")
+        for original_name, mac in SYSTEM_WIFI_MAP.items():
+            smart_rename_interface(mac, original_name)
 
-    # --- PHASE 4: RESTART SERVICES ---
-    print("[Cleanup] Restarting Network Services...")
+    # Use the restored name
+    final_iface = ORIGINAL_IFACE if (ORIGINAL_IFACE and ORIGINAL_MAC) else "wlan0"
+
+    print(f"   >> Restarting Services for {final_iface}...")
+    run_cmd(f"ip link set {final_iface} down")
+    run_cmd(f"ip addr flush dev {final_iface}")
+    run_cmd(f"iw dev {final_iface} set type managed")
+    run_cmd(f"ip link set {final_iface} up")
+
     run_cmd("systemctl restart wpa_supplicant")
     run_cmd("systemctl start NetworkManager")
     time.sleep(2)
 
-    # Re-manage all interfaces
-    if SYSTEM_WIFI_MAP:
-        for iface in SYSTEM_WIFI_MAP.keys():
-            run_cmd(f"nmcli device set {iface} managed yes")
-            run_cmd(f"nmcli device set {iface} autoconnect yes")
+    run_cmd(f"nmcli device set {final_iface} managed yes")
+    run_cmd(f"nmcli device set {final_iface} autoconnect yes")
 
     if not wait_for_network_restore(timeout=10):
         print("[Cleanup] Warning: Could not automatically reconnect.")
@@ -386,6 +401,7 @@ def remove_pid_file():
         except: pass
 
 def main():
+    global ORIGINAL_IFACE, ORIGINAL_MAC
     parser = argparse.ArgumentParser(description="Deck-Upad Service Runner")
     parser.add_argument("--role", choices=["host", "client"], required=False)
     parser.add_argument("--ssid", default="DeckUpad")
@@ -403,16 +419,17 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. CAPTURE SYSTEM SNAPSHOT (Order is Critical)
+    # 1. CAPTURE SYSTEM SNAPSHOT
     capture_system_state()
 
-    # Determine Active Interface for this session
-    active_iface = None
-    if args.p2p_iface and args.p2p_iface in SYSTEM_WIFI_MAP:
-        active_iface = args.p2p_iface
-    elif SYSTEM_WIFI_MAP:
-        # Default to wlan0 or first available
-        active_iface = "wlan0" if "wlan0" in SYSTEM_WIFI_MAP else list(SYSTEM_WIFI_MAP.keys())[0]
+    detected = get_active_wifi_interface()
+    ORIGINAL_IFACE = args.p2p_iface if args.p2p_iface else detected
+    if not ORIGINAL_IFACE: ORIGINAL_IFACE = "wlan0"
+
+    ORIGINAL_MAC = get_interface_mac(ORIGINAL_IFACE)
+    if ORIGINAL_MAC:
+        # print(f"[Startup] Tracking Hardware: {ORIGINAL_IFACE} [{ORIGINAL_MAC}]")
+        pass
 
     # Run Storage Fix
     configure_storage_location()
@@ -451,7 +468,7 @@ def main():
                 channel=args.channel,
                 wifi_mode=args.wifi_mode,
                 country=args.country,
-                p2p_iface=active_iface,
+                p2p_iface=ORIGINAL_IFACE,
                 internet_iface=args.internet_iface,
                 internet_ssid=args.internet_ssid,
                 internet_pass=args.internet_pass

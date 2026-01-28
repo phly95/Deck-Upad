@@ -55,11 +55,11 @@ class UsbIpManager:
 
     # --- Public API ---
 
-    def prepare_sender_environment(self):
+    def start_sender_mode(self):
         """
-        Starts the container and loads modules, but does NOT bind the controller yet.
+        [Deck Side] Starts container, finds controller, binds it.
         """
-        print("[UsbIpManager] Preparing Sender Environment...")
+        print("[UsbIpManager] Initializing Sender (Deck)...")
         self._start_container()
 
         print("   Loading kernel modules...")
@@ -67,29 +67,15 @@ class UsbIpManager:
         print("   Starting usbipd...")
         self._run_command(f"{self.exec_cmd} 'usbipd -D'", check=False)
 
-    def get_valve_bus_id(self):
-        """
-        Returns the Bus ID of the Steam Deck controller without binding it.
-        """
-        return self._find_valve_controller_bus()
+        bus_id = self._find_valve_controller_bus()
+        if not bus_id:
+            print("[UsbIpManager] No Steam Deck Controller found!")
+            return None
 
-    def bind_device(self, bus_id):
-        """
-        Actually binds the device to USBIP. Controls will be lost on the Deck here.
-        """
-        if not bus_id: return
-        print(f"[UsbIpManager] Binding Controller at Bus {bus_id}...")
+        print(f"   Binding Controller at Bus {bus_id}...")
+        # Unbind first just in case
         self._run_command(f"{self.exec_cmd} 'usbip unbind -b {bus_id}'", check=False)
         self._run_command(f"{self.exec_cmd} 'usbip bind -b {bus_id}'")
-
-    def start_sender_mode(self):
-        """
-        Legacy wrapper: Prepares, finds, and binds immediately.
-        """
-        self.prepare_sender_environment()
-        bus_id = self.get_valve_bus_id()
-        if bus_id:
-            self.bind_device(bus_id)
         return bus_id
 
     def release_device(self, bus_id):
@@ -157,6 +143,7 @@ class UsbIpManager:
         self.detach_all_ports()
 
         # 2. Attempt to unload module (Receiver) or unbind (Sender)
+        # This is "Best Effort" cleanup
         if self._is_container_running():
             try:
                 # Try unloading vhci-hcd to fully clear state on Host
@@ -200,6 +187,7 @@ class UsbIpManager:
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
             if check:
+                # --- NEW DETAILED LOGGING ---
                 print(f"\n[ERROR] Command failed: {cmd}")
                 print(f"EXIT CODE: {e.returncode}")
                 print(f"--- STDOUT ---\n{e.stdout}")

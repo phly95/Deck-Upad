@@ -10,7 +10,8 @@ sys.path.append(".")
 from core.wifi_manager import WifiManager
 from core.usbip_manager import UsbIpManager
 
-TARGET_HOST_IP = "192.168.50.2"
+TARGET_HOST_IP_STD = "192.168.50.2"
+TARGET_HOST_IP_INV = "192.168.50.10" # Default DHCP lease for first client in Host Mode
 TARGET_PORT = 5555
 GUI_CONTROL_PORT = 5003
 
@@ -23,6 +24,7 @@ class ClientService:
         self.receiver_proc = None
         self.inhibitor_proc = None
         self.sudo_user = os.environ.get('SUDO_USER') or "deck"
+        self.is_inverse = False
 
         # Get UID for environment variables
         try:
@@ -114,10 +116,13 @@ class ClientService:
                 self.inhibitor_proc.terminate()
                 self.inhibitor_proc = None
 
-    def start(self, ssid, password, country="US"):
+    def start(self, ssid, password, country="US", inverse=False):
         print("="*50)
         print("   DECK-UPAD CLIENT AGENT (NATIVE FLATPAK)")
+        print(f"   Network Topology: {'INVERSE (AP Mode)' if inverse else 'STANDARD (Client Mode)'}")
         print("="*50)
+
+        self.is_inverse = inverse
 
         # 1. PRE-FLIGHT CHECKS
         print("[Client] Performing Pre-Flight Checks...")
@@ -132,7 +137,19 @@ class ClientService:
         # 2. START HARDWARE
         print(f"[Client] Configuring WiFi Container for {ssid}...")
         try:
-            self.wifi.start_client_mode(ssid=ssid, password=password, country=country)
+            if self.is_inverse:
+                # Deck acts as AP (Host Mode)
+                print(f"[Client] Inverse Mode: Creating AP '{ssid}'...")
+                self.wifi.start_host_mode(
+                    ssid=ssid,
+                    password=password,
+                    channel=165, # Default, configurable? Using safe 5GHz
+                    wifi_mode="ax",
+                    country=country
+                )
+            else:
+                # Deck acts as Station (Client Mode)
+                self.wifi.start_client_mode(ssid=ssid, password=password, country=country)
         except Exception as e:
             print(f"[CRITICAL] WiFi Setup Failed: {e}")
             self.stop()
@@ -153,7 +170,8 @@ class ClientService:
         self._launch_native_receiver()
 
         # 4. CONNECT TO HOST
-        self.host_socket = self._establish_handshake()
+        target_ip = TARGET_HOST_IP_INV if self.is_inverse else TARGET_HOST_IP_STD
+        self.host_socket = self._establish_handshake(target_ip)
 
         # 5. RUNTIME LOOP
         if self.host_socket:
@@ -164,6 +182,10 @@ class ClientService:
         subprocess.run(["pkill", "-f", "core/video_receiver.py"], stderr=subprocess.DEVNULL)
 
         script_path = os.path.abspath("core/video_receiver.py")
+
+        # Determine host IP argument for the GUI based on topology
+        # The GUI needs to send UDP packets to the Host.
+        gui_target_ip = TARGET_HOST_IP_INV if self.is_inverse else TARGET_HOST_IP_STD
 
         print(f"[Client] Launching Receiver via Flatpak wrapper...")
 
@@ -178,7 +200,7 @@ class ClientService:
             "--socket=wayland",
             "org.gnome.Sdk//45",
             script_path,
-            "--host-ip", TARGET_HOST_IP,
+            "--host-ip", gui_target_ip,
             "--fullscreen"
         ]
 
@@ -197,17 +219,18 @@ class ClientService:
 
         time.sleep(2)
 
-    def _establish_handshake(self):
-        print(f"[Client] Connecting to Host ({TARGET_HOST_IP})...")
+    def _establish_handshake(self, target_ip):
+        print(f"[Client] Connecting to Host ({target_ip})...")
         payload = "HELLO_FROM_DECK"
         if self.bus_id:
             payload += f"|BUS_ID:{self.bus_id}"
 
+        retry_count = 0
         while True:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect((TARGET_HOST_IP, TARGET_PORT))
+                s.settimeout(5)
+                s.connect((target_ip, TARGET_PORT))
                 s.send(payload.encode())
                 resp = s.recv(1024).decode()
                 if "ACK_AUTHORIZED" in resp:
@@ -218,6 +241,9 @@ class ClientService:
                 else: s.close()
             except (socket.timeout, ConnectionRefusedError, OSError):
                 time.sleep(2)
+                retry_count += 1
+                if self.is_inverse and retry_count % 5 == 0:
+                     print(f"   Waiting for Host to connect to AP and obtain lease {target_ip}...")
             except KeyboardInterrupt:
                 self.stop()
                 return None

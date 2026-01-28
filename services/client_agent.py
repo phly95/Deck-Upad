@@ -134,7 +134,7 @@ class ClientService:
             print(f"[CRITICAL] Pre-flight failed: {e}")
             sys.exit(1)
 
-        # 2. START HARDWARE
+        # 2. START HARDWARE (WIFI ONLY)
         print(f"[Client] Configuring WiFi Container for {ssid}...")
         try:
             if self.is_inverse:
@@ -143,7 +143,7 @@ class ClientService:
                 self.wifi.start_host_mode(
                     ssid=ssid,
                     password=password,
-                    channel=165, # Default, configurable? Using safe 5GHz
+                    channel=165,
                     wifi_mode="ax",
                     country=country
                 )
@@ -155,27 +155,59 @@ class ClientService:
             self.stop()
             sys.exit(1)
 
-        print("[Client] Setting up Controller Input...")
+        # 3. PREPARE USBIP (BUT DO NOT BIND YET)
+        print("[Client] Preparing Input Environment...")
         try:
-            self.bus_id = self.usbip.start_sender_mode()
+            self.usbip.prepare_sender_environment()
+            self.bus_id = self.usbip.get_valve_bus_id()
             if not self.bus_id:
-                print("[WARNING] Could not find Steam Deck Controller! Input will not work.")
+                print("[WARNING] Steam Deck Controller NOT FOUND. Input will not work.")
             else:
-                print(f"[Client] Controller ready on Bus {self.bus_id}")
+                print(f"[Client] Controller detected at {self.bus_id}. Waiting for connection...")
         except Exception as e:
-            print(f"[ERROR] USBIP Init Failed: {e}")
+            print(f"[ERROR] USBIP Prep Failed: {e}")
 
-        # 3. START GUI OVERLAY
-        print("[Client] Launching Native Video Receiver...")
+        # 4. WAIT FOR HOST CONNECTION (BLOCKING)
+        target_ip = TARGET_HOST_IP_INV if self.is_inverse else TARGET_HOST_IP_STD
+        self.host_socket = self._wait_and_connect(target_ip)
+
+        if not self.host_socket:
+            print("[CRITICAL] Failed to connect to Host.")
+            self.stop()
+            return
+
+        # 5. ENGAGE HARDWARE (BIND CONTROLLER + LAUNCH GUI)
+        print("[Client] Connection Established! Engaging Hardware...")
+
+        # Bind USBIP (Controls disappear now)
+        if self.bus_id:
+            self.usbip.bind_device(self.bus_id)
+
+        # Launch GUI (Screen goes black now)
         self._launch_native_receiver()
 
-        # 4. CONNECT TO HOST
-        target_ip = TARGET_HOST_IP_INV if self.is_inverse else TARGET_HOST_IP_STD
-        self.host_socket = self._establish_handshake(target_ip)
+        # 6. SEND HANDSHAKE
+        print("[Client] Sending Handshake...")
+        try:
+            payload = "HELLO_FROM_DECK"
+            if self.bus_id:
+                payload += f"|BUS_ID:{self.bus_id}"
 
-        # 5. RUNTIME LOOP
-        if self.host_socket:
-            self._monitor_lifecycle()
+            self.host_socket.settimeout(5)
+            self.host_socket.send(payload.encode())
+            resp = self.host_socket.recv(1024).decode()
+
+            if "ACK_AUTHORIZED" in resp:
+                print("   >> Host Authorized.")
+                self._send_gui_command("STATUS:Connected. Ready.")
+                self.host_socket.settimeout(None)
+                # Enter Loop
+                self._monitor_lifecycle()
+            else:
+                print(f"[Client] Host Rejected Handshake: {resp}")
+        except Exception as e:
+            print(f"[Client] Handshake Failed: {e}")
+            self.stop()
 
     def _launch_native_receiver(self):
         # Kill old instances
@@ -189,7 +221,6 @@ class ClientService:
 
         print(f"[Client] Launching Receiver via Flatpak wrapper...")
 
-        # FIX: Use _get_user_cmd to ensure Wayland/X11 sockets are visible
         flatpak_cmd = [
             "flatpak", "run",
             "--command=python3",
@@ -219,33 +250,23 @@ class ClientService:
 
         time.sleep(2)
 
-    def _establish_handshake(self, target_ip):
-        print(f"[Client] Connecting to Host ({target_ip})...")
-        payload = "HELLO_FROM_DECK"
-        if self.bus_id:
-            payload += f"|BUS_ID:{self.bus_id}"
+    def _wait_and_connect(self, target_ip):
+        print(f"[Client] Attempting to connect to Host ({target_ip})...")
+        print("   (Note: In Inverse Mode, please ensure the PC connects to the Deck's WiFi)")
 
         retry_count = 0
         while True:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
+                s.settimeout(2)
                 s.connect((target_ip, TARGET_PORT))
-                s.send(payload.encode())
-                resp = s.recv(1024).decode()
-                if "ACK_AUTHORIZED" in resp:
-                    print("   >> Session Established!")
-                    self._send_gui_command("STATUS:Connected. Ready.")
-                    s.settimeout(None)
-                    return s
-                else: s.close()
+                return s
             except (socket.timeout, ConnectionRefusedError, OSError):
                 time.sleep(2)
                 retry_count += 1
-                if self.is_inverse and retry_count % 5 == 0:
-                     print(f"   Waiting for Host to connect to AP and obtain lease {target_ip}...")
+                if retry_count % 5 == 0:
+                     print(f"   Waiting for Host ({target_ip}) to become reachable...")
             except KeyboardInterrupt:
-                self.stop()
                 return None
 
     def _monitor_lifecycle(self):

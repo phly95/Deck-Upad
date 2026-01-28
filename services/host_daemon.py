@@ -6,7 +6,7 @@ import subprocess
 import os
 
 sys.path.append(".")
-from core.wifi_manager import WifiManager, HOST_LAN_IP, CLIENT_HOST_IP
+from core.wifi_manager import WifiManager, HOST_LAN_IP
 from core.usbip_manager import UsbIpManager
 from core.input_server import InputServer
 from core.video_sender_manager import VideoSenderManager
@@ -21,17 +21,12 @@ class HostService:
         self.server_socket = None
         self.client_conn = None
         self.video_proc = None
-        self.is_inverse = False
 
     def start(self, ssid, password, channel=165, wifi_mode="ax", country="US",
-              p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None,
-              inverse=False):
+              p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None):
         print("="*50)
         print("   DECK-UPAD HOST DAEMON (CONTAINERIZED)")
-        print(f"   Network Topology: {'INVERSE (Client Mode)' if inverse else 'STANDARD (AP Mode)'}")
         print("="*50)
-
-        self.is_inverse = inverse
 
         print("[Host] Performing Pre-Flight Checks...")
         try:
@@ -44,23 +39,18 @@ class HostService:
 
         print(f"[Host] Initializing WiFi Bridge (SSID: {ssid})...")
         try:
-            if self.is_inverse:
-                # In Inverse Mode, PC acts as the Station (Client)
-                print(f"[Host] Inverse Mode: Connecting to AP '{ssid}'...")
-                self.wifi.start_client_mode(ssid, password, country)
-            else:
-                # Standard Mode, PC acts as the AP (Host)
-                self.wifi.start_host_mode(
-                    ssid=ssid,
-                    password=password,
-                    channel=channel,
-                    wifi_mode=wifi_mode,
-                    country=country,
-                    p2p_iface=p2p_iface,
-                    internet_iface=internet_iface,
-                    internet_ssid=internet_ssid,
-                    internet_pass=internet_pass
-                )
+            # Pass new explicit interface configuration
+            self.wifi.start_host_mode(
+                ssid=ssid,
+                password=password,
+                channel=channel,
+                wifi_mode=wifi_mode,
+                country=country,
+                p2p_iface=p2p_iface,
+                internet_iface=internet_iface,
+                internet_ssid=internet_ssid,
+                internet_pass=internet_pass
+            )
         except Exception as e:
             print(f"[CRITICAL] WiFi Failed: {e}")
             self.stop()
@@ -73,24 +63,22 @@ class HostService:
             self.stop()
             sys.exit(1)
 
-        # Determine Bind IP based on Topology
-        bind_ip = CLIENT_HOST_IP if self.is_inverse else HOST_LAN_IP
-        print(f"[Host] Infrastructure Ready. Binding to: {bind_ip}")
+        print(f"[Host] Infrastructure Ready. IP: {HOST_LAN_IP}")
 
         self.input_server.start()
-        self.run_server(bind_ip)
+        self.run_server()
 
-    def run_server(self, bind_ip):
+    def run_server(self):
         attempts = 0
         bound = False
         while not bound and attempts < 10:
             try:
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.server_socket.bind((bind_ip, 5555))
+                self.server_socket.bind((HOST_LAN_IP, 5555))
                 self.server_socket.listen(1)
                 bound = True
-                print(f"[Host] Listening for Deck on {bind_ip}:5555...")
+                print(f"[Host] Listening for Deck on {HOST_LAN_IP}:5555...")
             except OSError as e:
                 print(f"[Host] Bind failed (Attempt {attempts+1}/10): {e}")
                 time.sleep(1)

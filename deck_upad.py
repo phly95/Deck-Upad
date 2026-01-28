@@ -417,9 +417,6 @@ def main():
     parser.add_argument("--internet-ssid", help="SSID for upstream internet")
     parser.add_argument("--internet-pass", help="Password for upstream internet")
 
-    # New Flag for Inverse Topology (Deck acts as AP, PC connects)
-    parser.add_argument("--inverse", action="store_true", help="Invert Network Topology")
-
     args = parser.parse_args()
 
     # 1. CAPTURE SYSTEM SNAPSHOT
@@ -463,7 +460,7 @@ def main():
 
     try:
         if args.role == "host":
-            print(f"--- LAUNCHING HOST DAEMON (Inverse: {args.inverse}) ---")
+            print("--- LAUNCHING HOST DAEMON ---")
             service = HostService()
             service.start(
                 ssid=args.ssid,
@@ -474,18 +471,12 @@ def main():
                 p2p_iface=ORIGINAL_IFACE,
                 internet_iface=args.internet_iface,
                 internet_ssid=args.internet_ssid,
-                internet_pass=args.internet_pass,
-                inverse=args.inverse
+                internet_pass=args.internet_pass
             )
         else:
-            print(f"--- LAUNCHING CLIENT AGENT (Inverse: {args.inverse}) ---")
+            print("--- LAUNCHING CLIENT AGENT ---")
             service = ClientService()
-            service.start(
-                ssid=args.ssid,
-                password=args.password,
-                country=args.country,
-                inverse=args.inverse
-            )
+            service.start(ssid=args.ssid, password=args.password, country=args.country)
     except SystemExit:
         pass
     except Exception as e:

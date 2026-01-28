@@ -181,24 +181,17 @@ class DeckUpadLauncher(Gtk.Window):
         self.combo_country.set_active_id(self.config.get("country", "US"))
         grid.attach(self.combo_country, 1, 8, 2, 1)
 
-        # Row 9: Inverse Topology
-        grid.attach(Gtk.Label(label="Inverse Topology:"), 0, 9, 1, 1)
-        self.chk_inverse = Gtk.CheckButton(label="Deck hosts WiFi (AP), PC connects to Deck")
-        self.chk_inverse.set_tooltip_text("If checked: Client Agent creates Hotspot, Host Daemon connects to it.")
-        self.chk_inverse.set_active(self.config.get("inverse_topology", False))
-        grid.attach(self.chk_inverse, 1, 9, 2, 1)
-
-        # Row 10: Sudo Password
-        grid.attach(Gtk.Label(label="Sudo Password:"), 0, 10, 1, 1)
+        # Row 9: Sudo Password
+        grid.attach(Gtk.Label(label="Sudo Password:"), 0, 9, 1, 1)
         self.entry_sudo = Gtk.Entry()
         self.entry_sudo.set_visibility(False)
         self.entry_sudo.set_invisible_char("•")
         self.entry_sudo.set_text(self.config.get("sudo_pass", ""))
-        grid.attach(self.entry_sudo, 1, 10, 1, 1)
+        grid.attach(self.entry_sudo, 1, 9, 1, 1)
 
         self.chk_save_sudo = Gtk.CheckButton(label="Save")
         self.chk_save_sudo.set_active(bool(self.config.get("sudo_pass", "")))
-        grid.attach(self.chk_save_sudo, 2, 10, 1, 1)
+        grid.attach(self.chk_save_sudo, 2, 9, 1, 1)
 
         if self.config.get("role") == "host": self.rb_host.set_active(True)
 
@@ -312,8 +305,7 @@ class DeckUpadLauncher(Gtk.Window):
             "wifi_mode": self.combo_mode.get_active_id(),
             "channel": int(self.spin_channel.get_value()),
             "country": country,
-            "sudo_pass": sudo_pass,
-            "inverse_topology": self.chk_inverse.get_active()
+            "sudo_pass": sudo_pass
         }
         try:
             with open(CONFIG_FILE, 'w') as f: json.dump(data, f)
@@ -323,6 +315,11 @@ class DeckUpadLauncher(Gtk.Window):
         end_iter = self.log_buffer.get_end_iter()
         self.log_buffer.insert(end_iter, text)
         self.log_view.scroll_to_mark(self.log_mark, 0.0, True, 0.0, 1.0)
+
+    # ... (Rest of the file: _ensure_flatpak_runtime, _robust_podman_rm, ensure_receiver_image_exists,
+    #      on_test_video, _run_test_sequence, _start_test_sender, _send_udp_signal,
+    #      _monitor_pipe, _monitor_sender_output) ...
+    # [Code truncated for brevity as logic remains largely the same, inserting on_start update below]
 
     def _ensure_flatpak_runtime(self):
         """Checks and installs Flatpak GNOME SDK for the Test Mode."""
@@ -462,7 +459,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.set_sensitive(True)
         # Disable inputs
         for w in [self.entry_ssid, self.entry_pass, self.spin_channel, self.combo_mode,
-                  self.combo_country, self.combo_p2p, self.combo_net, self.entry_net_ssid, self.entry_net_pass, self.chk_inverse]:
+                  self.combo_country, self.combo_p2p, self.combo_net, self.entry_net_ssid, self.entry_net_pass]:
             w.set_sensitive(False)
 
         role = "host" if self.rb_host.get_active() else "client"
@@ -472,7 +469,6 @@ class DeckUpadLauncher(Gtk.Window):
         channel = str(int(self.spin_channel.get_value()))
         country = self.combo_country.get_active_id() or "US"
         sudo_pw = self.entry_sudo.get_text()
-        is_inverse = self.chk_inverse.get_active()
 
         # New Arguments
         p2p_iface = self.combo_p2p.get_active_id()
@@ -499,11 +495,7 @@ class DeckUpadLauncher(Gtk.Window):
             cmd.extend(["--internet-ssid", internet_ssid])
             cmd.extend(["--internet-pass", internet_pass])
 
-        if is_inverse:
-            cmd.append("--inverse")
-
-        topo = "INVERSE" if is_inverse else "STANDARD"
-        self.append_log(f"--- STARTING {role.upper()} MODE ({topo} TOPOLOGY) ---\n")
+        self.append_log(f"--- STARTING {role.upper()} MODE ---\n")
         self._run_process(cmd, sudo_pw)
 
     def on_cleanup(self, widget):
@@ -559,7 +551,7 @@ class DeckUpadLauncher(Gtk.Window):
         self.btn_stop.set_sensitive(False)
         # Re-enable inputs
         for w in [self.entry_ssid, self.entry_pass, self.spin_channel, self.combo_mode,
-                  self.combo_country, self.combo_p2p, self.combo_net, self.entry_net_ssid, self.entry_net_pass, self.chk_inverse]:
+                  self.combo_country, self.combo_p2p, self.combo_net, self.entry_net_ssid, self.entry_net_pass]:
             w.set_sensitive(True)
         self.process = None
 

@@ -17,6 +17,21 @@ This is a Work In Progress (WIP), but all major functionality is now working. Th
 
 Using the Azahar fork https://github.com/phly95/azahar-upad you can use this to play 3DS games with the touch screen usable on the Steam Deck. The video is reasonably low latency, though improvements could be made on this front with further optimizations. Touch interaction works by simulating touch inputs on the main display, which Azahar recognizes as taps on the bottom screen. Controller passthrough works by using USB/IP. Device discovery is now automatic using the launcher.py GUI.
 
+## Things to be improved
+
+While this has reached a state where it is working, ideally, connecting to a PC should be a frictionless experience. Here's what I'm thinking:
+
+[] Switch to a more efficient protocol over WiFi since USB/IP is quite heavy over the air. Here's a rough map of how this might work:
+```
+[Deck Hardware] → [evdev] → [Delta Compressor] → [UDP Socket] → [WiFi P2P 20MHz]
+                                                            ↓
+[PC Hardware] ← [uhid] ← [Report Reconstructor] ← [UDP Socket]
+```
+[] Order a USB WiFi dongle. I've ordered https://www.aliexpress.us/item/3256805644155956.html (fenvi WiFi 6 AX1800) but will need to wait on it to arrive.
+[] Turn this software into a background service that is installed and leverages the dongle. Perhaps as a systemd service.
+[] Use systemd-sysext instead of podman containers to lower complexity and bloat while still installing hostapd.
+[] Use network namespaces in a way that doesn't rely on containerization.
+
 ## Installation instructions
 
 

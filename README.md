@@ -21,7 +21,7 @@ Using the Azahar fork https://github.com/phly95/azahar-upad you can use this to 
 
 While this has reached a state where it is working, ideally, connecting to a PC should be a frictionless experience. Here's what I'm thinking:
 
-[] Switch to a more efficient protocol over WiFi since USB/IP is quite heavy over the air. Here's a rough map of how this might work:
+[ ] Switch to a more efficient protocol over WiFi since USB/IP is quite heavy over the air. Here's a rough map of how this might work:
 
 ```
 [Deck Hardware] → [evdev] → [Delta Compressor] → [UDP Socket] → [WiFi P2P 20MHz]
@@ -29,13 +29,13 @@ While this has reached a state where it is working, ideally, connecting to a PC 
 [PC Hardware] ← [uhid] ← [Report Reconstructor] ← [UDP Socket]
 ```
 
-[] Order a USB WiFi dongle. I've ordered https://www.aliexpress.us/item/3256805644155956.html (fenvi WiFi 6 AX1800) but will need to wait on it to arrive.
+[ ] Order a USB WiFi dongle. I've ordered https://www.aliexpress.us/item/3256805644155956.html (fenvi WiFi 6 AX1800) but will need to wait on it to arrive.
 
-[] Turn this software into a background service that is installed and leverages the dongle. Perhaps as a systemd service.
+[ ] Turn this software into a background service that is installed and leverages the dongle. Perhaps as a systemd service.
 
-[] Use systemd-sysext instead of podman containers to lower complexity and bloat while still installing hostapd.
+[ ] Use systemd-sysext instead of podman containers to lower complexity and bloat while still installing hostapd.
 
-[] Use network namespaces in a way that doesn't rely on containerization.
+[ ] Use network namespaces in a way that doesn't rely on containerization.
 
 ## Installation instructions
 

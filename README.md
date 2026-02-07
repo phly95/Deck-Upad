@@ -37,6 +37,8 @@ While this has reached a state where it is working, ideally, connecting to a PC 
 
 [ ] Use network namespaces in a way that doesn't rely on containerization.
 
+I think ideally, this should become a Decky plugin. On startup, it should wait to ensure the Decky plugin is active before capturing the wifi card on boot to avoid the user being stuck without WiFi internet. Then the decky plugin lets you assign a wifi card to be for Deck-Upad. I would want this to survive reboots so that connecting a paired deck is as easy as a Bluetooth controller.
+
 ## Installation instructions
 
 

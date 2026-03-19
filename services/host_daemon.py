@@ -23,12 +23,21 @@ class HostService:
         self.video_proc = None
 
     def start(self, ssid, password, channel=165, wifi_mode="ax", country="US",
-              p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None):
+              p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None,
+              bootstrap_ssid=None, bootstrap_pass=None):
         print("="*50)
         print("   DECK-UPAD HOST DAEMON (CONTAINERIZED)")
         print("="*50)
 
         print("[Host] Performing Pre-Flight Checks...")
+
+        # Validate that P2P and Internet interfaces are not the same
+        if p2p_iface and internet_iface and internet_iface.lower() != "none":
+            if p2p_iface == internet_iface:
+                print(f"[CRITICAL] Configuration Error: P2P interface ({p2p_iface}) and Internet interface ({internet_iface}) cannot be the same.")
+                print("[CRITICAL] Please select different interfaces, or set Internet Interface to 'none' if you don't need internet sharing.")
+                sys.exit(1)
+
         try:
             self.wifi.ensure_image_exists()
             self.usbip.ensure_image_exists()
@@ -49,7 +58,9 @@ class HostService:
                 p2p_iface=p2p_iface,
                 internet_iface=internet_iface,
                 internet_ssid=internet_ssid,
-                internet_pass=internet_pass
+                internet_pass=internet_pass,
+                bootstrap_ssid=bootstrap_ssid,
+                bootstrap_pass=bootstrap_pass
             )
         except Exception as e:
             print(f"[CRITICAL] WiFi Failed: {e}")

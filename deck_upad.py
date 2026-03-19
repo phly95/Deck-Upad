@@ -416,6 +416,8 @@ def main():
     parser.add_argument("--internet-iface", default="none", help="Interface for Internet")
     parser.add_argument("--internet-ssid", help="SSID for upstream internet")
     parser.add_argument("--internet-pass", help="Password for upstream internet")
+    parser.add_argument("--bootstrap-ssid", help="SSID to connect to briefly for regulatory unlock")
+    parser.add_argument("--bootstrap-pass", help="Password for bootstrap network")
 
     args = parser.parse_args()
 
@@ -471,7 +473,9 @@ def main():
                 p2p_iface=ORIGINAL_IFACE,
                 internet_iface=args.internet_iface,
                 internet_ssid=args.internet_ssid,
-                internet_pass=args.internet_pass
+                internet_pass=args.internet_pass,
+                bootstrap_ssid=args.bootstrap_ssid,
+                bootstrap_pass=args.bootstrap_pass
             )
         else:
             print("--- LAUNCHING CLIENT AGENT ---")

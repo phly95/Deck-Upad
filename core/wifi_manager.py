@@ -28,6 +28,7 @@ CLIENT_HOST_IP = "10.13.13.2"
 # Ports to forward (UDP/TCP)
 FWD_PORT_RANGE = "2000:65535"
 
+
 class WifiManager:
     def __init__(self):
         self.exec_cmd = f"podman exec {CONTAINER_NAME} /bin/sh -c"
@@ -61,16 +62,31 @@ class WifiManager:
     # --- Public API ---
 
     def start_host_mode(self, ssid, password, channel=165, wifi_mode="ax", country="US",
-                        p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None):
+                        p2p_iface=None, internet_iface="none", internet_ssid=None, internet_pass=None,
+                        bootstrap_ssid=None, bootstrap_pass=None):
 
         # 1. Determine Interfaces
         wifi_interface = p2p_iface if p2p_iface else self._get_active_wifi_interface()
         print(f"[WifiManager] Starting HOST mode on {wifi_interface} (AP: {ssid}, Region: {country})...")
 
+        # Handle bootstrap-host mode: connect to WiFi on HOST to unlock regulatory domain BEFORE moving to container
+        if country.lower() == "bootstrap-host" and bootstrap_ssid:
+            print(f"[WifiManager] Bootstrap mode (host): Connecting to {bootstrap_ssid} on host to unlock channels...")
+            self._bootstrap_regulatory_unlock(wifi_interface, bootstrap_ssid, bootstrap_pass)
+            country = "inherit"
+
         self._initialize_container()
 
-        # 2. Move P2P Interface to Container
-        ctr_pid = self._move_wifi_card(wifi_interface, "wlan0") # Rename to wlan0 inside
+        # Handle bootstrap-container mode: single container exploit
+        # If active, we SKIP the normal _move_wifi_card below, because the bootstrap handles moving it.
+        if country.lower() == "bootstrap-container" and bootstrap_ssid:
+            print(f"[WifiManager] Bootstrap mode (container exploit): Connecting to {bootstrap_ssid}...")
+            self._bootstrap_regulatory_unlock_container(wifi_interface, bootstrap_ssid, bootstrap_pass)
+            ctr_pid = self._run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+            country = "inherit"
+        else:
+            # 2. Normal Mode: Move P2P Interface to Container directly
+            ctr_pid = self._move_wifi_card(wifi_interface, "wlan0", country)
 
         # 3. Handle Internet Interface
         has_wan = False
@@ -79,20 +95,18 @@ class WifiManager:
         if internet_iface and internet_iface.lower() != "none":
             print(f"[WifiManager] Configuring Internet via {internet_iface}...")
 
-            # Check if Internet interface is WiFi
             is_wifi_wan = self._is_interface_wifi(internet_iface)
 
             if is_wifi_wan:
                 # Upstream WiFi Logic
                 wan_iface = "wlan1" # Rename to wlan1 inside
-                self._move_wifi_card(internet_iface, wan_iface)
+                self._move_wifi_card(internet_iface, wan_iface, country)
                 self._connect_upstream_wifi(wan_iface, internet_ssid, internet_pass, country)
                 has_wan = True
             else:
                 # Wired/Ethernet Logic
                 has_wan = self._move_ethernet_card(internet_iface, ctr_pid)
-                # _move_ethernet_card already handles renaming/DHCP if successful
-                wan_iface = internet_iface # Usually keeps name or becomes eth0
+                wan_iface = internet_iface
 
         # 4. Setup AP & Routing
         self._setup_ap_logic(ssid, password, channel, ctr_pid, wifi_mode, country, has_wan, wan_iface)
@@ -100,11 +114,10 @@ class WifiManager:
 
     def start_client_mode(self, ssid, password, country="US"):
         print(f"[WifiManager] Starting CLIENT mode (Connecting to: {ssid}, Region: {country})...")
-        # Client mode usually just needs one card for P2P connection to Host
         wifi_interface = self._get_active_wifi_interface()
 
         self._initialize_container()
-        ctr_pid = self._move_wifi_card(wifi_interface, "wlan0")
+        ctr_pid = self._move_wifi_card(wifi_interface, "wlan0", country)
         self._setup_client_logic(ssid, password, ctr_pid, country)
         print("[WifiManager] Client Mode Ready.")
 
@@ -124,7 +137,6 @@ class WifiManager:
         time.sleep(1)
         # Attempt to restore NM on common interfaces
         try:
-            # We don't know exactly which were moved without state, but trying to up everything is usually safe
             self._run_command("nmcli device connect wlan0", check=False)
         except: pass
 
@@ -165,10 +177,10 @@ class WifiManager:
         self.ensure_image_exists()
         print(f"[WifiManager] Starting container '{CONTAINER_NAME}'...")
 
-        # FIX: Added --tmpfs /tmp and --tmpfs /run to force RAM usage and avoid writing to /var overlay
         podman_run = (
             f"podman run -d --name {CONTAINER_NAME} --replace "
             "--privileged "
+            "--security-opt label=disable "
             "--net=none "
             "--sysctl net.ipv4.ip_forward=1 "
             "--tmpfs /tmp "
@@ -181,7 +193,7 @@ class WifiManager:
             self._run_command(f"chrt -f -p 99 {ctr_pid}", check=False)
         except: pass
 
-    def _move_wifi_card(self, host_iface, container_name):
+    def _move_wifi_card(self, host_iface, container_name, country=None):
         phy = "phy0"
         try:
             out = self._run_command(f"iw dev {host_iface} info", check=False)
@@ -189,6 +201,11 @@ class WifiManager:
                 m = re.search(r"wiphy\s+(\d+)", out)
                 if m: phy = f"phy{m.group(1)}"
         except: pass
+
+        if country and country.lower() not in["inherit", "bootstrap", "bootstrap-host", "bootstrap-container", "none", ""]:
+            print(f"[WifiManager] Setting regulatory domain to {country} on host...")
+            self._run_command(f"iw reg set {country}")
+            time.sleep(0.5)
 
         self._run_command(f"nmcli device disconnect {host_iface}", check=False)
         ctr_pid = self._run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
@@ -201,14 +218,9 @@ class WifiManager:
         time.sleep(1)
         # Rename inside container
         try:
-            # Find the interface name associated with that phy inside the container
             iw_out = self._run_command(f"{self.exec_cmd} 'iw dev'", check=False)
             current_name = None
             if iw_out:
-                # Simple parser to find interface for the phy we just moved.
-                # Note: This might be tricky if multiple phys.
-                # Assuming the most recently moved is the one we want or grep by phy#
-                # A safer bet is to match phy# to Interface
                 sections = iw_out.split("phy#")
                 for sec in sections:
                     if sec.startswith(phy.replace("phy", "")):
@@ -222,11 +234,177 @@ class WifiManager:
         except: pass
         return ctr_pid
 
+    def _bootstrap_regulatory_unlock(self, iface_name, ssid, password):
+        try:
+            self._run_command(f"nmcli device disconnect {iface_name}", check=False)
+            time.sleep(1)
+
+            print(f"[WifiManager] Connecting to {ssid} on host...")
+            connect_cmd = f"nmcli device wifi connect '{ssid}'"
+            if password:
+                connect_cmd += f" password '{password}'"
+            connect_cmd += f" ifname {iface_name}"
+
+            result = self._run_command(connect_cmd, check=False)
+            if result is None:
+                print(f"[WifiManager] Warning: Could not connect to bootstrap network")
+                return
+
+            print(f"[WifiManager] Connected! Waiting for regulatory unlock...")
+            time.sleep(3)
+
+            iw_out = self._run_command(f"iw list | grep -E '5180.*MHz.*\\[36\\]'", check=False)
+            if iw_out and "no IR" not in iw_out.lower():
+                print(f"[WifiManager] Channel 36 appears unlocked on host!")
+            else:
+                print(f"[WifiManager] Channel 36 still has restrictions, but continuing anyway...")
+
+            print(f"[WifiManager] Disconnecting from bootstrap network (keeping regulatory state)...")
+            self._run_command(f"nmcli connection down '{ssid}'", check=False)
+            time.sleep(0.5)
+            print(f"[WifiManager] Bootstrap complete. Moving interface to container...")
+
+        except Exception as e:
+            print(f"[WifiManager] Bootstrap failed (continuing anyway): {e}")
+
+    def _bootstrap_regulatory_unlock_container(self, host_iface, ssid, password):
+        """
+        Bootstrap workaround using the MAIN CONTAINER but exploiting namespace hops:
+        1. Move WiFi PHY to main container
+        2. Connect to WiFi (unlocks channels)
+        3. Yank PHY out to Host OS (freezes unlocked state)
+        4. Push PHY back into main container
+        """
+        try:
+            print(f"[WifiManager] Bootstrap mode (single-container exploit): Preparing...")
+
+            # 0. Disconnect from Host OS NetworkManager
+            self._run_command(f"nmcli device disconnect {host_iface}", check=False)
+            time.sleep(1)
+
+            # 1. Get PHY name from host before we start
+            phy = "phy0"
+            try:
+                out = self._run_command(f"iw dev {host_iface} info", check=False)
+                if out:
+                    m = re.search(r"wiphy\s+(\d+)", out)
+                    if m:
+                        phy = f"phy{m.group(1)}"
+            except: pass
+
+            print(f"[WifiManager] Using Host PHY: {phy}")
+
+            # Get main container PID (already created by _initialize_container)
+            ctr_pid = self._run_command(f"podman inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+
+            # 2. Move PHY to main container
+            print(f"[WifiManager] Moving {phy} to main container...")
+            self._run_command(f"iw phy {phy} set netns {ctr_pid}")
+            time.sleep(1)
+
+            # RENAME interface to wlan0 inside container
+            iw_out = self._run_command(f"{self.exec_cmd} 'iw dev'", check=False)
+            if iw_out:
+                m = re.search(r"Interface\s+(\S+)", iw_out)
+                if m:
+                    current_name = m.group(1)
+                    if current_name != "wlan0":
+                        self._run_command(f"{self.exec_cmd} 'ip link set {current_name} name wlan0'")
+
+            # 3. Configure and connect in container
+            print(f"[WifiManager] Configuring WiFi in container...")
+            self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'", check=False)
+            time.sleep(1)
+
+            wpa_conf = f"""ctrl_interface=/tmp/wpa_supplicant
+update_config=1
+network={{
+    ssid="{ssid}"
+    {f'psk="{password}"' if password else 'key_mgmt=NONE'}
+}}
+"""
+            self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > /tmp/wpa_bootstrap.conf'", shell=True, input=wpa_conf)
+
+            print(f"[WifiManager] Connecting to {ssid} in container...")
+            self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /tmp/wpa_bootstrap.conf'")
+
+            # Wait for connection
+            connected = False
+            for i in range(15):
+                status = self._run_command(f"{self.exec_cmd} 'wpa_cli -p /tmp/wpa_supplicant -i wlan0 status'", check=False)
+                if status and "wpa_state=COMPLETED" in status:
+                    connected = True
+                    print(f"[WifiManager] Connected to {ssid}!")
+                    break
+                time.sleep(1)
+
+            if not connected:
+                print(f"[WifiManager] Warning: Could not confirm connection to {ssid}")
+            else:
+                print(f"[WifiManager] Waiting for regulatory unlock...")
+                time.sleep(3)
+
+                iw_out = self._run_command(f"{self.exec_cmd} 'iw list | grep -E \"5180.*MHz.*\\[36\\]\"'", check=False)
+                if iw_out and "no IR" not in iw_out.lower():
+                    print(f"[WifiManager] Channel 36 unlocked in container!")
+
+            # 4. FREEZE STATE: Yank PHY back to Host
+            print(f"[WifiManager] Yanking PHY back to host to freeze regulatory state...")
+
+            # Find the exact PHY index inside the container right now
+            ctr_phy_idx = None
+            iw_ctr = self._run_command(f"{self.exec_cmd} 'iw dev wlan0 info'", check=False)
+            if iw_ctr:
+                m = re.search(r"wiphy\s+(\d+)", iw_ctr)
+                if m:
+                    ctr_phy_idx = m.group(1)
+
+            if not ctr_phy_idx:
+                raise Exception("Could not determine PHY index inside container for extraction!")
+
+            # Yank it out using nsenter! (Executes on Host, but points into container's network namespace)
+            # CRITICAL: We use phy#{idx} instead of phy{idx} because nsenter -n doesn't share mount namespaces,
+            # which breaks iw's sysfs name lookups. phy#{idx} uses direct netlink IDs and bypasses sysfs!
+            self._run_command(f"nsenter -t {ctr_pid} -n iw phy#{ctr_phy_idx} set netns 1")
+            time.sleep(1)
+
+            # 5. FIND NEW PHY ON HOST
+            new_host_phy = None
+            iw_host_out = self._run_command("iw phy", check=False)
+            if iw_host_out:
+                matches = re.findall(r"Wiphy\s+phy(\d+)", iw_host_out)
+                if matches:
+                    new_host_phy = f"phy{max(int(m) for m in matches)}"
+
+            if not new_host_phy:
+                raise Exception("Could not find PHY on host after yanking!")
+
+            print(f"[WifiManager] Found PHY on host as {new_host_phy}. Pushing back to container...")
+
+            # 6. PUSH BACK TO CONTAINER
+            self._run_command(f"iw phy {new_host_phy} set netns {ctr_pid}")
+            time.sleep(1)
+
+            # 7. RENAME TO wlan0 AND BRING UP inside container
+            iw_main = self._run_command(f"{self.exec_cmd} 'iw dev'", check=False)
+            if iw_main:
+                m = re.search(r"Interface\s+(\S+)", iw_main)
+                if m:
+                    current_name = m.group(1)
+                    if current_name != "wlan0":
+                        self._run_command(f"{self.exec_cmd} 'ip link set {current_name} name wlan0'")
+
+            self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'", check=False)
+            print(f"[WifiManager] Bootstrap complete. Channels should remain unlocked.")
+
+        except Exception as e:
+            print(f"[WifiManager] Bootstrap failed: {e}")
+            raise
+
     def _connect_upstream_wifi(self, iface_name, ssid, password, country):
         print(f"[WifiManager] Connecting {iface_name} to upstream WiFi: {ssid}...")
         self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
 
-        # FIX: Use /tmp (RAM) for control sockets and config
         wpa_conf = f"""ctrl_interface=/tmp/wpa_supplicant
 update_config=1
 country={country}
@@ -235,20 +413,16 @@ network={{
     psk="{password}"
 }}
 """
-        # Write config for specific interface to /tmp
         conf_path = f"/tmp/wpa_supplicant_{iface_name}.conf"
         self._run_command(f"podman exec -i {CONTAINER_NAME} sh -c 'cat > {conf_path}'", shell=True, input=wpa_conf)
 
         self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i {iface_name} -c {conf_path}'")
 
-        # Wait for connection
         for _ in range(15):
-            # FIX: Point wpa_cli to /tmp
             status = self._run_command(f"{self.exec_cmd} 'wpa_cli -p /tmp/wpa_supplicant -i {iface_name} status'", check=False)
             if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
 
-        # DHCP
         try:
             self._run_command(f"{self.exec_cmd} 'udhcpc -i {iface_name} -n -q -f -t 10'")
         except:
@@ -273,8 +447,23 @@ network={{
     # --- Mode Specific Logic ---
 
     def _setup_ap_logic(self, ssid, password, channel, ctr_pid, wifi_mode, country, has_wan, wan_iface):
-        # 1. Setup Veth Bridge
-        self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
+        if country and country.lower() not in["inherit", "bootstrap", "bootstrap-host", "bootstrap-container", "none", ""]:
+            print(f"[WifiManager] Setting regulatory domain to {country}...")
+            self._run_command(f"{self.exec_cmd} 'iw reg set {country}'")
+            time.sleep(1)
+
+            reg_info = self._run_command(f"{self.exec_cmd} 'iw reg get'", check=False)
+            if reg_info and f"country {country}" in reg_info:
+                print(f"[WifiManager] Regulatory domain set: {reg_info.split('country')[1].split(':')[0].strip()}")
+            else:
+                print(f"[WifiManager] Warning: Could not verify regulatory domain")
+        else:
+            print(f"[WifiManager] Using inherited regulatory domain from host")
+            reg_info = self._run_command(f"{self.exec_cmd} 'iw reg get'", check=False)
+            if reg_info:
+                country_line =[line for line in reg_info.split('\n') if 'country' in line]
+                if country_line:
+                    print(f"[WifiManager] Current: {country_line[0].strip()}")
 
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
@@ -288,7 +477,6 @@ network={{
         self._run_command(f"nmcli connection delete {NM_CONN_NAME}", check=False)
 
         gw_arg = f"gw4 {ROUTER_LAN_IP}" if has_wan else ""
-        # Only set DNS if we have WAN, otherwise host might lose DNS resolution
         dns_arg = "ipv4.dns '8.8.8.8'" if has_wan else ""
 
         nm_cmd = (f"nmcli connection add type ethernet ifname {VETH_HOST} con-name {NM_CONN_NAME} "
@@ -300,7 +488,6 @@ network={{
 
         self._open_host_ports()
 
-        # 2. Setup NAT if WAN exists
         if has_wan:
             self._run_command(f"{self.exec_cmd} 'sysctl -w net.ipv4.ip_forward=1'")
             self._run_command(f"{self.exec_cmd} 'iptables -t nat -A POSTROUTING -o {wan_iface} -j MASQUERADE'")
@@ -309,17 +496,20 @@ network={{
 
         self._run_command(f"{self.exec_cmd} 'iptables -P FORWARD ACCEPT'", check=False)
 
-        # 3. Hostapd Config
         is_5ghz = int(channel) > 14
         hw_mode = "a" if is_5ghz else "g"
-        enable_ac = 1 if is_5ghz and wifi_mode in ["ac", "ax"] else 0
+        enable_ac = 1 if is_5ghz and wifi_mode in["ac", "ax"] else 0
         enable_ax = 1 if is_5ghz and wifi_mode == "ax" else 0
 
-        # FIX: Write hostapd config to /tmp (RAM)
+        if country.lower() in["inherit", "bootstrap", "bootstrap-host", "bootstrap-container", "none", ""]:
+            country_line = "# country_code not set (inheriting from host)"
+        else:
+            country_line = f"country_code={country}"
+
         hostapd_conf = f"""interface=wlan0
 bridge=br0
 ssid={ssid}
-country_code={country}
+{country_line}
 hw_mode={hw_mode}
 channel={channel}
 wmm_enabled=1
@@ -336,11 +526,27 @@ rsn_pairwise=CCMP"""
         self._run_command(f"{self.exec_cmd} 'rfkill unblock all'", check=False)
         self._run_command(f"{self.exec_cmd} 'ip link set wlan0 up'")
         self._run_command(f"{self.exec_cmd} 'iw dev wlan0 set power_save off'")
-        self._run_command(f"{self.exec_cmd} 'hostapd -B /tmp/hostapd.conf'")
+
+        try:
+            self._run_command(f"{self.exec_cmd} 'hostapd -B /tmp/hostapd.conf'")
+        except Exception as e:
+            error_str = str(e)
+            if any(x in error_str for x in["not allowed for AP mode", "not found from the channel list",
+                                            "Hardware does not support configured channel",
+                                            "Could not select hw_mode and channel", "AP-DISABLED"]):
+                print(f"\n[CRITICAL] Channel {channel} is not supported by your WiFi card for AP mode.")
+                print(f"[CRITICAL] Debug - checking available channels in container:")
+                channels = self._run_command(f"{self.exec_cmd} 'iw list | grep MHz'", check=False)
+                if channels:
+                    for line in channels.split('\n')[:20]:
+                        if line.strip():
+                            print(f"  {line.strip()}")
+                print(f"\n[CRITICAL] The regulatory domain inside the container may differ from the host.")
+                print(f"[CRITICAL] Try channel 1, 6, or 11 (2.4GHz) which usually have best compatibility.")
+                raise Exception(f"Channel {channel} not supported for AP mode. Try a different channel.")
+            raise
         self._run_command(f"{self.exec_cmd} 'tc qdisc add dev wlan0 root fq_codel 2>/dev/null || true'")
 
-        # 4. Dnsmasq Config
-        # FIX: Write dnsmasq config to /tmp (RAM)
         dnsmasq_conf = f"""interface=br0
 dhcp-range={DHCP_RANGE}
 dhcp-option=3,{ROUTER_LAN_IP}
@@ -349,7 +555,6 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"{self.exec_cmd} 'dnsmasq -C /tmp/dnsmasq.conf'")
 
     def _setup_client_logic(self, ssid, password, ctr_pid, country="US"):
-        # (Same as before)
         self._run_command(f"ip link add {VETH_HOST} type veth peer name {VETH_CTR}")
         self._run_command(f"ip link set {VETH_CTR} netns {ctr_pid}")
         self._run_command(f"{self.exec_cmd} 'ip link set {VETH_CTR} up'")
@@ -359,12 +564,13 @@ dhcp-option=6,8.8.8.8"""
         self._run_command(f"nmcli connection modify {NM_CONN_NAME} ipv4.dns '8.8.8.8'")
         self._run_command(f"nmcli connection up {NM_CONN_NAME}")
 
-        self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
+        if country and country.lower() not in["inherit", "bootstrap", "bootstrap-host", "bootstrap-container", "none", ""]:
+            self._run_command(f"{self.exec_cmd} 'iw reg set {country}'", check=False)
 
-        # FIX: Write config to /tmp (RAM)
+        wpa_country = country if country and country.lower() not in["inherit", "bootstrap", "bootstrap-host", "bootstrap-container", "none", ""] else ""
         wpa_conf = f"""ctrl_interface=/tmp/wpa_supplicant
 update_config=1
-country={country}
+country={wpa_country}
 network={{
     ssid="{ssid}"
     psk="{password}"
@@ -377,7 +583,6 @@ network={{
         self._run_command(f"{self.exec_cmd} 'wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf'")
 
         for _ in range(15):
-            # FIX: Point wpa_cli to /tmp
             status = self._run_command(f"{self.exec_cmd} 'wpa_cli -p /tmp/wpa_supplicant status'", check=False)
             if status and "wpa_state=COMPLETED" in status: break
             time.sleep(1)
@@ -395,12 +600,9 @@ network={{
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p tcp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
         self._run_command(f"{self.exec_cmd} 'iptables -t nat -A PREROUTING -i wlan0 -p udp --dport {FWD_PORT_RANGE} -j DNAT --to-destination {CLIENT_HOST_IP}'")
 
-        # FIX: Generate DBus ID in /tmp (RAM)
         self._run_command(f"{self.exec_cmd} 'dbus-uuidgen > /tmp/machine-id'", check=False)
-        # We need /var/lib/dbus to exist for dbus-daemon to start, but we link the file from /tmp
         self._run_command(f"{self.exec_cmd} 'mkdir -p /var/lib/dbus'", check=False)
         self._run_command(f"{self.exec_cmd} 'ln -sf /tmp/machine-id /var/lib/dbus/machine-id'", check=False)
-        # /var/run is usually a symlink to /run (tmpfs), but we create just in case
         self._run_command(f"{self.exec_cmd} 'mkdir -p /var/run/dbus'", check=False)
 
         self._run_command(f"{self.exec_cmd} 'dbus-daemon --system --fork'")

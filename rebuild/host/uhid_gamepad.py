@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Host-side UHID gamepad daemon — fake Steam Controller.
+"""Host-side UHID fake Steam Controller daemon.
 
-Receives controller input over UDP from the Deck and creates a virtual
-Steam Controller via /dev/uhid. Uses the actual SC2 HID descriptor
-and VID/PID so Steam recognizes it as a real Steam Controller.
+Simulates a USB-connected Steam Controller via /dev/uhid.
+Handles the hid-steam driver's initialization handshake (feature report 0x00)
+and forwards controller input from the Deck over UDP.
 
 Usage: sudo python3 uhid_gamepad.py [--deck DECK_IP]
 """
@@ -22,25 +22,64 @@ from shared.protocol import (
     unpack_input_report, pack_haptic_report,
 )
 
-# --- UHID constants (from linux/uhid.h) ---
+# --- UHID constants (from linux/uhid.h enum) ---
 UHID_DESTROY = 1
+UHID_START = 2
+UHID_STOP = 3
+UHID_OPEN = 4
+UHID_CLOSE = 5
+UHID_OUTPUT = 6
+UHID_GET_REPORT = 9
+UHID_GET_REPORT_REPLY = 10
 UHID_CREATE2 = 11
 UHID_INPUT2 = 12
+UHID_SET_REPORT = 13
+UHID_SET_REPORT_REPLY = 14
 
 BUS_USB = 0x03
 
-# Valve Steam Controller VID/PID
+# Steam Controller VID/PID — must match hid-steam driver's USB ID table
+# hid-steam.c: HID_USB_DEVICE(0x28DE, 0x1205) = Steam Deck
 SC_VID = 0x28DE
-SC_PID = 0x1102  # USB wired SC (matches hid-steam driver alias table)
+SC_PID = 0x1205
 
-# Full SC2 HID Report Map descriptor (282 bytes)
-# From spoofdeck-modified/src/gatt_db.py build_report_map()
-SC2_RD = bytes([
-    # --- Gamepad (Report ID 1) & Haptic Output (Report ID 2) ---
+# hid-steam command IDs (from hid-steam.c:85-138)
+ID_CLEAR_DIGITAL_MAPPINGS = 0x81
+ID_SET_DEFAULT_DIGITAL_MAPPINGS = 0x85
+ID_SET_SETTINGS_VALUES = 0x87
+ID_LOAD_DEFAULT_SETTINGS = 0x8E
+ID_TRIGGER_HAPTIC_PULSE = 0x8F
+ID_GET_DEVICE_INFO = 0xA1
+ID_GET_STRING_ATTRIBUTE = 0xAE
+ID_TRIGGER_RUMBLE_CMD = 0xEB
+
+# Input report ID — Deck uses 0x09, SC uses 0x01
+INPUT_REPORT_ID = 0x09
+
+
+# --- HID Report Descriptor ---
+# Structure:
+# 1. Vendor Feature report (NO Report ID → implicit ID 0) — hid-steam command channel
+# 2. Gamepad Input report (Report ID 0x09 — Deck input format)
+STEAM_CONTROLLER_RD = bytes([
+    # Feature report — NO Report ID tag (implicit ID 0)
+    # hid-steam looks for report_id_hash[0] — must be >= 64 bytes
+    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01,        # Usage (0x01)
+    0xA1, 0x01,        # Collection (Application)
+    0x09, 0x20,        #   Usage (0x20)
+    0x15, 0x00,        #   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  #   Logical Maximum (255)
+    0x75, 0x08,        #   Report Size (8)
+    0x95, 0x40,        #   Report Count (64)
+    0xB1, 0x02,        #   Feature (Data,Var,Abs)  -- 64-byte feature (ID 0x00 implicit)
+    0xC0,              # End Collection
+
+    # Gamepad Input (Report ID 0x09)
     0x05, 0x01,        # Usage Page (Generic Desktop)
     0x09, 0x05,        # Usage (Gamepad)
     0xA1, 0x01,        # Collection (Application)
-    0x85, 0x01,        #   Report ID (1)
+    0x85, 0x09,        #   Report ID (0x09)
     0x05, 0x09,        #   Usage Page (Button)
     0x19, 0x01,        #   Usage Minimum (1)
     0x29, 0x10,        #   Usage Maximum (16)
@@ -48,7 +87,7 @@ SC2_RD = bytes([
     0x25, 0x01,        #   Logical Maximum (1)
     0x75, 0x01,        #   Report Size (1)
     0x95, 0x10,        #   Report Count (16)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- 16 button bits
+    0x81, 0x02,        #   Input (Data,Var,Abs)
     0x05, 0x01,        #   Usage Page (Generic Desktop)
     0x09, 0x30,        #   Usage (X)
     0x09, 0x31,        #   Usage (Y)
@@ -58,181 +97,27 @@ SC2_RD = bytes([
     0x26, 0xFF, 0x7F,  #   Logical Maximum (32767)
     0x75, 0x10,        #   Report Size (16)
     0x95, 0x04,        #   Report Count (4)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- 4 x 16-bit axes
+    0x81, 0x02,        #   Input (Data,Var,Abs)
     0x09, 0x32,        #   Usage (Z)
     0x09, 0x35,        #   Usage (Rz)
     0x15, 0x00,        #   Logical Minimum (0)
     0x26, 0xFF, 0x00,  #   Logical Maximum (255)
     0x75, 0x08,        #   Report Size (8)
     0x95, 0x02,        #   Report Count (2)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- 2 x 8-bit triggers
-    0x85, 0x02,        #   Report ID (2)
-    0x09, 0x20,        #   Usage (Survey)
-    0x15, 0x00,        #   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  #   Logical Maximum (255)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x01,        #   Report Count (1)
-    0x91, 0x02,        #   Output (Data,Var,Abs)         -- haptic output
-    0xC0,              # End Collection
-
-    # --- Mouse (Report ID 3) ---
-    0x05, 0x01,        # Usage Page (Generic Desktop)
-    0x09, 0x02,        # Usage (Mouse)
-    0xA1, 0x01,        # Collection (Application)
-    0x09, 0x01,        #   Usage (Pointer)
-    0xA1, 0x00,        #   Collection (Physical)
-    0x85, 0x03,        #     Report ID (3)
-    0x05, 0x09,        #     Usage Page (Button)
-    0x19, 0x01,        #     Usage Minimum (1)
-    0x29, 0x05,        #     Usage Maximum (5)
-    0x15, 0x00,        #     Logical Minimum (0)
-    0x25, 0x01,        #     Logical Maximum (1)
-    0x95, 0x05,        #     Report Count (5)
-    0x75, 0x01,        #     Report Size (1)
-    0x81, 0x02,        #     Input (Data,Var,Abs)
-    0x95, 0x01,        #     Report Count (1)
-    0x75, 0x03,        #     Report Size (3)
-    0x81, 0x01,        #     Input (Cnst,Var,Abs)        -- padding
-    0x05, 0x01,        #     Usage Page (Generic Desktop)
-    0x09, 0x30,        #     Usage (X)
-    0x09, 0x31,        #     Usage (Y)
-    0x15, 0x81,        #     Logical Minimum (-127)
-    0x25, 0x7F,        #     Logical Maximum (127)
-    0x75, 0x08,        #     Report Size (8)
-    0x95, 0x02,        #     Report Count (2)
-    0x81, 0x06,        #     Input (Data,Var,Rel)
-    0x09, 0x38,        #     Usage (Wheel)
-    0x15, 0x81,        #     Logical Minimum (-127)
-    0x25, 0x7F,        #     Logical Maximum (127)
-    0x75, 0x08,        #     Report Size (8)
-    0x95, 0x01,        #     Report Count (1)
-    0x81, 0x06,        #     Input (Data,Var,Rel)
-    0xC0,              #   End Collection
-    0xC0,              # End Collection
-
-    # --- Keyboard (Report ID 4) ---
-    0x05, 0x01,        # Usage Page (Generic Desktop)
-    0x09, 0x06,        # Usage (Keyboard)
-    0xA1, 0x01,        # Collection (Application)
-    0x85, 0x04,        #   Report ID (4)
-    0x05, 0x07,        #   Usage Page (Key Codes)
-    0x19, 0xE0,        #   Usage Minimum (224)
-    0x29, 0xE7,        #   Usage Maximum (231)
-    0x15, 0x00,        #   Logical Minimum (0)
-    0x25, 0x01,        #   Logical Maximum (1)
-    0x75, 0x01,        #   Report Size (1)
-    0x95, 0x08,        #   Report Count (8)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- modifier byte
-    0x95, 0x01,        #   Report Count (1)
-    0x75, 0x08,        #   Report Size (8)
-    0x81, 0x01,        #   Input (Cnst,Var,Abs)          -- reserved
-    0x19, 0x00,        #   Usage Minimum (0)
-    0x29, 0x65,        #   Usage Maximum (101)
-    0x15, 0x00,        #   Logical Minimum (0)
-    0x25, 0x65,        #   Logical Maximum (101)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x06,        #   Report Count (6)
-    0x81, 0x00,        #   Input (Data,Ary,Abs)          -- 6 key codes
-    0xC0,              # End Collection
-
-    # --- SC2 Custom Input (Report ID 0x45, 45 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x45,        # Usage (0x45)
-    0xA1, 0x01,        # Collection (Application)
-    0x85, 0x45,        #   Report ID (0x45)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x2D,        #   Report Count (45)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- 45 raw bytes
-    0xC0,              # End Collection
-
-    # --- SC2 Custom Input (Report ID 0x47, 47 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x47,        # Usage (0x47)
-    0xA1, 0x01,        # Collection (Application)
-    0x85, 0x47,        #   Report ID (0x47)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x2F,        #   Report Count (47)
-    0x81, 0x02,        #   Input (Data,Var,Abs)          -- 47 raw bytes
-    0xC0,              # End Collection
-
-    # --- SC2 Haptic Rumble Output (Report ID 0x80, 9 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x80,        # Usage (0x80)
-    0xA1, 0x01,        # Collection (Application)
-    0x85, 0x80,        #   Report ID (0x80)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x09,        #   Report Count (9)
-    0x91, 0x02,        #   Output (Data,Var,Abs)         -- 9 bytes output
-    0xC0,              # End Collection
-
-    # --- Feature Report 0x02 (SC2 Command Channel, 64 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x00,        # Usage (0x00)
-    0xA1, 0x02,        # Collection (Logical)
-    0x85, 0x02,        #   Report ID (0x02)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x40,        #   Report Count (64)
-    0xB1, 0x02,        #   Feature (Data,Var,Abs)
-    0xC0,              # End Collection
-
-    # --- Feature Report 0x01 (SC2 Capabilities, 64 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x01,        # Usage (0x01)
-    0xA1, 0x02,        # Collection (Logical)
-    0x85, 0x01,        #   Report ID (0x01)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x40,        #   Report Count (64)
-    0xB1, 0x02,        #   Feature (Data,Var,Abs)
-    0xC0,              # End Collection
-
-    # --- Feature Report 0x85 (SC2 Mode Switch, 64 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x85,        # Usage (0x85)
-    0xA1, 0x02,        # Collection (Logical)
-    0x85, 0x85,        #   Report ID (0x85)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x40,        #   Report Count (64)
-    0xB1, 0x02,        #   Feature (Data,Var,Abs)
-    0xC0,              # End Collection
-
-    # --- Feature Report 0x8F (SC2 Haptic Command, 64 bytes) ---
-    0x06, 0x00, 0xFF,  # Usage Page (Vendor Defined 0xFF00)
-    0x09, 0x8F,        # Usage (0x8F)
-    0xA1, 0x02,        # Collection (Logical)
-    0x85, 0x8F,        #   Report ID (0x8F)
-    0x75, 0x08,        #   Report Size (8)
-    0x95, 0x40,        #   Report Count (64)
-    0xB1, 0x02,        #   Feature (Data,Var,Abs)
+    0x81, 0x02,        #   Input (Data,Var,Abs)
     0xC0,              # End Collection
 ])
 
 
 def uhid_create(fd):
-    """Create a virtual Steam Controller via UHID.
-
-    UHID event struct (uhid.h, __attribute__((packed))):
-      type:     u32  (4)
-      name:     u8[128]
-      phys:     u8[64]
-      uniq:     u8[64]
-      rd_size:  u16
-      bus:      u16
-      vendor:   u32
-      product:  u32
-      version:  u32
-      country:  u32
-      rd_data:  u8[4096]
-    Total: 4 + 128 + 64 + 64 + 2 + 2 + 4 + 4 + 4 + 4 + 4096 = 4372
-    """
-    rd = SC2_RD
+    """Create a virtual Steam Controller via UHID_CREATE2."""
+    rd = STEAM_CONTROLLER_RD
     buf = bytearray(4372)
 
     struct.pack_into('<I', buf, 0, UHID_CREATE2)
-
     name = b"Steam Controller\x00"
     buf[4:4+len(name)] = name
 
-    # offsets: name(128) phys(64) uniq(64) = 260
     struct.pack_into('<H', buf, 260, len(rd))     # rd_size
     struct.pack_into('<H', buf, 262, BUS_USB)     # bus
     struct.pack_into('<I', buf, 264, SC_VID)      # vendor
@@ -253,95 +138,106 @@ def uhid_input(fd, report_id, report_data):
     os.write(fd, buf)
 
 
-def build_sc2_report_45(rpt):
-    """Build a 45-byte SC2 Report 0x45 from parsed Neptune data.
+def uhid_get_report_reply(fd, req_id, data):
+    """Reply to a UHID_GET_REPORT request."""
+    size = len(data)
+    # uhid_event: type(u32) + { id(u32) + err(u16) + size(u16) + data }
+    buf = struct.pack('<IIHH', UHID_GET_REPORT_REPLY, req_id, 0, size) + data
+    os.write(fd, buf)
 
-    Layout from spoofdeck-modified docs/sc2-protocol.md:
-    [0]      seq_num (1 byte)
-    [1-4]    buttons (32-bit Triton bitmask)
-    [5-6]    sTriggerLeft (signed 16-bit)
-    [7-8]    sTriggerRight (signed 16-bit)
-    [9-10]   sLeftStickX (signed 16-bit)
-    [11-12]  sLeftStickY (signed 16-bit)
-    [13-14]  sRightStickX (signed 16-bit)
-    [15-16]  sRightStickY (signed 16-bit)
-    [17-18]  sLeftPadX (signed 16-bit)
-    [19-20]  sLeftPadY (signed 16-bit)
-    [21-22]  unPressureLeft (unsigned 16-bit)
-    [23-24]  sRightPadX (signed 16-bit)
-    [25-26]  sRightPadY (signed 16-bit)
-    [27-28]  unPressureRight (unsigned 16-bit)
-    [29-32]  timestamp (uint32_t us)
-    [33-34]  accel_x (signed 16-bit)
-    [35-36]  accel_y (signed 16-bit)
-    [37-38]  accel_z (signed 16-bit)
-    [39-40]  gyro_x (signed 16-bit)
-    [41-42]  gyro_y (signed 16-bit)
-    [43-44]  gyro_z (signed 16-bit)
+
+def uhid_set_report_reply(fd, req_id):
+    """Reply to a UHID_SET_REPORT request (success)."""
+    # uhid_event: type(u32) + { id(u32) + err(u16) }
+    buf = struct.pack('<IIH', UHID_SET_REPORT_REPLY, req_id, 0)
+    os.write(fd, buf)
+
+
+def handle_command(data):
+    """Handle a 64-byte command from hid-steam and return a 64-byte response.
+
+    hid-steam sends commands via SET_REPORT with report_id=0x00.
+    The first byte of the 64-byte payload is the command ID.
     """
-    report = bytearray(45)
+    cmd_id = data[0] if data else 0
+    response = bytearray(64)
 
-    report[0] = build_sc2_report_45.seq & 0xFF
-    build_sc2_report_45.seq = (build_sc2_report_45.seq + 1) & 0xFF
+    if cmd_id == ID_GET_STRING_ATTRIBUTE:
+        # GET_SERIAL: [0xAE, 0x15, 0x01, ...] -> serial starting with 'F'
+        sub = data[1] if len(data) > 1 else 0
+        response[0] = cmd_id
+        response[1] = 0x15  # length
+        response[2] = 0x01  # success
+        serial = b"F123456789ABCDEF0000"
+        response[3:3+len(serial)] = serial
 
-    # 32-bit Triton button bitmask
-    b = 0
-    buttons = rpt['buttons']
-    if buttons & 0x0001: b |= (1 << 0)   # A
-    if buttons & 0x0002: b |= (1 << 1)   # B
-    if buttons & 0x0004: b |= (1 << 2)   # X
-    if buttons & 0x0008: b |= (1 << 3)   # Y
-    if buttons & 0x0010: b |= (1 << 19)  # L1
-    if buttons & 0x0020: b |= (1 << 9)   # R1
-    if buttons & 0x0040: b |= (1 << 6)   # Select
-    if buttons & 0x0080: b |= (1 << 14)  # Start
-    if buttons & 0x0100: b |= (1 << 16)  # Steam
-    if buttons & 0x0200: b |= (1 << 15)  # L3
-    if buttons & 0x0400: b |= (1 << 5)   # R3
-    if buttons & 0x0800: b |= (1 << 13)  # D-pad Up
-    if buttons & 0x1000: b |= (1 << 10)  # D-pad Down
-    if buttons & 0x2000: b |= (1 << 12)  # D-pad Left
-    if buttons & 0x4000: b |= (1 << 11)  # D-pad Right
-    if buttons & 0x8000: b |= (1 << 17)  # Back grips
+    elif cmd_id == ID_GET_DEVICE_INFO:
+        # GET_DEVICE_INFO
+        response[0] = cmd_id
+        response[1] = 0x15  # length
+        response[2] = 0x01  # success
+        # Device type, capabilities, etc.
+        response[3] = 0x01  # SC2 wired
 
-    struct.pack_into('<I', report, 1, b)
-    struct.pack_into('<h', report, 5, min(32767, max(-32768, rpt['lt'] << 7)))
-    struct.pack_into('<h', report, 7, min(32767, max(-32768, rpt['rt'] << 7)))
-    struct.pack_into('<h', report, 9, rpt['lx'])
-    struct.pack_into('<h', report, 11, rpt['ly'])
-    struct.pack_into('<h', report, 13, rpt['rx'])
-    struct.pack_into('<h', report, 15, rpt['ry'])
-    struct.pack_into('<h', report, 17, rpt['lpad_x'])
-    struct.pack_into('<h', report, 19, rpt['lpad_y'])
-    struct.pack_into('<H', report, 21, rpt['lpad_force'])
-    struct.pack_into('<h', report, 23, rpt['rpad_x'])
-    struct.pack_into('<h', report, 25, rpt['rpad_y'])
-    struct.pack_into('<H', report, 27, rpt['rpad_force'])
-    struct.pack_into('<I', report, 29, rpt.get('timestamp', 0))
-    struct.pack_into('<h', report, 33, rpt['accel_x'])
-    struct.pack_into('<h', report, 35, rpt['accel_y'])
-    struct.pack_into('<h', report, 37, rpt['accel_z'])
-    struct.pack_into('<h', report, 39, rpt['gyro_x'])
-    struct.pack_into('<h', report, 41, rpt['gyro_y'])
-    struct.pack_into('<h', report, 43, rpt['gyro_z'])
+    elif cmd_id == 0x83:
+        # GET_ATTRIBUTES
+        # 9 attributes: 1-byte tag + 4-byte LE value each
+        response[0] = cmd_id
+        response[1] = 0x01  # success
+        offset = 2
+        attrs = [
+            (1, SC_PID),          # ATTRIB_PRODUCT_ID
+            (2, 0x4169BFFF),      # ATTRIB_CAPABILITIES
+            (4, 0x65E4F1AD),      # ATTRIB_FIRMWARE_BUILD_TIME
+            (9, 46),              # ATTRIB_BOARD_REVISION
+            (10, 0x65E4F1AD),     # ATTRIB_BOOTLOADER_BUILD_TIME
+            (11, 4000),           # ATTRIB_CONNECTION_INTERVAL_IN_US
+            (12, 0),              # ATTRIB_12
+            (13, 0),              # ATTRIB_13
+            (14, 0),              # ATTRIB_14
+        ]
+        for tag, val in attrs:
+            response[offset] = tag
+            struct.pack_into('<I', response, offset + 1, val)
+            offset += 5
 
-    return bytes(report)
+    elif cmd_id == ID_SET_DEFAULT_DIGITAL_MAPPINGS:
+        # ENABLE_LIZARD_MODE — just ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
 
+    elif cmd_id == ID_CLEAR_DIGITAL_MAPPINGS:
+        # DISABLE_LIZARD_MODE — just ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
 
-build_sc2_report_45.seq = 0
+    elif cmd_id == ID_LOAD_DEFAULT_SETTINGS:
+        # LOAD_DEFAULTS — just ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
 
+    elif cmd_id == ID_SET_SETTINGS_VALUES:
+        # SET_SETTINGS — just ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
 
-def build_sc2_report_01(rpt):
-    """Build a 12-byte standard gamepad Report 0x01 from parsed Neptune data."""
-    report = bytearray(12)
-    struct.pack_into('<H', report, 0, rpt['buttons'] & 0xFFFF)
-    struct.pack_into('<h', report, 2, rpt['lx'])
-    struct.pack_into('<h', report, 4, rpt['ly'])
-    struct.pack_into('<h', report, 6, rpt['rx'])
-    struct.pack_into('<h', report, 8, rpt['ry'])
-    report[10] = rpt['lt'] & 0xFF
-    report[11] = rpt['rt'] & 0xFF
-    return bytes(report)
+    elif cmd_id == ID_TRIGGER_HAPTIC_PULSE:
+        # HAPTIC PULSE — ACK (we'll handle haptics later)
+        response[0] = cmd_id
+        response[1] = 0x01  # success
+
+    elif cmd_id == ID_TRIGGER_RUMBLE_CMD:
+        # RUMBLE CMD — ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
+
+    else:
+        # Unknown command — generic ACK
+        response[0] = cmd_id
+        response[1] = 0x01  # success
+        print(f"[uhid] Unknown command: {cmd_id:#04x}")
+
+    return bytes(response)
 
 
 def main():
@@ -363,38 +259,102 @@ def main():
 
     deck_target = (deck_ip, HAPTIC_PORT)
 
+    # Pending response buffer for GET_REPORT after SET_REPORT
+    pending_response = bytearray(64)
+
     report_count = 0
     last_print = time.monotonic()
 
     try:
         while True:
-            rlist, _, _ = select.select([sock], [], [], 1.0)
-            if not rlist:
-                continue
+            rlist, _, _ = select.select([sock, uhid_fd], [], [], 1.0)
 
-            try:
-                data, addr = sock.recvfrom(512)
-            except BlockingIOError:
-                continue
+            for fd in rlist:
+                if fd == sock:
+                    # --- Input from Deck (UDP) ---
+                    try:
+                        data, addr = sock.recvfrom(512)
+                    except BlockingIOError:
+                        continue
 
-            if len(data) < 3 or data[0] != PACKET_INPUT:
-                continue
+                    if len(data) < 3 or data[0] != PACKET_INPUT:
+                        continue
 
-            rpt = unpack_input_report(data)
+                    rpt = unpack_input_report(data)
 
-            # Send standard gamepad report (Report ID 1)
-            rpt01 = build_sc2_report_01(rpt)
-            uhid_input(uhid_fd, 0x01, rpt01)
+                    # Build Deck input report (Report ID 0x09)
+                    # UHID_INPUT2: type(u32) + { size(u16) + report_id(u8) + data }
+                    hid_report = struct.pack('<BHhhhhBB',
+                        INPUT_REPORT_ID,
+                        rpt['buttons'] & 0xFFFF,
+                        rpt['lx'], rpt['ly'],
+                        rpt['rx'], rpt['ry'],
+                        rpt['lt'], rpt['rt'],
+                    )
+                    uhid_input(uhid_fd, INPUT_REPORT_ID, hid_report[1:])
 
-            # Send SC2 vendor report (Report ID 0x45)
-            rpt45 = build_sc2_report_45(rpt)
-            uhid_input(uhid_fd, 0x45, rpt45)
+                    report_count += 1
+                    now = time.monotonic()
+                    if now - last_print >= 5.0:
+                        print(f"[uhid] Processed {report_count} reports")
+                        last_print = now
 
-            report_count += 1
-            now = time.monotonic()
-            if now - last_print >= 5.0:
-                print(f"[uhid] Processed {report_count} reports")
-                last_print = now
+                elif fd == uhid_fd:
+                    # --- UHID event from kernel ---
+                    try:
+                        raw = os.read(uhid_fd, 4376)
+                    except BlockingIOError:
+                        continue
+
+                    if len(raw) < 4:
+                        continue
+
+                    evt_type = struct.unpack_from('<I', raw, 0)[0]
+
+                    if evt_type == UHID_GET_REPORT:
+                        # Kernel reads a feature report (hid-steam reading response)
+                        req_id = struct.unpack_from('<I', raw, 4)[0]
+                        rnum = raw[8]
+                        rtype = raw[9]
+                        uhid_get_report_reply(uhid_fd, req_id, pending_response)
+
+                    elif evt_type == UHID_SET_REPORT:
+                        # Kernel writes a feature report (hid-steam sending command)
+                        req_id = struct.unpack_from('<I', raw, 4)[0]
+                        rnum = raw[8]
+                        rtype = raw[9]
+                        size = struct.unpack_from('<H', raw, 10)[0]
+                        cmd_data = raw[12:12+size]
+
+                        if rtype == 3 and size >= 1:
+                            # Feature report — command from hid-steam
+                            pending_response = bytearray(handle_command(cmd_data))
+
+                        # ACK the SET_REPORT
+                        uhid_set_report_reply(uhid_fd, req_id)
+
+                    elif evt_type == UHID_START:
+                        print("[uhid] Device started by kernel")
+
+                    elif evt_type == UHID_STOP:
+                        print("[uhid] Device stopped by kernel")
+
+                    elif evt_type == UHID_OPEN:
+                        print("[uhid] Device opened")
+
+                    elif evt_type == UHID_CLOSE:
+                        print("[uhid] Device closed")
+
+                    elif evt_type == UHID_OUTPUT:
+                        # Output from kernel (haptic commands from Steam)
+                        if len(raw) >= 12:
+                            out_size = struct.unpack_from('<H', raw, 6)[0]
+                            out_data = raw[8:8+out_size]
+                            if out_size >= 2:
+                                left_motor = min(255, out_data[1] if len(out_data) > 1 else 0)
+                                right_motor = min(255, out_data[2] if len(out_data) > 2 else 0)
+                                haptic_pkt = pack_haptic_report(left_motor, right_motor)
+                                sock.sendto(haptic_pkt, deck_target)
 
     except KeyboardInterrupt:
         print(f"\n[uhid] Stopped. Processed {report_count} reports.")

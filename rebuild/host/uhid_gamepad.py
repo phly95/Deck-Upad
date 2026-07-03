@@ -31,7 +31,7 @@ BUS_USB = 0x03
 
 # Valve Steam Controller VID/PID
 SC_VID = 0x28DE
-SC_PID = 0x1303  # BLE SC2
+SC_PID = 0x1102  # USB wired SC (matches hid-steam driver alias table)
 
 # Full SC2 HID Report Map descriptor (282 bytes)
 # From spoofdeck-modified/src/gatt_db.py build_report_map()

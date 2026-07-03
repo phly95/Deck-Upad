@@ -182,12 +182,6 @@ UHID (`/dev/uhid`) lets userspace create virtual HID devices. A daemon:
 The HID report descriptor tells the kernel (and Steam) what the device is.
 With Valve's VID `0x28DE` and SC PID, Steam recognizes it as a Steam Controller.
 
-### Windows Equivalent
-
-UHID doesn't exist on Windows. Use **ViGEmBus** (virtual Xbox controller driver)
-or a custom virtual HID driver. Same concept — userspace daemon receives UDP,
-creates virtual device via Windows HID API.
-
 ### Neptune Parser (from SpoofDeck)
 
 SpoofDeck's `input_handler.py` (`/home/philip/spoofdeck-modified/src/input_handler.py`)
@@ -259,30 +253,21 @@ BLE HID works cross-platform (no host software needed), but:
 ### Why WiFi
 
 - Full bandwidth for video + input on one link
-- Haptics work (no BLE architecture block — virtual device via UHID/ViGEmBus)
+- Haptics work (no BLE architecture block — virtual device via UHID)
 - Already proven in current Deck-Upad (2-5ms latency observed)
-- Cross-platform: Linux UHID, Windows ViGEmBus, macOS IOKit
-
-### The Xbox Adapter Question
-
-Xbox Wireless Adapter uses 802.11 WiFi hardware with Microsoft's proprietary
-protocol. It proves low-latency WiFi HID works on Windows. But the protocol
-is not reverse-engineered enough to use as a standard. The Puck (Steam Controller
-dongle) is the equivalent for Steam — uses ESB protocol on nRF52840 hardware.
-SpoofDeck has the Puck firmware for future reverse engineering.
+- Cross-platform potential if needed later
 
 ### Remaining Platform Gap
 
-| Component | Linux | Windows |
-|---|---|---|
-| WiFi AP | hostapd | Hosted Network / netsh |
-| Virtual gamepad | UHID | ViGEmBus |
-| Video decoder | GStreamer | GStreamer / mpv |
-| Touch injection | evdev | SendInput |
-| WiFi client | wpa_supplicant | netsh / NM |
+| Component | Linux |
+|---|---|
+| WiFi AP | hostapd |
+| Virtual gamepad | UHID |
+| Video decoder | GStreamer |
+| Touch injection | evdev |
+| WiFi client | wpa_supplicant |
 
-Linux is fully solved with existing tools. Windows needs ViGEmBus + a
-host app, but both are mature projects with large user bases.
+Linux is fully solved with existing tools.
 
 ## Network Config
 
